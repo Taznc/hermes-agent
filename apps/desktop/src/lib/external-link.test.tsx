@@ -2,7 +2,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/re
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { IS_MAC } from '@/lib/keybinds/combo'
-import { INLINE_LINK_GATED_ATTR, setRequireModifierToOpenInlineLinks } from '@/store/inline-link-open'
+import { setAlwaysExternalLinks } from '@/store/external-links'
 import { $previewTabs, closeRightRail } from '@/store/preview'
 
 import {
@@ -40,9 +40,9 @@ function installTitleBridge(title: string) {
 }
 
 afterEach(() => {
-  setRequireModifierToOpenInlineLinks(false)
   __resetLinkTitleCache()
   closeRightRail()
+  setAlwaysExternalLinks(false)
   vi.restoreAllMocks()
   cleanup()
 
@@ -68,6 +68,17 @@ describe('external link helpers', () => {
         'https://www.getyourguide.com/fajardo-l882/from-fajardo-icacos-island-full-day-catamaran-trip-t19891/'
       )
     ).toBe('From Fajardo Icacos Island Full Day Catamaran Trip')
+  })
+
+  // Regression for #121321: a separator-less slug token that looks like a
+  // case-sensitive identifier (a digit, a dot, or mixed case — release
+  // tags, filenames) must keep its exact casing; title-casing it invented a
+  // different identifier (`V1.0.1`, `README.Md`) than the one authored. A
+  // plain lowercase word token is not an identifier and still title-cases.
+  it('keeps identifier casing in separator-less slug tokens but still title-cases words', () => {
+    expect(urlSlugTitleLabel('https://example.com/releases/tag/v1.0.1')).toBe('v1.0.1')
+    expect(urlSlugTitleLabel('https://example.com/repository/blob/main/README.md')).toBe('README.md')
+    expect(urlSlugTitleLabel('https://example.com/p/quantumcomputing')).toBe('Quantumcomputing')
   })
 
   it('filters out local/non-http targets for title fetches', () => {
@@ -138,6 +149,19 @@ describe('external link helpers', () => {
     expect($previewTabs.get()).toHaveLength(0)
   })
 
+  it('sends a plain click to the OS browser when "always external" is on', () => {
+    const openExternal = vi.fn().mockResolvedValue(undefined)
+    installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
+    setAlwaysExternalLinks(true)
+
+    render(<ExternalLink href="https://example.com/path/to/resource">Example link</ExternalLink>)
+
+    fireEvent.click(screen.getByRole('link', { name: 'Example link' }))
+
+    expect(openExternal).toHaveBeenCalledWith('https://example.com/path/to/resource')
+    expect($previewTabs.get()).toHaveLength(0)
+  })
+
   it('treats only the HUD renderer as a native-link surface', () => {
     expect(hudForcesNativeLinks('')).toBe(false)
     expect(hudForcesNativeLinks('?win=secondary')).toBe(false)
@@ -198,28 +222,6 @@ describe('external link helpers', () => {
     expect(openExternal).toHaveBeenCalledWith('mailto:hi@example.com')
   })
 
-  it('hides the trailing external-link icon by default', () => {
-    installDesktopBridge()
-
-    render(<ExternalLink href="https://example.com/path/to/resource">Example link</ExternalLink>)
-
-    const link = screen.getByRole('link', { name: 'Example link' })
-    expect(link.querySelector('svg')).toBeNull()
-  })
-
-  it('shows a trailing external-link icon when opted in', () => {
-    installDesktopBridge()
-
-    render(
-      <ExternalLink href="https://example.com/path/to/resource" showExternalIcon>
-        Example link
-      </ExternalLink>
-    )
-
-    const link = screen.getByRole('link', { name: 'Example link' })
-    expect(link.querySelector('svg')).toBeTruthy()
-  })
-
   it('renders pretty links with fetched titles and no host suffix', async () => {
     const bridge = vi.fn().mockResolvedValue('From Fajardo: Full-Day Culebra Islands Catamaran Tour')
     installDesktopBridge({ fetchLinkTitle: bridge as unknown as Window['hermesDesktop']['fetchLinkTitle'] })
@@ -236,17 +238,6 @@ describe('external link helpers', () => {
       expect(link.textContent).toContain('From Fajardo: Full-Day Culebra Islands Catamaran Tour')
     })
     expect(link.textContent).not.toContain('getyourguide.com')
-  })
-
-  it('shows host/path fallback when title is unavailable', () => {
-    installDesktopBridge()
-    const url = 'https://www.expedia.com/things-to-do/puerto-rico-el-yunque'
-
-    render(<PrettyLink href={url} />)
-
-    const link = screen.getByTitle(url)
-
-    expect(link.textContent).toBe('Puerto Rico El Yunque')
   })
 
   it('ignores error-like fetched titles and falls back to slug label', async () => {
@@ -333,145 +324,5 @@ describe('external link helpers', () => {
 
     const link = screen.getByRole('link', { name: 'agent.log' })
     expect(link.getAttribute('href')).toBe('https://agent.log')
-  })
-
-  it('prefixes a pretty link to a known host with its brand glyph', () => {
-    installDesktopBridge()
-
-    const url = 'https://github.com/NousResearch/hermes-agent/pull/123'
-
-    render(<PrettyLink fallbackLabel="#123" href={url} />)
-
-    const link = screen.getByTitle(url)
-
-    expect(link.querySelector('svg')).toBeTruthy()
-    // The glyph is decorative — it must not pollute the link's accessible name.
-    expect(link.textContent).toBe('#123')
-  })
-
-  it('renders no brand glyph for an unknown host', () => {
-    installDesktopBridge()
-
-    const url = 'https://example.com/some/page'
-
-    render(<PrettyLink fallbackLabel="Some Page" href={url} />)
-
-    expect(screen.getByTitle(url).querySelector('svg')).toBeNull()
-  })
-
-  it('still opens a non-chat link on a regular click when the chat modifier preference is on', async () => {
-    setRequireModifierToOpenInlineLinks(true)
-    const openExternal = vi.fn().mockResolvedValue(undefined)
-    installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
-
-    render(<ExternalLink href="https://example.com/path/to/resource">Example link</ExternalLink>)
-
-    fireEvent.click(screen.getByRole('link', { name: 'Example link' }), { detail: 1 })
-
-    expect(openExternal).not.toHaveBeenCalled()
-    await waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/path/to/resource'))
-  })
-
-  it('still escapes a non-chat link to the OS browser on the platform modifier when the preference is on', () => {
-    setRequireModifierToOpenInlineLinks(true)
-    const openExternal = vi.fn().mockResolvedValue(undefined)
-    installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
-
-    render(<ExternalLink href="https://example.com/path/to/resource">Example link</ExternalLink>)
-
-    fireEvent.click(screen.getByRole('link', { name: 'Example link' }), IS_MAC ? { metaKey: true } : { ctrlKey: true })
-
-    expect(openExternal).toHaveBeenCalledWith('https://example.com/path/to/resource')
-    expect($previewTabs.get()).toHaveLength(0)
-  })
-
-  it('still opens a non-chat PrettyLink on a regular click when the preference is on', async () => {
-    setRequireModifierToOpenInlineLinks(true)
-    const openExternal = vi.fn().mockResolvedValue(undefined)
-    installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
-
-    render(<PrettyLink fallbackLabel="Docs" href="https://example.com/guide" />)
-
-    fireEvent.click(screen.getByRole('link', { name: 'Docs' }), { detail: 1 })
-
-    expect(openExternal).not.toHaveBeenCalled()
-    await waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/guide'))
-  })
-
-  it('does not open an opted-in chat link on a regular mouse click when the preference is on', async () => {
-    setRequireModifierToOpenInlineLinks(true)
-    const openExternal = vi.fn().mockResolvedValue(undefined)
-    installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
-
-    render(
-      <ExternalLink applyInlineOpenPreference href="https://example.com/path/to/resource">
-        Example link
-      </ExternalLink>
-    )
-
-    fireEvent.click(screen.getByRole('link', { name: 'Example link' }), { detail: 1 })
-
-    expect(openExternal).not.toHaveBeenCalled()
-    await Promise.resolve()
-    expect($previewTabs.get()).toHaveLength(0)
-  })
-
-  it('opens an opted-in chat link in-app on the platform modifier when the preference is on', async () => {
-    setRequireModifierToOpenInlineLinks(true)
-    const openExternal = vi.fn().mockResolvedValue(undefined)
-    installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
-
-    render(
-      <ExternalLink applyInlineOpenPreference href="https://example.com/path/to/resource">
-        Example link
-      </ExternalLink>
-    )
-
-    fireEvent.click(
-      screen.getByRole('link', { name: 'Example link' }),
-      IS_MAC ? { detail: 1, metaKey: true } : { detail: 1, ctrlKey: true }
-    )
-
-    expect(openExternal).not.toHaveBeenCalled()
-    await waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/path/to/resource'))
-  })
-
-  it('still opens an opted-in chat link on a keyboard-generated click when the preference is on', async () => {
-    setRequireModifierToOpenInlineLinks(true)
-    const openExternal = vi.fn().mockResolvedValue(undefined)
-    installDesktopBridge({ openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'] })
-
-    render(
-      <ExternalLink applyInlineOpenPreference href="https://example.com/path/to/resource">
-        Example link
-      </ExternalLink>
-    )
-
-    fireEvent.click(screen.getByRole('link', { name: 'Example link' }), { detail: 0 })
-
-    expect(openExternal).not.toHaveBeenCalled()
-    await waitFor(() => expect($previewTabs.get().at(-1)?.target.url).toBe('https://example.com/path/to/resource'))
-  })
-
-  it('marks only opted-in chat links as cursor-gated', () => {
-    setRequireModifierToOpenInlineLinks(true)
-
-    const { rerender } = render(
-      <ExternalLink applyInlineOpenPreference href="https://example.com/chat">
-        Chat link
-      </ExternalLink>
-    )
-
-    expect(screen.getByRole('link', { name: 'Chat link' }).hasAttribute(INLINE_LINK_GATED_ATTR)).toBe(true)
-
-    rerender(<ExternalLink href="https://example.com/chrome">Chrome link</ExternalLink>)
-
-    expect(screen.getByRole('link', { name: 'Chrome link' }).hasAttribute(INLINE_LINK_GATED_ATTR)).toBe(false)
-  })
-
-  it('does not mark a non-chat PrettyLink as cursor-gated', () => {
-    render(<PrettyLink fallbackLabel="Docs" href="https://example.com/guide" />)
-
-    expect(screen.getByRole('link', { name: 'Docs' }).hasAttribute(INLINE_LINK_GATED_ATTR)).toBe(false)
   })
 })

@@ -23,7 +23,7 @@ export interface McpOAuthFlow {
 }
 
 /** Connect to the server, list its tools, disconnect. Slow (spawns/handshakes
- *  for real) — well past the 30s default fetch timeout. */
+ *  for real) — well past the 15s default fetch timeout. */
 export function testMcpServer(name: string, profile?: ProfileScope): Promise<McpTestResult> {
   return window.hermesDesktop.api<McpTestResult>({
     ...capabilityScoped(profile),
@@ -114,10 +114,11 @@ export function setMcpServerEnabled(name: string, enabled: boolean): Promise<{ o
   })
 }
 
-export function getMcpCatalog(profile?: ProfileScope): Promise<McpCatalogResponse> {
+export function getMcpCatalog(profile?: ProfileScope, detectApps = false): Promise<McpCatalogResponse> {
   return window.hermesDesktop.api<McpCatalogResponse>({
     ...capabilityScoped(profile),
-    path: '/api/mcp/catalog'
+    path: `/api/mcp/catalog${detectApps ? '?detect_apps=true' : ''}`,
+    ...(detectApps ? { timeoutMs: 5000 } : {})
   })
 }
 

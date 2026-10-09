@@ -56,6 +56,7 @@ export function isRemoteReauthError(error: string | null | undefined): boolean {
     text.includes('remote gateway session has expired') ||
     text.includes('gateway sign-in required') ||
     text.includes('needs oauth login') ||
+    text.includes('app token is invalid') ||
     (text.includes('oauth') && (text.includes('not signed in') || text.includes('sign in')))
   )
 }
@@ -139,26 +140,6 @@ export function isRemoteReauthFailure(
     config!.remoteAuthMode === 'oauth' &&
     (!config!.remoteOauthConnected || isRemoteReauthError(error))
   )
-}
-
-// Marker substring for a confirmed "gateway reachable, WS credential
-// rejected" boot failure (#t_360b3fcb). A browser WebSocket cannot observe
-// the HTTP status of a failed handshake — hermes_cli/web_server.py's
-// gateway_ws closes before accept() on a bad/missing `?token=`, so a 403
-// upgrade reaches the renderer as nothing more than a generic connect error.
-// use-gateway-boot.ts reactively probes the plain (non-WS) /api/health
-// endpoint after a connect failure; a 200 there proves the gateway is up, so
-// the failure must be the WS credential, not "the gateway didn't come up".
-// Kept as a shared marker (rather than a class instance) so it survives the
-// message being stored as a plain string in $desktopBoot.
-const WS_AUTH_REJECTED_MARKER = 'gateway is reachable, but the live connection was refused'
-
-export function wsAuthRejectedMessage(detail: string): string {
-  return `Hermes ${WS_AUTH_REJECTED_MARKER} (missing or invalid access credential). ${detail}`
-}
-
-export function isWsAuthRejectedFailure(error: string | null | undefined): boolean {
-  return String(error || '').includes(WS_AUTH_REJECTED_MARKER)
 }
 
 // Derive the password flag + display label from the probed providers. A

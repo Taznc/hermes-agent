@@ -94,11 +94,9 @@
   const FALLBACK_COLUMN_LABEL = {
     triage: "Triage",
     todo: "Todo",
-    scheduled: "Scheduled",
     ready: "Ready",
     running: "In Progress",
     blocked: "Blocked",
-    on_hold: "On Hold",
     review: "Review",
     done: "Done",
     archived: "Archived",
@@ -106,11 +104,9 @@
   const FALLBACK_COLUMN_HELP = {
     triage: "Raw ideas — a specifier will flesh out the spec",
     todo: "Waiting on dependencies or unassigned",
-    scheduled: "Waiting for a scheduled time to arrive",
     ready: "Dependencies satisfied; assign a profile to dispatch",
     running: "Claimed by a worker — in-flight",
     blocked: "Worker asked for human input",
-    on_hold: "Shelved by a human — drag back to Ready when you want it resumed",
     review: "Implementation complete — awaiting review",
     done: "Completed",
     archived: "Archived",
@@ -176,11 +172,9 @@
   const COLUMN_DOT = {
     triage: "hermes-kanban-dot-triage",
     todo: "hermes-kanban-dot-todo",
-    scheduled: "hermes-kanban-dot-scheduled",
     ready: "hermes-kanban-dot-ready",
     running: "hermes-kanban-dot-running",
     blocked: "hermes-kanban-dot-blocked",
-    on_hold: "hermes-kanban-dot-on-hold",
     review: "hermes-kanban-dot-review",
     done: "hermes-kanban-dot-done",
     archived: "hermes-kanban-dot-archived",
@@ -474,15 +468,44 @@
 
   function attachTouchDrag(el, taskId) {
     if (!el) return;
+    // A finger drifts a few px on every real tap; without a movement threshold ANY touch
+    // pointerdown armed a drag and called preventDefault(), which suppresses the synthesized
+    // click the card relies on to open (#115568). Defer the drag proxy + preventDefault until
+    // the pointer has actually moved past DRAG_THRESHOLD_PX; a tap that never crosses it falls
+    // through to the native click, same as it already does for a mouse.
+    const DRAG_THRESHOLD_PX = 8;
     function onDown(e) {
       if (e.pointerType !== "touch") return;
-      e.preventDefault();
-      const proxy = el.cloneNode(true);
-      proxy.classList.add("hermes-kanban-touch-proxy");
-      document.body.appendChild(proxy);
+      const startX = e.clientX;
+      const startY = e.clientY;
+      let proxy = null;
       let lastTarget = null;
+      let dragging = false;
+
+      function startDrag() {
+        dragging = true;
+        proxy = el.cloneNode(true);
+        proxy.classList.add("hermes-kanban-touch-proxy");
+        document.body.appendChild(proxy);
+        proxy.style.position = "fixed";
+        proxy.style.pointerEvents = "none";
+        proxy.style.opacity = "0.85";
+        proxy.style.zIndex = "9999";
+        proxy.style.width = `${el.offsetWidth}px`;
+        proxy.style.left = `${startX - el.offsetWidth / 2}px`;
+        proxy.style.top = `${startY - 24}px`;
+      }
 
       function move(ev) {
+        if (!dragging) {
+          const dx = ev.clientX - startX;
+          const dy = ev.clientY - startY;
+          if (Math.hypot(dx, dy) < DRAG_THRESHOLD_PX) return;
+          startDrag();
+        }
+        // Only now, once a drag is actually underway, does it claim the gesture — a stationary
+        // tap never reaches preventDefault() and its click event fires normally.
+        ev.preventDefault();
         proxy.style.left = `${ev.clientX - proxy.offsetWidth / 2}px`;
         proxy.style.top = `${ev.clientY - 24}px`;
         proxy.style.display = "none";
@@ -501,6 +524,7 @@
         document.removeEventListener("pointermove", move);
         document.removeEventListener("pointerup", up);
         document.removeEventListener("pointercancel", up);
+        if (!dragging) return;
         if (lastTarget) {
           lastTarget.classList.remove("hermes-kanban-column--drop");
           const status = lastTarget.getAttribute("data-kanban-column");
@@ -519,14 +543,6 @@
         }
         proxy.remove();
       }
-      // Kick off proxy at the pointer origin.
-      proxy.style.position = "fixed";
-      proxy.style.pointerEvents = "none";
-      proxy.style.opacity = "0.85";
-      proxy.style.zIndex = "9999";
-      proxy.style.width = `${el.offsetWidth}px`;
-      proxy.style.left = `${e.clientX - el.offsetWidth / 2}px`;
-      proxy.style.top = `${e.clientY - 24}px`;
       document.addEventListener("pointermove", move);
       document.addEventListener("pointerup", up);
       document.addEventListener("pointercancel", up);
@@ -1269,6 +1285,10 @@
           onSwitch: switchBoard,
           onNewClick: function () { setShowNewBoard(true); },
           onSettingsClick: function () { setShowBoardSettings(true); },
+          onUnbindProject: function () {
+            updateBoard(board, { project_id: "" })
+              .catch(function (e) { setError(String(e.message || e)); });
+          },
           onDeleteBoard: deleteBoard,
           requestDialog: function (req) { return kanbanDialogs.request(req); },
         }),
@@ -1287,7 +1307,6 @@
           },
         }) : null,
         h(OrchestrationPanel, null),
-        h(QuotaCircuitBanner, null),
         h(AttentionStrip, {
           boardData,
           onOpen: setSelectedTaskId,
@@ -1301,11 +1320,7 @@
           search, setSearch,
           onNudgeDispatch: function () {
             SDK.fetchJSON(withBoard(`${API}/dispatch?max=8`, board), { method: "POST" })
-              .then(function (result) {
-                return loadBoard().then(function () {
-                  if (result && result.dispatch_status) setError(result.dispatch_status);
-                });
-              })
+              .then(loadBoard)
               .catch(function (e) { setError(String(e.message || e)); });
           },
           onRefresh: loadBoard,
@@ -1360,66 +1375,6 @@
           requestDialog: function (req) { return kanbanDialogs.request(req); },
         }) : null,
       ),
-    );
-  }
-
-  // -------------------------------------------------------------------------
-  // Host quota circuit — shared across every board/profile on this machine.
-  // -------------------------------------------------------------------------
-
-  function QuotaCircuitBanner() {
-    const [circuits, setCircuits] = useState([]);
-    const [message, setMessage] = useState("");
-
-    const load = useCallback(function () {
-      return SDK.fetchJSON(`${API}/quota-circuits`).then(function (payload) {
-        setCircuits((payload && payload.circuits) || []);
-      }).catch(function (err) {
-        setMessage("Quota diagnostics unavailable: " + (err.message || String(err)));
-      });
-    }, []);
-
-    useEffect(function () {
-      load();
-      const timer = setInterval(load, 30000);
-      return function () { clearInterval(timer); };
-    }, [load]);
-
-    const clearCircuit = function (group) {
-      setMessage("");
-      SDK.fetchJSON(`${API}/quota-circuits/${encodeURIComponent(group)}`, {
-        method: "DELETE",
-      }).then(function () {
-        setMessage("Quota circuit cleared.");
-        load();
-      }).catch(function (err) {
-        setMessage("Clear failed: " + (err.message || String(err)));
-      });
-    };
-
-    if (circuits.length === 0 && !message) return null;
-    return h("div", { className: "hermes-kanban-quota-circuits", role: "status" },
-      h("div", { className: "hermes-kanban-quota-title" },
-        "Host quota circuit active — matching account budget groups are deferred"),
-      circuits.map(function (circuit) {
-        return h("div", { className: "hermes-kanban-quota-row", key: circuit.group },
-          h("div", { className: "hermes-kanban-quota-detail" },
-            h("strong", null, circuit.group),
-            " · " + circuit.reason,
-            " · First observed " + new Date(circuit.first_observed_at * 1000).toLocaleString(),
-            " · Last observed " + new Date(circuit.last_observed_at * 1000).toLocaleString(),
-            " · Next eligible " + new Date(circuit.next_eligible_at * 1000).toLocaleString(),
-            " · Boards deferred " + circuit.boards_deferred,
-            " · Cards deferred " + circuit.cards_deferred,
-          ),
-          h("button", {
-            type: "button",
-            className: "hermes-kanban-quota-clear",
-            onClick: function () { clearCircuit(circuit.group); },
-          }, "Clear circuit"),
-        );
-      }),
-      message ? h("div", { className: "hermes-kanban-quota-message" }, message) : null,
     );
   }
 
@@ -2136,6 +2091,30 @@
     );
   }
 
+  // Readout of the board's project binding (GET /boards annotates every
+  // board with project_id + project_name). The × sends PATCH
+  // {project_id: ""} — the same clear the settings dialog uses — so the
+  // binding is visible and removable without opening Settings.
+  function BoardProjectBadge(props) {
+    const { t } = useI18n();
+    const b = props.board;
+    if (!b || !b.project_id) return null;
+    return h(Badge, {
+      variant: "outline",
+      className: "hermes-kanban-board-project text-xs font-normal gap-1",
+      title: tx(t, "boardProjectBadgeTitle", "New tasks on this board inherit this project"),
+    },
+      tx(t, "boardProjectBadge", "Project: {name}", { name: b.project_name || b.project_id }),
+      h("button", {
+        type: "button",
+        className: "hermes-kanban-board-project-unbind",
+        "aria-label": tx(t, "unbindProject", "Unbind project"),
+        title: tx(t, "unbindProject", "Unbind project"),
+        onClick: props.onUnbind,
+      }, "×"),
+    );
+  }
+
   function BoardSwitcher(props) {
     const { t } = useI18n();
     const list = props.boardList || [];
@@ -2168,6 +2147,7 @@
           title: tx(t, "boardSettingsTitle",
             "Board settings — name, description, and the default project directory new tasks inherit"),
         }, tx(t, "boardSettings", "Settings")),
+        h(BoardProjectBadge, { board: current, onUnbind: props.onUnbindProject }),
         h(DocsLink, null),
       );
     }
@@ -2193,6 +2173,7 @@
             ),
             h("span", { className: "text-xs text-muted-foreground" },
               `${currentTotal || 0} task${currentTotal === 1 ? "" : "s"}`),
+            h(BoardProjectBadge, { board: current, onUnbind: props.onUnbindProject }),
           ),
         ),
         h("div", { className: "flex-1" }),
@@ -2240,6 +2221,24 @@
     );
   }
 
+  // Live (non-archived) Hermes projects available for board scoping,
+  // fetched from GET /projects on mount. On failure the list stays empty
+  // and both dialogs omit the project_id field from their payloads, so a
+  // projects-store hiccup can never clear an existing binding.
+  function useBoardProjects() {
+    const [projects, setProjects] = useState([]);
+    useEffect(function () {
+      let cancelled = false;
+      SDK.fetchJSON(`${API}/projects`)
+        .then(function (res) {
+          if (!cancelled) setProjects((res && res.projects) || []);
+        })
+        .catch(function () { /* optional field; keep the list empty */ });
+      return function () { cancelled = true; };
+    }, []);
+    return projects;
+  }
+
   function NewBoardDialog(props) {
     const { t } = useI18n();
     const [slug, setSlug] = useState("");
@@ -2247,6 +2246,8 @@
     const [description, setDescription] = useState("");
     const [icon, setIcon] = useState("");
     const [projectDirectory, setProjectDirectory] = useState("");
+    const projects = useBoardProjects();
+    const [projectId, setProjectId] = useState("");
     const [switchTo, setSwitchTo] = useState(true);
     const [submitting, setSubmitting] = useState(false);
     const [err, setErr] = useState(null);
@@ -2272,6 +2273,9 @@
         description: description.trim() || undefined,
         icon: icon.trim() || undefined,
         default_workdir: projectDirectory.trim() || undefined,
+        // Only send the binding when the selector was actually rendered
+        // (projects loaded) and one was picked.
+        project_id: (projects.length && projectId) || undefined,
         switch: switchTo,
       }).catch(function (e) {
         setErr(String(e && e.message ? e.message : e));
@@ -2348,6 +2352,25 @@
               tx(t, "projectDirectoryExplanation",
                 "Sets the default location for task files so project output is preserved.")),
           ),
+          projects.length ? h("div", { className: "flex flex-col gap-1" },
+            h(Label, { className: "text-xs" }, tx(t, "boardProject", "Project"), " ",
+              h("span", { className: "text-muted-foreground" },
+                tx(t, "boardProjectHint", "(optional)"))),
+            h(Select, Object.assign({
+              value: projectId,
+              className: "h-8",
+            }, selectChangeHandler(setProjectId)),
+              h(SelectOption, { value: "" },
+                tx(t, "boardProjectNone", "No project binding")),
+              projects.map(function (p) {
+                return h(SelectOption, { key: p.id, value: p.id },
+                  p.name || p.slug || p.id);
+              }),
+            ),
+            h("div", { className: "text-xs text-muted-foreground" },
+              tx(t, "boardProjectExplanation",
+                "Tasks created on this board inherit the bound project.")),
+          ) : null,
           h("div", { className: "flex flex-col gap-1" },
             h(Label, { className: "text-xs" }, tx(t, "icon", "Icon"), " ",
               h("span", { className: "text-muted-foreground" },
@@ -2385,16 +2408,19 @@
     );
   }
 
-  // Board settings dialog — edit display name, description, and the
-  // board-level default project directory (default_workdir). The workdir
-  // is the board-level setting every new task's workspace kind/path is
-  // seeded from; task-level values in the create dialog override it.
+  // Board settings dialog — edit display name, description, the
+  // board-level default project directory (default_workdir), and the
+  // board's project binding (project_id). The workdir is the board-level
+  // setting every new task's workspace kind/path is seeded from;
+  // task-level values in the create dialog override it.
   function BoardSettingsDialog(props) {
     const { t } = useI18n();
     const b = props.board || {};
     const [name, setName] = useState(b.name || "");
     const [description, setDescription] = useState(b.description || "");
     const [projectDirectory, setProjectDirectory] = useState(b.default_workdir || "");
+    const projects = useBoardProjects();
+    const [projectId, setProjectId] = useState(b.project_id || "");
     const [submitting, setSubmitting] = useState(false);
     const [err, setErr] = useState(null);
 
@@ -2404,10 +2430,19 @@
       setErr(null);
       // Send default_workdir unconditionally: "" clears it on the server,
       // a path sets it (validated server-side: absolute + existing dir).
+      // Exception: a blank directory next to a chosen project is omitted
+      // so the server mirrors the project's primary folder into
+      // default_workdir — the same seeding the create dialog gets.
+      // project_id mirrors that only when the selector was rendered
+      // (projects loaded): "" clears the binding, an id scopes the board.
+      // When the projects store is unreachable the field is omitted so
+      // saving unrelated settings never wipes an existing binding.
+      const boundProject = projects.length ? projectId : undefined;
       props.onSave({
         name: name.trim() || undefined,
         description: description.trim() || undefined,
-        default_workdir: projectDirectory.trim(),
+        default_workdir: projectDirectory.trim() || (boundProject ? undefined : ""),
+        project_id: boundProject,
       }).catch(function (e) {
         setErr(parseApiErrorMessage(e));
         setSubmitting(false);
@@ -2462,6 +2497,26 @@
               tx(t, "projectDirectoryOverrideHint",
                 "New tasks inherit this as their workspace default; each task can still override it in the create dialog.")),
           ),
+          projects.length ? h("div", { className: "flex flex-col gap-1" },
+            h(Label, { className: "text-xs" },
+              tx(t, "boardProject", "Project")),
+            h(Select, Object.assign({
+              value: projectId,
+              className: "h-8",
+            }, selectChangeHandler(setProjectId)),
+              h(SelectOption, { value: "" },
+                tx(t, "boardProjectClear", "No binding (clears on save)")),
+              projects.map(function (p) {
+                return h(SelectOption, {
+                  key: p.id,
+                  value: p.id,
+                }, p.name || p.slug || p.id);
+              }),
+            ),
+            h("div", { className: "text-xs text-muted-foreground" },
+              tx(t, "boardProjectSettingsExplanation",
+                "Bound project tasks inherit the project. Select “No binding” to clear it.")),
+          ) : null,
         ),
         err ? h("div", { className: "text-xs text-destructive mt-2" }, err) : null,
         h("div", { className: "hermes-kanban-dialog-actions" },
@@ -3963,7 +4018,6 @@
               onClick: function () { props.setEditing(true); },
             }, t.title || tx(i18n, "untitled", "(untitled)")),
       ),
-      h(CtaBanner, { task: t, events: events, onPatch: props.onPatch }),
       h("div", { className: "hermes-kanban-drawer-meta" },
         h(MetaRow, { label: tx(i18n, "status", "Status"), value: t.status }),
         h(AssigneeEditor, { task: t, onPatch: props.onPatch }),
@@ -4278,102 +4332,6 @@
       h("span", { className: "hermes-kanban-meta-label" }, props.label),
       h("span", { className: "hermes-kanban-meta-value" }, props.value),
     );
-  }
-
-  // The reason text on the most recent `blocked` event, if any — the
-  // worker's own explanation for why the task is stuck, surfaced verbatim
-  // in the CTA banner instead of making the user dig through Events for it.
-  function _latestBlockReason(events) {
-    for (let i = events.length - 1; i >= 0; i--) {
-      const e = events[i];
-      if (e.kind === "blocked" || e.kind === "block_loop_detected") {
-        const p = e.payload;
-        if (p && typeof p === "object" && typeof p.reason === "string" && p.reason) {
-          return p.reason;
-        }
-        return null;
-      }
-    }
-    return null;
-  }
-
-  const BLOCK_KIND_LABEL = {
-    dependency: "waitingOnDependency",
-    needs_input: "needsYourInput",
-    capability: "missingCapability",
-    transient: "transientFailure",
-  };
-  const BLOCK_KIND_FALLBACK = {
-    dependency: "Waiting on a dependency",
-    needs_input: "Needs your input",
-    capability: "Missing a capability",
-    transient: "Hit a transient failure",
-  };
-
-  // The task detail view's top-of-drawer call to action: the answer to "why
-  // is this stuck and what do I do about it", rendered once above everything
-  // else whenever the task needs a human decision right now (blocked or
-  // parked in review). Everything below stays informational.
-  function CtaBanner(props) {
-    const { t } = useI18n();
-    const task = props.task;
-    const events = props.events || [];
-
-    if (task.status === "blocked") {
-      const kind = task.block_kind || null;
-      const reason = _latestBlockReason(events);
-      const cls = kind === "transient" ? "hermes-kanban-cta--transient" : "hermes-kanban-cta--blocked";
-      const icon = kind === "needs_input" ? "?" : kind === "transient" ? "\u21BB" : "!!";
-      const title = kind
-        ? tx(t, "cta." + BLOCK_KIND_LABEL[kind], BLOCK_KIND_FALLBACK[kind])
-        : tx(t, "cta.blockedTitle", "Blocked — needs your input");
-      return h("div", { className: cn("hermes-kanban-cta", cls) },
-        h("div", { className: "hermes-kanban-cta-head" },
-          h("span", { className: "hermes-kanban-cta-icon" }, icon),
-          h("span", { className: "hermes-kanban-cta-title" }, title),
-        ),
-        h("div", { className: "hermes-kanban-cta-body" },
-          reason || tx(t, "cta.blockedNoReason", "The worker blocked this task but did not record a reason.")),
-        h("div", { className: "hermes-kanban-cta-actions" },
-          h(Button, {
-            size: "sm",
-            onClick: function () {
-              const ta = document.querySelector(".hermes-kanban-drawer-comment-row input, .hermes-kanban-drawer-comment-row textarea");
-              if (ta) { ta.scrollIntoView({ behavior: "smooth", block: "nearest" }); ta.focus(); }
-            },
-          }, tx(t, "cta.reply", "Reply")),
-          h(Button, {
-            size: "sm",
-            variant: "outline",
-            onClick: function () { props.onPatch({ status: "ready" }); },
-          }, tx(t, "unblock", "Unblock")),
-        ),
-      );
-    }
-
-    if (task.status === "review") {
-      return h("div", { className: "hermes-kanban-cta hermes-kanban-cta--review" },
-        h("div", { className: "hermes-kanban-cta-head" },
-          h("span", { className: "hermes-kanban-cta-icon" }, "\u{1F441}"),
-          h("span", { className: "hermes-kanban-cta-title" }, tx(t, "cta.reviewTitle", "Needs review")),
-        ),
-        h("div", { className: "hermes-kanban-cta-body" },
-          tx(t, "cta.reviewBody", "A reviewer should check the work below before this is marked done.")),
-        h("div", { className: "hermes-kanban-cta-actions" },
-          h(Button, {
-            size: "sm",
-            onClick: function () { props.onPatch({ status: "done" }, { confirm: getDestructiveConfirm(t, "done") }); },
-          }, tx(t, "cta.approve", "Approve (mark done)")),
-          h(Button, {
-            size: "sm",
-            variant: "outline",
-            onClick: function () { props.onPatch({ status: "ready" }); },
-          }, tx(t, "cta.sendBack", "Send back to Ready")),
-        ),
-      );
-    }
-
-    return null;
   }
 
   function TitleEditor(props) {
@@ -4878,8 +4836,6 @@
         specifyButton,
         decomposeButton,
         b("→ triage",  { status: "triage" },   task.status !== "triage"),
-        b(tx(t, "hold", "Shelve"), { status: "on_hold" },
-          task.status !== "on_hold" && task.status !== "done" && task.status !== "archived"),
         b("→ ready",   { status: "ready" },    task.status !== "ready"),
         // No direct → running button: /tasks/:id PATCH rejects status=running
         // with 400 (issue #19535). Tasks enter running only through the
@@ -4952,9 +4908,6 @@
   // -------------------------------------------------------------------------
 
   if (window.__HERMES_PLUGINS__ && typeof window.__HERMES_PLUGINS__.register === "function") {
-    // Sub-surfaces the host does not route to directly are reachable off the
-    // registered page so behavioral tests can mount them with a fake SDK.
-    KanbanPage.QuotaCircuitBanner = QuotaCircuitBanner;
     window.__HERMES_PLUGINS__.register("kanban", KanbanPage);
   }
 })();

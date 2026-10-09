@@ -1,249 +1,124 @@
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
-import type * as React from 'react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { cleanup, render } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-import type { SidebarSessionEntry } from '@/lib/session-branch-tree'
+import type { SessionInfo } from '@/hermes'
 import type { SidebarListRow } from '@/lib/session-date-groups'
-import type { SessionInfo } from '@/types/hermes'
+import { $sessionListDensity } from '@/store/session-list-density'
 
+import { SESSION_CARD_ROW_ESTIMATE_PX, sessionRowEstimate } from './session-row-details'
 import { VirtualSessionList } from './virtual-session-list'
 
-const virtualizer = {
-  getTotalSize: () => 68,
-  getVirtualItems: () => [
-    { end: 26, index: 0, start: 0 },
-    { end: 68, index: 1, start: 26 }
-  ],
-  measure: vi.fn(),
+// The virtualizer is mocked with a STABLE instance (the real hook returns
+// one), so the component's measure() effect fires exactly when its deps
+// change — which is the behavior under test: `card` must invalidate cached
+// measurements, or toggling Inbox style leaves the previous mode's row
+// heights in place (#88473).
+const measureSpy = vi.fn()
+let estimateSize: (index: number) => number = () => 0
+
+const stableVirtualizer = {
+  measure: (...args: []) => measureSpy(...args),
+  getVirtualItems: () => [],
+  getTotalSize: () => 0,
   measureElement: vi.fn()
 }
 
-vi.mock('@dnd-kit/sortable', () => ({ useSortable: vi.fn() }))
-vi.mock('@dnd-kit/utilities', () => ({ CSS: { Transform: { toString: vi.fn() } } }))
-vi.mock('@tanstack/react-virtual', () => ({ useVirtualizer: () => virtualizer }))
+vi.mock('@tanstack/react-virtual', () => ({
+  useVirtualizer: (options: { estimateSize: (index: number) => number }) => {
+    estimateSize = options.estimateSize
+
+    return stableVirtualizer
+  }
+}))
+
+vi.mock('./chrome', () => ({ SidebarDateDivider: () => null }))
+vi.mock('./session-row', () => ({ SidebarSessionRow: () => null }))
 
 vi.mock('@/i18n', () => ({
-  useI18n: () => ({
-    t: {
-      sidebar: {
-        dateDivider: {
-          earlierThisMonth: 'Earlier this month',
-          lastMonth: 'Last month',
-          lastWeek: 'Last week',
-          older: 'Older',
-          today: 'Today',
-          yesterday: 'Yesterday'
-        }
-      }
-    }
-  })
+  useI18n: () => ({ t: { sidebar: { dateDivider: {} } } })
 }))
 
-vi.mock('./chrome', () => ({
-  SidebarDateDivider: ({ label, ...props }: { label: string } & React.ComponentProps<'div'>) => (
-    <div data-testid={`divider-${label}`} {...props} />
-  )
-}))
-
-vi.mock('./session-row', () => ({
-  SidebarSessionRow: ({ onArchive, session }: { onArchive: () => void; session: SessionInfo }) => (
-    <button data-testid={`archive-${session.id}`} onClick={onArchive} type="button" />
-  )
-}))
-
-afterEach(cleanup)
+const session = (id: string) =>
+  ({ archived: false, id, last_active: 0, profile: 'default', started_at: 0 }) as unknown as SessionInfo
 
 const rows: SidebarListRow[] = [
   { key: 'today', kind: 'divider', label: 'Today' },
-  { key: 'older', kind: 'divider', label: 'Older' }
+  { entry: { session: session('s1') }, kind: 'session' },
+  { entry: { session: session('s2') }, kind: 'session' }
 ]
 
-const noop = () => {}
+const defaultProps = {
+  activeSessionId: null,
+  onDeleteSession: () => {},
+  onResumeSession: () => {},
+  onArchiveSession: () => {},
+  onTogglePin: () => {},
+  onToggleUnread: () => {},
+  pinned: false,
+  rows,
+  sortable: false
+}
 
-describe('VirtualSessionList', () => {
-  it('positions measured rows independently within a total-size spacer', () => {
-    const { getByTestId } = render(
-      <VirtualSessionList
-        activeSessionId={null}
-        onArchiveSession={noop}
-        onDeleteSession={noop}
-        onResumeSession={noop}
-        onTogglePin={noop}
-        onToggleUnread={noop}
-        pinned={false}
-        rows={rows}
-        sortable={false}
-      />
-    )
+function renderList(props: Partial<Parameters<typeof VirtualSessionList>[0]> = {}) {
+  return render(<VirtualSessionList {...defaultProps} {...props} />)
+}
 
-    const firstItem = getByTestId('divider-Today').parentElement
-    const secondItem = getByTestId('divider-Older').parentElement
-    const spacer = firstItem?.parentElement
-
-    expect(firstItem?.dataset.index).toBe('0')
-    expect(firstItem?.style.position).toBe('absolute')
-    expect(firstItem?.style.transform).toBe('translateY(0px)')
-    expect(secondItem?.dataset.index).toBe('1')
-    expect(secondItem?.style.transform).toBe('translateY(26px)')
-    expect(spacer?.className).toBe('relative')
-    expect(spacer?.style.height).toBe('68px')
-    expect(spacer?.style.paddingTop).toBe('')
-    expect(spacer?.style.paddingBottom).toBe('')
+describe('VirtualSessionList row measurement', () => {
+  beforeEach(() => {
+    measureSpy.mockClear()
+    $sessionListDensity.set('compact')
   })
 
-  it('lets wheel overscroll chain to the outer sidebar scroller (#84964)', () => {
-    const { getByTestId } = render(
-      <VirtualSessionList
-        activeSessionId={null}
-        onArchiveSession={noop}
-        onDeleteSession={noop}
-        onResumeSession={noop}
-        onTogglePin={noop}
-        onToggleUnread={noop}
-        pinned={false}
-        rows={rows}
-        sortable={false}
-      />
-    )
-
-    const scroller = getByTestId('divider-Today').parentElement?.parentElement?.parentElement
-
-    // The inner virtualized scroller must NOT contain overscroll: it is nested
-    // inside the sidebar's own scroll container, and containing it swallowed
-    // wheel events at the inner scroll boundary — the mid-list wheel dead-zone
-    // at 25+ sessions. Chaining stays inside the sidebar because the OUTER
-    // scroller keeps overscroll-contain.
-    expect(scroller?.className).toContain('overflow-y-auto')
-    expect(scroller?.className).not.toContain('overscroll-contain')
+  afterEach(() => {
+    cleanup()
   })
 
-  // The card's AC4 regression: an archived row's menu must call the inverse
-  // canonical mutation, never re-archive an already-archived session — proven
-  // through the virtualized path (>=25 sessions), not just the flat renderer.
-  const archivedEntry: SidebarSessionEntry = {
-    session: { archived: true, id: 'archived-session' } as SessionInfo
-  }
+  it('re-measures when the density changes', () => {
+    const { rerender } = renderList()
 
-  const archivedRows: SidebarListRow[] = [{ entry: archivedEntry, kind: 'session' }]
+    const afterMount = measureSpy.mock.calls.length
 
-  it('routes an archived row to onUnarchiveSession, never onArchiveSession', () => {
-    const onArchiveSession = vi.fn()
-    const onUnarchiveSession = vi.fn()
+    $sessionListDensity.set('detailed')
+    rerender(<VirtualSessionList {...defaultProps} />)
 
-    const { getByTestId } = render(
-      <VirtualSessionList
-        activeSessionId={null}
-        onArchiveSession={onArchiveSession}
-        onDeleteSession={noop}
-        onResumeSession={noop}
-        onTogglePin={noop}
-        onToggleUnread={noop}
-        onUnarchiveSession={onUnarchiveSession}
-        pinned={false}
-        rows={archivedRows}
-        sortable={false}
-      />
-    )
-
-    fireEvent.click(getByTestId('archive-archived-session'))
-
-    expect(onUnarchiveSession).toHaveBeenCalledExactlyOnceWith('archived-session')
-    expect(onArchiveSession).not.toHaveBeenCalled()
+    expect(measureSpy.mock.calls.length).toBeGreaterThan(afterMount)
   })
 
-  it('falls back to a no-op on an archived row when no onUnarchiveSession is wired', () => {
-    const onArchiveSession = vi.fn()
+  it('re-measures when Inbox card mode toggles — stale compact measurements must not survive the switch (#88473)', () => {
+    const { rerender } = renderList()
 
-    const { getByTestId } = render(
-      <VirtualSessionList
-        activeSessionId={null}
-        onArchiveSession={onArchiveSession}
-        onDeleteSession={noop}
-        onResumeSession={noop}
-        onTogglePin={noop}
-        onToggleUnread={noop}
-        pinned={false}
-        rows={archivedRows}
-        sortable={false}
-      />
-    )
+    const afterMount = measureSpy.mock.calls.length
 
-    fireEvent.click(getByTestId('archive-archived-session'))
+    rerender(<VirtualSessionList {...defaultProps} card />)
 
-    expect(onArchiveSession).not.toHaveBeenCalled()
+    expect(measureSpy.mock.calls.length).toBeGreaterThan(afterMount)
   })
-})
 
-// AC4 (reviewer round 2, recovery t_77c22e64): the tests above prove
-// VirtualSessionList's OWN routing logic against the bare-button row mock —
-// they never exercise the row's real kebab/context menu. This block renders
-// the ACTUAL SidebarSessionRow (and its real ./chrome + ./session-actions-menu
-// dependents) through the virtualized path, at a >=25-row archived dataset, so
-// a real click on a real Unarchive menu item is what proves the wiring —
-// not a synthetic onClick on a stand-in button.
-//
-// The rest of this file mocks './chrome' and './session-row' with bare
-// stand-ins, and @/i18n with a partial (dateDivider-only) catalog — none of
-// which the real row can render with (it needs the full row chrome and the
-// full t.sidebar.row translations). vi.doUnmock + vi.resetModules gets a
-// fresh module graph for just this describe, without disturbing the
-// statically-imported (mocked) VirtualSessionList the rest of the file uses.
-describe('VirtualSessionList — real archived row through the virtualized path (AC4)', () => {
-  it('opens the real Unarchive menu on an archived row and calls onUnarchiveSession once', async () => {
-    vi.resetModules()
-    vi.doUnmock('./chrome')
-    vi.doUnmock('./session-row')
-    vi.doUnmock('@/i18n')
+  it('routes the estimate by row kind and mode', () => {
+    const { rerender } = renderList()
 
-    const { VirtualSessionList: RealRowVirtualSessionList } = await import('./virtual-session-list')
+    // Dividers keep their own fixed estimate in every mode.
+    expect(estimateSize(0)).toBe(28)
+    expect(estimateSize(1)).toBe(sessionRowEstimate('compact'))
 
-    const realArchivedRows: SidebarListRow[] = Array.from({ length: 25 }, (_, i) => ({
-      entry: {
-        session: {
-          archived: true,
-          id: `archived-${i}`,
-          last_active: Date.now() / 1000 - i,
-          profile: 'default',
-          started_at: Date.now() / 1000 - i,
-          title: `Archived session ${i}`
-        } as SessionInfo
-      },
-      kind: 'session' as const
-    }))
+    rerender(<VirtualSessionList {...defaultProps} card />)
 
-    const onArchiveSession = vi.fn()
-    const onResumeSession = vi.fn()
-    const onUnarchiveSession = vi.fn()
+    expect(estimateSize(0)).toBe(28)
+    expect(estimateSize(1)).toBe(SESSION_CARD_ROW_ESTIMATE_PX)
+  })
 
-    render(
-      <RealRowVirtualSessionList
-        activeSessionId={null}
-        onArchiveSession={onArchiveSession}
-        onDeleteSession={noop}
-        onResumeSession={onResumeSession}
-        onTogglePin={noop}
-        onToggleUnread={noop}
-        onUnarchiveSession={onUnarchiveSession}
-        pinned={false}
-        rows={realArchivedRows}
-        sortable={false}
-      />
+  it('estimates a card at or above the tallest four-line card stack (#88473)', () => {
+    // A full Inbox card renders four text lines (header, title, preview,
+    // model/size) where the tallest inline density renders three — plus the
+    // card's own padding, and one more title line when the title wraps on a
+    // narrow sidebar. The estimate must cover that worst case: undersized
+    // estimates paint rows over their neighbours on cold start, before
+    // self-measurement can correct them.
+    const onePreviewLine = 13.5
+    const oneTitleLine = 17.6
+
+    expect(SESSION_CARD_ROW_ESTIMATE_PX).toBeGreaterThanOrEqual(
+      sessionRowEstimate('detailed') + onePreviewLine + oneTitleLine
     )
-
-    // The mocked @tanstack/react-virtual stub always yields exactly two virtual
-    // items regardless of row count (see the shared `virtualizer` object above)
-    // — that's enough to exercise one real archived row through the actual
-    // virtualized render path without needing every one of the 25 to paint.
-    const [trigger] = screen.getAllByRole('button', { name: 'Session actions' })
-    fireEvent.pointerDown(trigger, { button: 0, pointerType: 'mouse' })
-    fireEvent.pointerUp(trigger, { button: 0, pointerType: 'mouse' })
-    fireEvent.click(trigger)
-
-    const unarchiveItem = await screen.findByRole('menuitem', { name: /^Unarchive$/i })
-    fireEvent.click(unarchiveItem)
-
-    expect(onUnarchiveSession).toHaveBeenCalledExactlyOnceWith('archived-0')
-    expect(onArchiveSession).not.toHaveBeenCalled()
-    expect(onResumeSession).not.toHaveBeenCalled()
   })
 })

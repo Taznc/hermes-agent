@@ -44,7 +44,8 @@ function resetStores() {
     requested: false,
     firstRunSkipped: false,
     manual: false,
-    localEndpoint: false
+    localEndpoint: false,
+    freeTierReady: false
   })
 }
 
@@ -61,30 +62,6 @@ const isRecoveryShown = () =>
   Boolean(screen.queryByText(/use local gateway/i) || screen.queryByText(/retry/i) || screen.queryByText(/sign in/i))
 
 describe('connecting overlay vs recovery surface', () => {
-  it('hard initial-boot failure surfaces the recovery overlay (the working path)', async () => {
-    // failDesktopBoot() ran: error set, gateway never opened.
-    $desktopBoot.set({
-      ...$desktopBoot.get(),
-      error: 'Hermes backend did not become ready',
-      running: false,
-      visible: true
-    })
-    setGatewayState('error')
-
-    await act(async () => {
-      render(
-        <>
-          <GatewayConnectingOverlay />
-          <BootFailureOverlay />
-        </>
-      )
-    })
-
-    expect(isRecoveryShown()).toBe(true)
-    // Connecting overlay bows out when boot.error is set.
-    expect(isConnectingShown()).toBe(false)
-  })
-
   it('post-boot socket drops do not re-cover the app with the initial CONNECTING overlay', async () => {
     // 1. Initial boot succeeded: gateway opened, boot completed (no error).
     setGatewayState('open')
@@ -174,14 +151,6 @@ describe('connecting overlay vs recovery surface', () => {
     // Transport blips no longer set boot.error (toast + background retry).
     // Confirmed OAuth reauth still does — and that recovery surface must win
     // over any residual connecting state so Sign-in / Gateway settings stay reachable.
-    // Electron always exposes getConnectionConfig (only the browser web-spike
-    // shim omits it), which is what gates the Gateway settings button.
-    const originalDesktop = window.hermesDesktop
-    Object.defineProperty(window, 'hermesDesktop', {
-      configurable: true,
-      value: { getRecentLogs: async () => ({ lines: [] }), getConnectionConfig: async () => null }
-    })
-
     setGatewayState('error')
     $desktopBoot.set({
       ...$desktopBoot.get(),
@@ -190,22 +159,18 @@ describe('connecting overlay vs recovery surface', () => {
       visible: true
     })
 
-    try {
-      await act(async () => {
-        render(
-          <>
-            <GatewayConnectingOverlay />
-            <BootFailureOverlay />
-          </>
-        )
-      })
+    await act(async () => {
+      render(
+        <>
+          <GatewayConnectingOverlay />
+          <BootFailureOverlay />
+        </>
+      )
+    })
 
-      // Escape hatch is reachable; the connecting overlay bows out.
-      expect(isRecoveryShown()).toBe(true)
-      expect(screen.getByRole('button', { name: /gateway settings/i })).toBeTruthy()
-      expect(isConnectingShown()).toBe(false)
-    } finally {
-      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: originalDesktop })
-    }
+    // Escape hatch is reachable; the connecting overlay bows out.
+    expect(isRecoveryShown()).toBe(true)
+    expect(screen.getByRole('button', { name: /gateway settings/i })).toBeTruthy()
+    expect(isConnectingShown()).toBe(false)
   })
 })

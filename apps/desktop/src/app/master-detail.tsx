@@ -100,20 +100,13 @@ export function MasterDetail({
       )
     }
 
-    // Ends on pointerup OR pointercancel (window drag-out, touch cancel,
-    // system gesture) — a cancelled stream must tear down too, or the sash
-    // keeps resizing with no button held. Explicit removal instead of
-    // `{ once: true }`: once-per-listener doesn't cross-remove the other path.
     const onUp = () => {
       window.removeEventListener('pointermove', onMove)
-      window.removeEventListener('pointerup', onUp)
-      window.removeEventListener('pointercancel', onUp)
       setDragging(false)
     }
 
     window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp)
-    window.addEventListener('pointercancel', onUp)
+    window.addEventListener('pointerup', onUp, { once: true })
   }
 
   // With a sash the detail side gets a relative wrapper so the seam handle can
@@ -213,8 +206,12 @@ const DETAIL_PANE_COLLAPSED_PX = 4
 // strip <Button size="icon">'s larger built-in size — a custom utility class
 // isn't size-merge-aware, so Button's icon size would leak and blow it up.
 // Compose extra state (data-[state=open], hover:text-destructive) with cn().
+// The visible box stays 20px; a transparent 2px ::before ring grows the pointer
+// target to 24px, the WCAG 2.5.8 Target Size (Minimum) floor (audit #38072,
+// finding 6), without changing how the button looks or lays out. The 2.5.5
+// enhanced 44px target is deliberately not met here.
 export const ICON_BUTTON =
-  'size-5 cursor-pointer rounded-[4px] text-muted-foreground/70 hover:bg-(--ui-control-active-background) hover:text-foreground'
+  "size-5 relative cursor-pointer rounded-[4px] text-muted-foreground/70 before:absolute before:-inset-0.5 before:content-[''] hover:bg-(--ui-control-active-background) hover:text-foreground"
 
 export function DetailPane({
   actions,
@@ -265,18 +262,13 @@ export function DetailPane({
       setPaneHeightOverride(id, Math.min(max, Math.max(0, Math.round(startHeight + (startY - move.clientY)))))
     }
 
-    // Same teardown contract as the split sash above: pointercancel ends the
-    // drag exactly like pointerup, with explicit cross-removal of both.
     const onUp = () => {
       window.removeEventListener('pointermove', onMove)
-      window.removeEventListener('pointerup', onUp)
-      window.removeEventListener('pointercancel', onUp)
       setDragging(false)
     }
 
     window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp)
-    window.addEventListener('pointercancel', onUp)
+    window.addEventListener('pointerup', onUp, { once: true })
   }
 
   return (

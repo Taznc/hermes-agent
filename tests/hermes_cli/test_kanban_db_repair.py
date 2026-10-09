@@ -93,10 +93,8 @@ def _integrity_messages(db_path: Path) -> list[str]:
 # Narrow auto-repair in the connect-time guard
 # ---------------------------------------------------------------------------
 
-def test_connect_auto_repairs_index_only_corruption(tmp_path, caplog):
+def test_connect_auto_repairs_index_only_corruption(tmp_path):
     """Index-only integrity errors are REINDEXed and connect proceeds."""
-    import logging
-
     db_path = tmp_path / "kanban.db"
     _build_board_db(db_path)
     _corrupt_index(db_path, "idx_tasks_status")
@@ -106,8 +104,7 @@ def test_connect_auto_repairs_index_only_corruption(tmp_path, caplog):
     assert any(m.startswith("wrong # of entries in index") for m in messages)
     assert kbc._repairable_index_names(messages) == ["idx_tasks_status"]
 
-    with caplog.at_level(logging.WARNING, logger="hermes_cli.kanban_db"):
-        conn = kbc.connect(db_path=db_path)
+    conn = kbc.connect(db_path=db_path)
     try:
         # DB is clean again and data survived.
         row = conn.execute("PRAGMA integrity_check").fetchone()
@@ -116,7 +113,6 @@ def test_connect_auto_repairs_index_only_corruption(tmp_path, caplog):
         assert "task-0" in titles and "task-11" in titles
     finally:
         conn.close()
-    assert "auto-repaired via REINDEX" in caplog.text
 
     # The corrupt bytes were quarantined BEFORE the repair mutated the file.
     backups = list(tmp_path.glob("kanban.db.corrupt.*.bak"))
@@ -207,11 +203,6 @@ def test_dispatch_tick_runs_wal_checkpoint_at_interval(tmp_path, monkeypatch):
     interval elapses the next tick checkpoints again."""
     db_path = tmp_path / "kanban.db"
     _build_board_db(db_path, tasks=1)
-    # Declare tmp_path as this test's kanban home so the pin below resolves
-    # inside it. kanban_db._pin_is_honored() drops an out-of-home pin that
-    # nothing vouches for — that is the guard which stops an inherited
-    # production pin from defeating a sandbox (t_602f6f7b / t_029c5ee7).
-    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
     # Fresh per-path clock so previous tests can't have claimed the slot.
     monkeypatch.setattr(kbc, "_LAST_WAL_CHECKPOINT", {})

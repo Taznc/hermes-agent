@@ -25,9 +25,13 @@
 // Everything here is pure so it can be unit-tested without Electron; the side
 // effects (writing the script, spawning) live in main.ts.
 
+import { backendProfileArg } from './profile-id-guard'
+
 /** Argv for resuming a session in the TUI, profile-pinned when we know it. */
 export function tuiResumeArgs(sessionId: string, profile?: string): string[] {
-  const head = profile ? ['--profile', profile] : []
+  // A non-slug profile value must never cross into spawn argv (#88842).
+  const pinned = backendProfileArg(profile)
+  const head = pinned ? ['--profile', pinned] : []
 
   return [...head, '--tui', '--resume', sessionId]
 }
@@ -37,18 +41,9 @@ export function posixQuote(value: string): string {
   return `'${String(value ?? '').replaceAll("'", `'\\''`)}'`
 }
 
-/**
- * Quote a value for a cmd.exe BATCH script line.
- *
- * Doubling `"` handles embedded quotes, but batch expands `%VAR%` at parse
- * time even INSIDE double quotes — a carried-over env value containing a
- * literal `%` (PROMPT-style strings, URL-encoded tokens) would be expanded or
- * silently collapsed when the .cmd runs. `%%` is the batch-file escape for a
- * literal percent (only valid in scripts, which is all this quoter is used
- * for — every caller writes lines into the generated .cmd launcher).
- */
+/** Quote a value for a cmd.exe script line. */
 export function windowsQuote(value: string): string {
-  return `"${String(value ?? '').replaceAll('%', '%%').replaceAll('"', '""')}"`
+  return `"${String(value ?? '').replaceAll('"', '""')}"`
 }
 
 /**

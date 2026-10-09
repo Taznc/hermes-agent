@@ -7,17 +7,12 @@ import { describe, expect, it } from 'vitest'
 // may use the native HTML `title=` attribute. Native tooltips are unstyled,
 // delayed (~500ms OS default), and visually inconsistent with the themed `Tip`.
 // When a tip is warranted (see DESIGN.md — not every icon, never menu triggers),
-// use `<Tip label={...}>` instead of `title=`.
+// use `<Tip label={...}>` instead of `title=`; otherwise keep an `aria-label`.
 //
 // This is a source-text scan, not a behavior test — it's the same category as
 // an ESLint rule, expressed as a vitest so it runs with the rest of the suite.
 
-// Files inside the scan scope whose title= violations are owned by an open
-// upstream PR (#94882) and must not be double-fixed here. Remove each entry
-// when that PR lands — the guard then covers the file again.
-const PENDING_UPSTREAM_FIX = new Set(['chat/zoomable-image.tsx'])
-
-// Recursively walk a directory and collect all .tsx file paths.
+// Recursively walk a directory and collect all shipped .tsx file paths.
 function collectTsxFiles(dir: string): string[] {
   const results: string[] = []
 
@@ -32,7 +27,9 @@ function collectTsxFiles(dir: string): string[] {
 
     if (stat.isDirectory()) {
       results.push(...collectTsxFiles(fullPath))
-    } else if (entry.endsWith('.tsx')) {
+    } else if (entry.endsWith('.tsx') && !entry.endsWith('.test.tsx')) {
+      // Test fixtures (`<button title={title}>` stand-ins for SDK components)
+      // are not shipped UI.
       results.push(fullPath)
     }
   }
@@ -40,145 +37,142 @@ function collectTsxFiles(dir: string): string[] {
   return results
 }
 
-// Find every <Button ...> / <button ...> opening tag (may span multiple lines)
-// carrying a native title= attribute. Returns `{ tagName, line }` per hit.
-//
-// A plain `[^>]*?` attribute window is defeated by any inline expression prop
-// containing a `>`: the `=>` of an arrow handler (`onClick={() => ...}`) or a
-// comparison (`if (a > b)`) terminates the match early, hiding a title= that
-// follows it (false negative). So instead of one regex, the attribute window
-// is walked with a tiny brace scanner: every `>` inside a `{...}` expression
-// container (or a depth-0 quoted attribute string) is ignored, and the tag
-// ends at the first `>` at brace depth 0 outside quotes. Only depth-0 text is
-// kept when testing for `title=`, so `foo.title = x` inside a handler body
-// can't false-positive. Quotes are deliberately NOT tracked inside braces —
-// apostrophes in code comments (`// don't ...`) would desync a full string
-// scanner, and unbalanced braces inside expression strings are far rarer than
-// apostrophes in comments. Still a source-text scan (no JSX parser); good
-// enough for a lint-style guard.
-export function findNativeTitleButtons(content: string): { line: number; tagName: string }[] {
-  const hits: { line: number; tagName: string }[] = []
-  const openPattern = /<(Button|button)\b/gu
+/** Every button-element opening tag in `content` — native `<button>`, the
+ *  `<Button>` primitive, and `<RowButton>` (a bare `<button>` that forwards
+ *  every prop) — with the attribute text up to the tag's real `>`. Wrappers
+ *  with their own `title` prop (CopyButton, …) render it through Tip. */
+function eachButtonOpenTag(content: string): Array<{ attrs: string; index: number; tagName: string }> {
+  const tags: Array<{ attrs: string; index: number; tagName: string }> = []
+  const openPattern = /<(Button|button|RowButton)\b/gu
   let match: RegExpExecArray | null
 
   while ((match = openPattern.exec(content)) !== null) {
-    let depth = 0
-    let quote: null | string = null
-    // Depth-0 attribute text only; nested expressions collapse to a space so
-    // `\btitle=` can only match a real attribute of THIS tag.
-    let topLevelAttrs = ''
-    let closed = false
-    let i = openPattern.lastIndex
+    const attrsStart = match.index + match[0].length
+    const end = findTagClose(content, attrsStart)
 
-    for (; i < content.length; i++) {
-      const ch = content[i]
-
-      if (depth > 0) {
-        // Inside a {...} expression: only balance braces; ignore everything
-        // else (strings, comments, nested JSX, arrows, comparisons).
-        if (ch === '{') {
-          depth++
-        } else if (ch === '}') {
-          depth--
-
-          if (depth === 0) {
-            topLevelAttrs += ' '
-          }
-        }
-      } else if (quote !== null) {
-        // Inside a depth-0 JSX attribute string ("..." / '...'): no escapes.
-        if (ch === quote) {
-          quote = null
-        }
-      } else if (ch === '"' || ch === "'") {
-        quote = ch
-      } else if (ch === '{') {
-        depth = 1
-      } else if (ch === '>') {
-        closed = true
-
-        break
-      } else {
-        topLevelAttrs += ch
-      }
+    if (end < 0) {
+      continue
     }
 
-    if (closed && /\btitle=/.test(topLevelAttrs)) {
-      hits.push({
-        line: content.slice(0, match.index).split('\n').length,
-        tagName: match[1]
-      })
+    tags.push({ attrs: content.slice(attrsStart, end), index: match.index, tagName: match[1] })
+  }
+
+  return tags
+}
+
+// The opening tag ends at the first `>` outside every `{…}` expression, string
+// literal and comment. A plain `[^>]*?>` stops inside `onClick={() =>` and
+// hides any `title=` written after the handler (#113688). Comments matter too:
+// a `// …doesn't…` note between attributes would otherwise open a quote.
+function findTagClose(content: string, start: number): number {
+  let depth = 0
+  let quote: null | string = null
+
+  for (let i = start; i < content.length; i++) {
+    const char = content[i]
+
+    if (quote) {
+      if (char === '\\') {
+        i++
+      } else if (char === quote) {
+        quote = null
+      }
+
+      continue
+    }
+
+    if (char === '/' && content[i + 1] === '/') {
+      const eol = content.indexOf('\n', i)
+
+      if (eol < 0) {
+        return -1
+      }
+
+      i = eol
+
+      continue
+    }
+
+    if (char === '/' && content[i + 1] === '*') {
+      const close = content.indexOf('*/', i + 2)
+
+      if (close < 0) {
+        return -1
+      }
+
+      i = close + 1
+
+      continue
+    }
+
+    if (char === '"' || char === "'" || char === '`') {
+      quote = char
+    } else if (char === '{') {
+      depth++
+    } else if (char === '}') {
+      depth--
+    } else if (char === '>' && depth === 0) {
+      return i
     }
   }
 
-  return hits
+  return -1
+}
+
+// `title=` as an attribute of its own — not `data-title=` / `subtitle=`.
+const TITLE_ATTR = /(?<![\w.-])title=/u
+
+function titleViolations(content: string, relativePath: string): string[] {
+  const violations: string[] = []
+
+  for (const { attrs, index, tagName } of eachButtonOpenTag(content)) {
+    if (TITLE_ATTR.test(attrs)) {
+      const lineNum = content.slice(0, index).split('\n').length
+
+      violations.push(`${relativePath}:${lineNum} <${tagName}> has title= — use <Tip> or aria-label`)
+    }
+  }
+
+  return violations
 }
 
 describe('no native title= on button elements', () => {
-  // Regression fixtures for the matcher itself: an inline arrow-function prop
-  // BEFORE the title attribute used to truncate the attribute window at the
-  // `>` of `=>`, so the title= after it was never seen (false negative).
-  it('catches title= even when an arrow-function prop precedes it', () => {
-    const singleLine = `<button onClick={() => setOpen(true)} title={label} type="button">x</button>`
+  it('sees title= after inline handlers and inside comment-bearing tags, and nowhere else', () => {
+    const flagged = [
+      '<button onClick={() => {}} title="probe">hi</button>',
+      '<Button\n  onClick={event => {\n    event.preventDefault()\n  }}\n  // macOS doesn\'t focus a button on mousedown\n  title={copy.send}\n  type="button"\n>',
+      "<button className={cn(saved ? 'a' : 'b')} title={on ? m.off(t) : m.on(t)}>",
+      '<RowButton onClick={pick} title={hint}>'
+    ]
 
-    expect(findNativeTitleButtons(singleLine)).toEqual([{ line: 1, tagName: 'button' }])
+    const clean = [
+      '<button aria-label="a > b" onClick={() => {}}>hi</button>',
+      '<button data-title="x" onClick={() => {}}>hi</button>',
+      '<button onClick={() => {}}>{`title=${x}`}</button>',
+      '<span title="fine"><button type="button">hi</button></span>'
+    ]
 
-    const multiLine = [
-      '<Button',
-      '  onClick={event => {',
-      '    if (a > b) return',
-      '    doThing()',
-      '  }}',
-      '  title="Do the thing"',
-      '>',
-      '  x',
-      '</Button>'
-    ].join('\n')
+    for (const source of flagged) {
+      expect(titleViolations(source, 'probe.tsx'), source).toHaveLength(1)
+    }
 
-    expect(findNativeTitleButtons(multiLine)).toEqual([{ line: 1, tagName: 'Button' }])
-
-    // Apostrophes in comments inside a handler body must not desync the scan.
-    const commented = [
-      '<button',
-      '  onClick={() => {',
-      "    // don't collapse the clamp",
-      '    toggle()',
-      '  }}',
-      '  title={dynamic ? a : undefined}',
-      '  type="button"',
-      '>',
-      '  x',
-      '</button>'
-    ].join('\n')
-
-    expect(findNativeTitleButtons(commented)).toEqual([{ line: 1, tagName: 'button' }])
+    for (const source of clean) {
+      expect(titleViolations(source, 'probe.tsx'), source).toEqual([])
+    }
   })
 
-  it('does not flag buttons without title=, or title= on other elements', () => {
-    expect(findNativeTitleButtons(`<button onClick={() => setOpen(true)} type="button">x</button>`)).toEqual([])
-    expect(findNativeTitleButtons(`<span title="host">x</span>`)).toEqual([])
-    expect(findNativeTitleButtons(`<button aria-label="Close" type="button">x</button>`)).toEqual([])
-  })
-
-  // Scan every .tsx file under src/components for <button or <Button opening
-  // tags that also carry a title= attribute (anywhere in the opening tag,
-  // which may span multiple lines).
-  it('uses <Tip> instead of native title= on all button elements', () => {
+  // Scan every shipped .tsx file under src/ for <button or <Button opening tags
+  // that also carry a title= attribute (anywhere in the opening tag, which may
+  // span multiple lines).
+  it('uses <Tip> or aria-label instead of native title= on all button elements', () => {
     const violations: string[] = []
-    const srcDir = resolve(__dirname, '../..')
+    const srcDir = resolve(__dirname, '../../..')
 
     for (const filePath of collectTsxFiles(srcDir)) {
+      const content = readFileSync(filePath, 'utf-8')
       const relativePath = filePath.replace(srcDir + '/', '')
 
-      if (PENDING_UPSTREAM_FIX.has(relativePath)) {
-        continue
-      }
-
-      const content = readFileSync(filePath, 'utf-8')
-
-      for (const { line, tagName } of findNativeTitleButtons(content)) {
-        violations.push(`${relativePath}:${line} <${tagName}> has title= — use <Tip>`)
-      }
+      violations.push(...titleViolations(content, relativePath))
     }
 
     expect(violations, violations.join('\n')).toEqual([])

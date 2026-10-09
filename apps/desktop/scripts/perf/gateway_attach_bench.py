@@ -153,7 +153,7 @@ def main() -> int:
         ),
         (
             "image.detach",
-            lambda sid: {"session_id": sid, "path": "/tmp/nothing.png"},
+            lambda sid: {"session_id": sid, "path": "/nonexistent/nothing.png"},
         ),
         (
             "prompt.submit",

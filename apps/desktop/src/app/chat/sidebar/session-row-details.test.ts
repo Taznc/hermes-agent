@@ -2,65 +2,77 @@ import { describe, expect, it } from 'vitest'
 
 import type { SessionInfo } from '@/types/hermes'
 
-import { sessionRowIdentity } from './session-row-details'
+import { sessionRowDetails, type SessionRowFormatters } from './session-row-details'
 
-function makeSession(overrides: Partial<SessionInfo>): SessionInfo {
-  return {
-    id: 's1',
-    last_active: 0,
-    started_at: 0,
-    ...overrides
-  } as unknown as SessionInfo
+const en: SessionRowFormatters = {
+  messageCount: count => `${count} ${count === 1 ? 'message' : 'messages'}`,
+  toolCallCount: count => `${count} ${count === 1 ? 'tool call' : 'tool calls'}`
 }
 
-describe('sessionRowIdentity', () => {
-  it('shows only the configured family when the served route matches', () => {
-    const identity = sessionRowIdentity(
-      makeSession({ configured_provider: 'anthropic', served_provider: 'anthropic' })
-    )
+const session = (overrides: Partial<SessionInfo> = {}): SessionInfo => ({
+  ended_at: null,
+  id: 's1',
+  input_tokens: 0,
+  is_active: false,
+  last_active: 1,
+  message_count: 26,
+  model: 'google/gemini-3.1-pro',
+  output_tokens: 0,
+  preview: '  Explore\nGmail-like density tiers for session rows.  ',
+  source: 'desktop',
+  started_at: 1,
+  title: 'Session density exploration',
+  tool_call_count: 8,
+  ...overrides
+})
 
-    expect(identity).toEqual({ configured: 'Claude', served: null })
+describe('session row details', () => {
+  it('formats deterministic metadata without ambiguous call wording', () => {
+    expect(sessionRowDetails(session({ git_branch: 'feature/menu' }), en)).toEqual({
+      metadata: 'feature/menu · gemini-3.1-pro · 26 messages · 8 tool calls',
+      preview: 'Explore Gmail-like density tiers for session rows.'
+    })
   })
 
-  it('is case-insensitive when comparing configured vs served', () => {
-    const identity = sessionRowIdentity(
-      makeSession({ configured_provider: 'Anthropic', served_provider: 'ANTHROPIC' })
-    )
-
-    expect(identity).toEqual({ configured: 'Claude', served: null })
+  it('uses singular labels and omits unavailable fields', () => {
+    expect(
+      sessionRowDetails(
+        session({
+          git_branch: null,
+          message_count: 1,
+          model: null,
+          preview: null,
+          title: 'Manual title',
+          tool_call_count: 1
+        }),
+        en
+      )
+    ).toEqual({ metadata: '1 message · 1 tool call', preview: null })
   })
 
-  it('surfaces the served family only on a real mismatch (fallback case)', () => {
-    const identity = sessionRowIdentity(
-      makeSession({ configured_provider: 'anthropic', served_provider: 'openai-codex' })
-    )
-
-    expect(identity).toEqual({ configured: 'Claude', served: 'Codex' })
+  it('omits zero counts from metadata so the sidebar stays clean', () => {
+    expect(
+      sessionRowDetails(session({ git_branch: null, message_count: 0, model: null, tool_call_count: 0 }), en)
+    ).toEqual({ metadata: '', preview: 'Explore Gmail-like density tiers for session rows.' })
   })
 
-  it('renders nothing for a legacy session with no resolvable provider', () => {
-    const identity = sessionRowIdentity(makeSession({ configured_provider: null, served_provider: null }))
-
-    expect(identity).toEqual({ configured: null, served: null })
+  it('normalizes whitespace-only title, branch, and preview values', () => {
+    expect(
+      sessionRowDetails(
+        session({
+          git_branch: '   ',
+          preview: '  ',
+          title: '   '
+        }),
+        en
+      )
+    ).toEqual({ metadata: 'gemini-3.1-pro · 26 messages · 8 tool calls', preview: null })
   })
 
-  it('never infers a mismatch family when only the served side is unresolved', () => {
-    const identity = sessionRowIdentity(makeSession({ configured_provider: 'anthropic', served_provider: null }))
-
-    expect(identity).toEqual({ configured: 'Claude', served: null })
-  })
-
-  it('falls back to a title-cased label for an unrecognized provider, never a false Claude/Codex identity', () => {
-    const identity = sessionRowIdentity(
-      makeSession({ configured_provider: 'my-custom-endpoint', served_provider: 'my-custom-endpoint' })
-    )
-
-    expect(identity).toEqual({ configured: 'My Custom Endpoint', served: null })
-  })
-
-  it('treats a bare billing bucket as unresolved rather than a provider identity', () => {
-    const identity = sessionRowIdentity(makeSession({ configured_provider: 'auto', served_provider: 'auto' }))
-
-    expect(identity).toEqual({ configured: null, served: null })
+  it('omits the preview when it already supplies the displayed title', () => {
+    expect(sessionRowDetails(session({ title: null }), en)).toEqual({
+      metadata: 'gemini-3.1-pro · 26 messages · 8 tool calls',
+      preview: null
+    })
   })
 })

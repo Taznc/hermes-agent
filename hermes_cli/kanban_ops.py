@@ -11,7 +11,6 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -58,90 +57,45 @@ def _cmd_tail(args: argparse.Namespace) -> int:
     return _poll_loop(args.interval, tick)
 
 
-def _dispatch_pause_message(state: dict, *, board: Optional[str] = None) -> str:
-    """Render the shared dispatcher status on the CLI surface."""
-    return kbd.dispatch_pause_message(state, board=board)
-
-
 def _cmd_dispatch(args: argparse.Namespace) -> int:
-    board = getattr(args, "board", None)
-    pause_note = getattr(args, "pause", None)
-    if pause_note is not None:
-        paused = kbd.pause_dispatch(board, note=" ".join(pause_note).strip() or None)
-        if getattr(args, "json", False):
-            _print_json(paused, ascii=True)
-        if not paused.get("paused", False):
-            if not getattr(args, "json", False):
-                print(
-                    f"Dispatch for {board or kb.DEFAULT_BOARD} was not paused: "
-                    "a dispatch tick is in progress; retry --pause."
-                )
-            return 1
-        if not getattr(args, "json", False):
-            print(
-                f"Dispatch for {board or kb.DEFAULT_BOARD}: "
-                f"{_dispatch_pause_message(paused['state'], board=board)}"
-            )
-        return 0
-    if getattr(args, "resume_circuit", False):
-        cleared = kbd.resume_dispatch(board)
-        if getattr(args, "json", False):
-            _print_json(cleared, ascii=True)
-        if not cleared.get("resumed", True):
-            if not getattr(args, "json", False):
-                print(
-                    f"Dispatch circuit for {board or kb.DEFAULT_BOARD} was not resumed: "
-                    "a dispatch tick is in progress; repair then retry --resume-circuit."
-                )
-            return 1
-        if not getattr(args, "json", False):
-            state = cleared.get("previous") or {}
-            suffix = f" (was {state.get('reason')})" if state else " (was not paused)"
-            print(f"Dispatch circuit resumed for {board or kb.DEFAULT_BOARD}{suffix}.")
-        return 0
-    if getattr(args, "circuit_status", False):
-        state = kbd.read_dispatch_pause(board)
-        if getattr(args, "json", False):
-            _print_json({"paused": state is not None, "state": state}, ascii=True)
-        else:
-            status = _dispatch_pause_message(state, board=board) if state else "running"
-            print(f"Dispatch circuit for {board or kb.DEFAULT_BOARD}: {status}")
-        return 0
-
-    # Same caps as the gateway tick and the dashboard nudge — resolved by the
-    # one shared helper so a fourth entry point can't silently dispatch uncapped.
-    # kanban.default_reviewer rides along on the same resolution (t_fec4c811):
-    # the CLI dispatch path must route review-lane cards exactly like the
-    # gateway tick, or `hermes kanban dispatch` leaves them self-assigned.
-    caps = kbd.resolve_dispatch_caps()
-    # CLI --max is the more explicit operator signal, so it wins over
-    # kanban.max_spawn. Not clamped: unlike the dashboard's query string this
-    # is a local operator command, and max_in_progress is passed through below
-    # and enforced by dispatch_once regardless of what --max asks for.
-    cli_max = getattr(args, "max", None)
-    max_spawn = cli_max if cli_max is not None else caps.max_spawn
-    with kbc.connect_closing(board=board) as conn:
+    # Honour kanban.default_assignee, kanban.max_in_progress,
+    # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
+    # semantics as the gateway dispatch path.
+    try:
+        from hermes_cli.config import load_config
+        _cfg = load_config()
+        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
+        max_in_progress_per_profile = kbd._positive_int(
+            _kanban_cfg.get("max_in_progress_per_profile"), None
+        )
+        # Memory-derived default when unset — same fallback the gateway applies.
+        max_in_progress = kbd.resolve_max_in_progress(
+            kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
+        )
+        # CLI --max is the more explicit signal, so it wins over kanban.max_spawn.
+        cli_max = getattr(args, "max", None)
+        max_spawn = (
+            cli_max if cli_max is not None else kbd._positive_int(_kanban_cfg.get("max_spawn"), None)
+        )
+    except Exception:
+        default_assignee = max_in_progress_per_profile = max_in_progress = None
+        max_spawn = getattr(args, "max", None)
+    with kbc.connect_closing() as conn:
         res = kbd.dispatch_once(
             conn,
-            board=board,
             dry_run=args.dry_run,
             max_spawn=max_spawn,
-            max_in_progress=caps.max_in_progress,
+            max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
-            default_assignee=caps.default_assignee,
-            default_reviewer=caps.default_reviewer,
-            max_in_progress_per_profile=caps.max_in_progress_per_profile,
-            dispatch_start_budget=caps.dispatch_start_budget,
-            dispatch_start_window_seconds=caps.dispatch_start_window_seconds,
-            review_rework_escalation_profile=caps.review_rework_escalation_profile,
-            max_review_rounds=caps.max_review_rounds,
-            priority_reserved_slots=caps.priority_reserved_slots,
-            priority_reserved_threshold=caps.priority_reserved_threshold,
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
         )
     if getattr(args, "json", False):
         _print_json({
             **{k: getattr(res, k)
-               for k in ("reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "review_no_verdict", "promoted")},
+               for k in ("reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "promoted",
+                         "reaped_terminal_workers")},
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws} for (tid, who, ws) in res.spawned
             ],
@@ -152,41 +106,23 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
-            "auto_assigned_reviewer": [
-                {"task_id": tid, "previous_assignee": prev, "reviewer": rev}
-                for (tid, prev, rev) in res.auto_assigned_reviewer
+            "respawn_guarded": [
+                {"task_id": tid, "reason": reason}
+                for (tid, reason) in res.respawn_guarded
             ],
-            "auto_escalated_rework": [
-                {"task_id": tid, "previous_assignee": prev, "assignee": who,
-                 "changes_rounds": rounds}
-                for (tid, prev, who, rounds) in res.auto_escalated_rework
-            ],
-            "escalated_review_cap": [
-                {"task_id": tid, "previous_assignee": prev, "assignee": who,
-                 "changes_rounds": rounds}
-                for (tid, prev, who, rounds) in res.escalated_review_cap
-            ],
-            "blocked_review_round_cap": [
-                {"task_id": tid, "changes_rounds": rounds}
-                for (tid, rounds) in res.blocked_review_round_cap
-            ],
-            "priority_reserved": {
-                "configured_slots": caps.priority_reserved_slots,
-                "threshold": caps.priority_reserved_threshold,
-                "reserved": res.priority_slots_reserved,
-                "unused": res.priority_slots_unused,
-                "deferred_task_ids": res.deferred_priority_reserved,
-            },
-            "dispatch_paused": res.dispatch_paused,
+            "rate_limited": res.rate_limited,
+            "skipped_locked": res.skipped_locked,
+            "memory_pressure": res.memory_pressure,
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
+    if res.reaped_terminal_workers:
+        print(f"Reaped workers of finished tasks: {', '.join(res.reaped_terminal_workers)}")
     for label, items in (
         ("Crashed:     ", res.crashed),
         ("Timed out:   ", res.timed_out),
         ("Stale:       ", res.stale),
         ("Auto-blocked:", res.auto_blocked),
-        ("Review (no verdict):", res.review_no_verdict),
     ):
         print(f"{label} {len(items)}")
         if items:
@@ -198,50 +134,11 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
     if res.auto_assigned_default:
         print(
-            f"Auto-assigned to kanban.default_assignee={caps.default_assignee!r}: "
+            f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
             f"{', '.join(res.auto_assigned_default)}"
-        )
-    if res.auto_assigned_reviewer:
-        print(
-            f"Auto-assigned to kanban.default_reviewer={caps.default_reviewer!r}: "
-            + ", ".join(
-                f"{tid} ({prev} -> {rev})" for (tid, prev, rev) in res.auto_assigned_reviewer
-            )
-        )
-    for tid, previous, who, rounds in res.auto_escalated_rework:
-        print(
-            f"Escalated review rework after {rounds} change requests: "
-            f"{tid} ({previous} -> {who})"
-        )
-    for tid, previous, who, rounds in res.escalated_review_cap:
-        print(
-            f"Escalated at kanban.max_review_rounds={caps.max_review_rounds} "
-            f"after {rounds} change requests (terminal rework round): "
-            f"{tid} ({previous} -> {who})"
-        )
-    for tid, rounds in res.blocked_review_round_cap:
-        print(
-            f"Blocked at kanban.max_review_rounds={caps.max_review_rounds} "
-            f"after {rounds} change requests: {tid}"
         )
     if res.skipped_unassigned:
         print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
-    # AC5 observability: the reservation is invisible otherwise — a normal card just
-    # fails to appear in `spawned` with no stated reason. Printed whenever the feature
-    # is configured, including when it reserved nothing this tick, so an operator can
-    # tell "off", "on but no high-priority demand", and "on and holding" apart.
-    if caps.priority_reserved_slots:
-        print(
-            f"Priority reservation: {res.priority_slots_reserved} of "
-            f"{caps.priority_reserved_slots} slot(s) held for priority >= "
-            f"{caps.priority_reserved_threshold}"
-            + (f", {res.priority_slots_unused} unused" if res.priority_slots_unused else "")
-        )
-        if res.deferred_priority_reserved:
-            print(
-                "  Deferred (below threshold, slot reserved): "
-                + ", ".join(res.deferred_priority_reserved)
-            )
     for tid, who, current in res.skipped_per_profile_capped:
         print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
     if res.skipped_nonspawnable:
@@ -249,10 +146,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
-    for tid, reason in res.skill_preflight_blocked:
-        print(f"Blocked (forced skill unavailable to assignee): {tid}\n  {reason}")
-    if res.dispatch_paused:
-        print("Dispatch: " + _dispatch_pause_message(res.dispatch_paused, board=board))
+    for tid, reason in res.respawn_guarded:
+        print(f"Guarded ({reason}): {tid}")
+    if res.rate_limited:
+        print(f"Rate-limited (released to ready, no failure counted): {', '.join(res.rate_limited)}")
+    if res.skipped_locked:
+        print("Skipped: another dispatcher holds this board's lock (no writes this tick)")
+    if res.memory_pressure:
+        print(f"Memory pressure {res.memory_pressure}: new workers restricted this tick")
     return 0
 
 
@@ -277,10 +178,9 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     if not getattr(args, "force", False):
         return _err(_DAEMON_DEPRECATED, 2)
 
-    board = getattr(args, "board", None)
     # Init before printing "started" so the DB path is right and init errors
     # surface immediately.
-    kb.init_db(board=board)
+    kb.init_db()
 
     pidfile = getattr(args, "pidfile", None)
     if pidfile:
@@ -308,7 +208,7 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         """Is there a ready+assigned+unclaimed task the dispatcher would spawn for?
         Control-plane lanes pulled via ``claim_task`` are correctly idle, not stuck."""
         try:
-            with kbc.connect_closing(board=board) as conn:
+            with kbc.connect_closing() as conn:
                 return kbd.has_spawnable_ready(conn)
         except Exception:
             return False
@@ -323,10 +223,12 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         if health_state["bad_ticks"] >= HEALTH_WINDOW:
             now = int(time.time())
             if now - health_state["last_warn_at"] >= 300:
+                held = kbd.describe_suppression([res])
+                held = f" Last tick held back: {held}." if held else ""
                 print(
                     f"[{_fmt_ts(now)}] WARN dispatcher stuck: ready queue non-empty for "
                     f"{health_state['bad_ticks']} consecutive ticks but 0 workers spawned "
-                    f"successfully. Check profile health (venv, PATH, credentials) and `hermes "
+                    f"successfully.{held} Check profile health (venv, PATH, credentials) and `hermes "
                     f"kanban list --status ready` / `hermes kanban list --status blocked` for "
                     f"recent spawn_failed tasks.",
                     file=sys.stderr, flush=True,
@@ -352,7 +254,6 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
             interval=args.interval,
             max_spawn=args.max,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
-            board=board,
             on_tick=_on_tick,
         )
     finally:
@@ -404,6 +305,10 @@ def _cmd_watch(args: argparse.Namespace) -> int:
 def _cmd_gc(args: argparse.Namespace) -> int:
     """Remove archived tasks' scratch workspaces, old events, and old worker logs."""
     import shutil
+    event_days = getattr(args, "event_retention_days", 30)
+    log_days = getattr(args, "log_retention_days", 30)
+    if event_days < 0 or log_days < 0:
+        return _err("kanban gc: retention days must be >= 0 (0 disables that sweep)", 2)
     scratch_root = kb.workspaces_root()
     removed_ws = 0
     with kbc.connect_closing() as conn:
@@ -411,37 +316,38 @@ def _cmd_gc(args: argparse.Namespace) -> int:
             "SELECT id, workspace_kind, workspace_path, branch_name FROM tasks "
             "WHERE status = 'archived'"
         ).fetchall()
-    for row in rows:
-        if row["workspace_kind"] == "worktree":
-            # Backstop for worktrees that escaped the completion/archive hook.
-            # Same safety predicate: only clean, fully-pushed worktrees go.
-            wt_path = row["workspace_path"]
-            if wt_path and Path(wt_path).is_dir():
-                kbw._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
-                if not Path(wt_path).is_dir():
-                    removed_ws += 1
-            continue
-        if row["workspace_kind"] != "scratch":
-            continue
-        path = Path(row["workspace_path"] or (scratch_root / row["id"]))
-        try:
-            path = path.resolve()
-        except OSError:
-            continue
-        try:
-            path.relative_to(scratch_root.resolve())
-        except ValueError:
-            # Safety: never delete outside the scratch root.
-            continue
-        if path.exists() and path.is_dir():
+        for row in rows:
+            if row["workspace_kind"] == "worktree":
+                # Backstop for worktrees that escaped the completion/archive hook.
+                # Same safety predicate: only clean, fully-pushed worktrees go.
+                wt_path = row["workspace_path"]
+                if wt_path and Path(wt_path).is_dir():
+                    if kbw._defer_shared_worktree_cleanup(conn, row["id"], wt_path):
+                        continue
+                    kbw._cleanup_worktree_workspace(row["id"], wt_path, row["branch_name"])
+                    if not Path(wt_path).is_dir():
+                        removed_ws += 1
+                continue
+            if row["workspace_kind"] != "scratch":
+                continue
+            path = Path(row["workspace_path"] or (scratch_root / row["id"]))
+            # Same containment predicate as completion cleanup (#28818): strictly below a
+            # managed root, never the root itself (which holds every task's scratch dir).
+            # Cheap existence/symlink check first: most rows were already cleaned at
+            # completion, and rmtree refuses a symlink (so it must not be counted).
+            if not path.is_dir() or path.is_symlink() or not kbw._is_managed_scratch_path(path):
+                continue
+            if kbw._defer_shared_workspace_cleanup(conn, row["id"], path):
+                continue
             shutil.rmtree(path, ignore_errors=True)
-            removed_ws += 1
+            if not path.exists():
+                removed_ws += 1
 
-    event_days = getattr(args, "event_retention_days", 30)
-    log_days = getattr(args, "log_retention_days", 30)
-    with kbc.connect_closing() as conn:
-        removed_events = kb.gc_events(conn, older_than_seconds=event_days * 24 * 3600)
-    removed_logs = kb.gc_worker_logs(older_than_seconds=log_days * 24 * 3600)
+    removed_events = 0
+    if event_days:
+        with kbc.connect_closing() as conn:
+            removed_events = kb.gc_events(conn, older_than_seconds=event_days * 24 * 3600)
+    removed_logs = kb.gc_worker_logs(older_than_seconds=log_days * 24 * 3600) if log_days else 0
     print(f"GC complete: {removed_ws} workspace(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
     return 0

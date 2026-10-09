@@ -198,78 +198,6 @@ describe('ErrorBoundary assistant-ui lookup recovery', () => {
     expect(recoveryWarningCount(warnSpy.mock.calls)).toBe(0)
   })
 
-  // The root fallback REPLACES <App/>, and the toast host (NotificationStack)
-  // renders inside <App/>. Anything this surface reports through notifyError()
-  // is therefore written to a store with no renderer — invisible to the user.
-  // These cover the three things a user actually needs off a crash screen.
-  describe('root fallback crash-report affordances', () => {
-    it('marks the error message selectable so it can be read and copied out', () => {
-      // body { user-select: none } is app-wide; the opt-in attribute is the
-      // documented escape hatch (styles.css [data-selectable-text='true']).
-      const Bomb = makeBomb({
-        error: new Error("Cannot read properties of undefined (reading 'getDevMainBundleStale')")
-      })
-
-      render(
-        <RootErrorBoundary>
-          <Bomb />
-        </RootErrorBoundary>
-      )
-
-      const message = screen.getByText(/getDevMainBundleStale/)
-
-      expect(message.closest('[data-selectable-text="true"]')).not.toBeNull()
-    })
-
-    it('copies the message and component stack to the clipboard', async () => {
-      const writeText = vi.fn().mockResolvedValue(undefined)
-      Object.defineProperty(window, 'hermesDesktop', { configurable: true, value: undefined, writable: true })
-      Object.defineProperty(navigator, 'clipboard', { configurable: true, value: { writeText }, writable: true })
-
-      const Bomb = makeBomb({ error: new Error('boom-copy') })
-
-      render(
-        <RootErrorBoundary>
-          <Bomb />
-        </RootErrorBoundary>
-      )
-
-      fireEvent.click(screen.getByRole('button', { name: 'Copy' }))
-      await act(async () => { await Promise.resolve() })
-
-      expect(writeText).toHaveBeenCalledTimes(1)
-      expect(String(writeText.mock.calls[0][0])).toContain('boom-copy')
-      expect(screen.getByRole('button', { name: 'Copied' })).toBeTruthy()
-    })
-
-    it('reports the log outcome inline instead of into the unmounted toast host', async () => {
-      Object.defineProperty(window, 'hermesDesktop', {
-        configurable: true,
-        value: {
-          getRecentLogs: async () => ({ lines: ['line-one', 'line-two'], path: '/tmp/desktop.log' }),
-          revealLogs: async () => ({ error: 'not available in the web spike', ok: false, path: '' })
-        },
-        writable: true
-      })
-
-      const Bomb = makeBomb({ error: new Error('boom-logs') })
-
-      render(
-        <RootErrorBoundary>
-          <Bomb />
-        </RootErrorBoundary>
-      )
-
-      fireEvent.click(screen.getByRole('button', { name: 'Open logs' }))
-      await act(async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve() })
-
-      // Falls back to rendering the log tail in-page when the host filesystem
-      // cannot be revealed (the web build), rather than doing nothing visible.
-      expect(screen.getByText(/line-two/)).toBeTruthy()
-      expect(screen.getByText('/tmp/desktop.log')).toBeTruthy()
-    })
-  })
-
   it.each([
     ['a differently cased classifier near-miss', new Error('UseClientLookup: Index 6 out of bounds (length: 2)')],
     ['a non-bounds lookup error', new Error('useClientLookup: Key "missing" not found')],
@@ -288,5 +216,105 @@ describe('ErrorBoundary assistant-ui lookup recovery', () => {
 
     expect(screen.getByRole(RELOAD_WINDOW.role, { name: RELOAD_WINDOW.name })).toBeTruthy()
     expect(recoveryWarningCount(warnSpy.mock.calls)).toBe(0)
+  })
+})
+
+// #98654: Radix portal teardown racing a host subtree swap makes vendor React
+// throw "Tried to unmount a fiber that is already unmounted" from INSIDE
+// whatever boundary hosts the portal (observed as `contrib:workspace`), so the
+// pane blanks until a manual Retry. The tree settles once the swap completes,
+// so a scoped boundary gets the same capped auto-recovery the root gets for
+// assistant-ui races.
+const PORTAL_UNMOUNT_ERROR = new Error('Tried to unmount a fiber that is already unmounted')
+
+const portalRecoveryWarningCount = (calls: unknown[][]) =>
+  calls.filter(call => call.some(value => String(value).includes('auto-recovering from portal teardown'))).length
+
+describe('ErrorBoundary portal teardown recovery', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    vi.setSystemTime(0)
+    vi.spyOn(console, 'error').mockImplementation(() => undefined)
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.useRealTimers()
+    vi.restoreAllMocks()
+  })
+
+  it('auto-recovers a scoped boundary that hosts the portal race (#98654)', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const box: { error: Error | null } = { error: PORTAL_UNMOUNT_ERROR }
+    const Bomb = makeBomb(box)
+
+    render(
+      <ErrorBoundary fallback={() => <div>scoped fallback</div>} label="contrib:workspace">
+        <Bomb />
+      </ErrorBoundary>
+    )
+
+    box.error = null
+    act(() => vi.runOnlyPendingTimers())
+
+    expect(screen.getByText('recovered')).toBeTruthy()
+    expect(screen.queryByText('scoped fallback')).toBeNull()
+    expect(portalRecoveryWarningCount(warnSpy.mock.calls)).toBe(1)
+  })
+
+  it('stops retrying a persistent portal race after the recovery budget is exhausted', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const Bomb = makeBomb({ error: PORTAL_UNMOUNT_ERROR })
+
+    render(
+      <ErrorBoundary fallback={() => <div>scoped fallback</div>} label="contrib:workspace">
+        <Bomb />
+      </ErrorBoundary>
+    )
+
+    for (let attempt = 0; attempt < 4; attempt += 1) {
+      act(() => vi.runOnlyPendingTimers())
+    }
+
+    expect(screen.getByText('scoped fallback')).toBeTruthy()
+    expect(portalRecoveryWarningCount(warnSpy.mock.calls)).toBe(3)
+    expect(vi.getTimerCount()).toBe(0)
+  })
+
+  it.each([
+    ['a near-miss unmount message', new Error('Tried to unmount a fiber that was painted twice')],
+    ['an unrelated render error', new Error('some unrelated application error')]
+  ])('does not auto-recover %s in a scoped boundary', (_label, error) => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const Bomb = makeBomb({ error })
+
+    render(
+      <ErrorBoundary fallback={() => <div>scoped fallback</div>} label="contrib:workspace">
+        <Bomb />
+      </ErrorBoundary>
+    )
+
+    act(() => vi.runAllTimers())
+
+    expect(screen.getByText('scoped fallback')).toBeTruthy()
+    expect(portalRecoveryWarningCount(warnSpy.mock.calls)).toBe(0)
+  })
+
+  it('recovers at root as well, sharing the same budget as scoped boundaries', () => {
+    const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => undefined)
+    const box: { error: Error | null } = { error: PORTAL_UNMOUNT_ERROR }
+    const Bomb = makeBomb(box)
+
+    render(
+      <RootErrorBoundary>
+        <Bomb />
+      </RootErrorBoundary>
+    )
+
+    box.error = null
+    act(() => vi.runOnlyPendingTimers())
+
+    expect(screen.getByText('recovered')).toBeTruthy()
+    expect(portalRecoveryWarningCount(warnSpy.mock.calls)).toBe(1)
   })
 })

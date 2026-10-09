@@ -31,18 +31,6 @@ test('windowsQuote doubles embedded quotes', () => {
   assert.equal(windowsQuote('C:\\a "b"'), '"C:\\a ""b"""')
 })
 
-test('windowsQuote escapes a literal percent so batch does not expand %VAR%', () => {
-  assert.equal(windowsQuote('C:\\a%PATH%b'), '"C:\\a%%PATH%%b"')
-})
-
-test('windowsQuote escapes a bare trailing percent', () => {
-  assert.equal(windowsQuote('100%'), '"100%%"')
-})
-
-test('windowsQuote escapes % before doubling " so inserted quotes are not rescanned', () => {
-  assert.equal(windowsQuote('%VAR% says "hi"'), '"%%VAR%% says ""hi"""')
-})
-
 test('terminalScriptEnv drops PATH in any casing and keeps the rest', () => {
   const env = terminalScriptEnv(
     { Path: 'C:\\junk', PATH: '/junk', PYTHONPATH: '/repo', PYTHONUTF8: '1' },
@@ -142,4 +130,16 @@ test('Linux falls down the emulator ladder and omits a flagless terminal', () =>
 
 test('Linux with no emulator installed reports no launch', () => {
   assert.equal(resolveTerminalLaunch({ findOnPath: never, platform: 'linux', scriptPath: '/tmp/x.sh' }), null)
+})
+
+test('tuiResumeArgs drops a profile value that is not a valid profile id', () => {
+  // A non-slug (numeric roster id, display label) must never cross into the
+  // TUI launch argv — the CLI used to str()-coerce it into profiles/0 (#88842).
+  assert.deepEqual(tuiResumeArgs('sess', 0 as unknown as string), ['--tui', '--resume', 'sess'])
+  assert.deepEqual(tuiResumeArgs('sess', ''), ['--tui', '--resume', 'sess'])
+  assert.deepEqual(tuiResumeArgs('sess', 'Not A Slug!'), ['--tui', '--resume', 'sess'])
+})
+
+test('tuiResumeArgs normalizes a valid profile id like the CLI', () => {
+  assert.deepEqual(tuiResumeArgs('sess', 'Work'), ['--profile', 'work', '--tui', '--resume', 'sess'])
 })

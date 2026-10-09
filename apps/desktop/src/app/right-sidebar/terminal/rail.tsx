@@ -34,10 +34,9 @@ const RAIL_ACTION =
 /** Thin icon "bookmark" strip blended into the terminal surface, shown whenever a
  *  terminal exists. Each square is a tab (name + hotkey on hover); close via the
  *  shell's `exit`, middle-click, or the context menu. */
-export function TerminalRail({ interactive = true }: { interactive?: boolean }) {
+export function TerminalRail() {
   const { t } = useI18n()
-  const allTerminals = useStore($terminals)
-  const terminals = interactive ? allTerminals : allTerminals.filter(term => term.kind === 'agent')
+  const terminals = useStore($terminals)
   const activeId = useStore($activeTerminalId)
   const bindings = useStore($bindings)
   const toggleHint = bindings['view.showTerminal']?.[0]
@@ -67,27 +66,25 @@ export function TerminalRail({ interactive = true }: { interactive?: boolean }) 
             toggleHint={toggleHint}
           />
         ))}
-        {interactive && (
-          <li className="flex w-full justify-center">
-            <Tip
-              label={<TipHintLabel hint={newHint && formatCombo(newHint)} text={t.rightSidebar.terminalNew} />}
-              side="left"
+        <li className="flex w-full justify-center">
+          <Tip
+            label={<TipHintLabel hint={newHint && formatCombo(newHint)} text={t.rightSidebar.terminalNew} />}
+            placement="right-rail"
+          >
+            <button
+              aria-label={t.rightSidebar.terminalNew}
+              className={cn(RAIL_ACTION, 'size-7 text-(--ui-text-quaternary)')}
+              onClick={() => createTerminal()}
+              type="button"
             >
-              <button
-                aria-label={t.rightSidebar.terminalNew}
-                className={cn(RAIL_ACTION, 'size-7 text-(--ui-text-quaternary)')}
-                onClick={() => createTerminal()}
-                type="button"
-              >
-                <Codicon name="add" size="0.8125rem" />
-              </button>
-            </Tip>
-          </li>
-        )}
+              <Codicon name="add" size="0.8125rem" />
+            </button>
+          </Tip>
+        </li>
       </ul>
 
       <div className="flex shrink-0 flex-col items-center pb-1.5">
-        <Tip label={t.rightSidebar.terminalHide} side="left">
+        <Tip label={t.rightSidebar.terminalHide} placement="right-rail">
           <button
             aria-label={t.rightSidebar.terminalHide}
             className={cn(RAIL_ACTION, 'opacity-0 transition-opacity group-hover/rail:opacity-100')}
@@ -124,7 +121,10 @@ function TerminalRailItem({ active, canCloseOthers, index, term, toggleHint }: T
               className="absolute inset-y-0.5 right-0 w-0.5 rounded-l-sm bg-(--ui-stroke-primary)"
             />
           )}
-          <Tip label={<TipHintLabel hint={toggleHint && formatCombo(toggleHint)} text={label} />} side="left">
+          <Tip
+            label={<TipHintLabel hint={toggleHint && formatCombo(toggleHint)} text={label} />}
+            placement="right-rail"
+          >
             <button
               aria-label={label}
               aria-selected={active}

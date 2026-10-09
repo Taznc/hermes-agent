@@ -2,6 +2,7 @@ import { cva, type VariantProps } from 'class-variance-authority'
 import { Slot } from 'radix-ui'
 import * as React from 'react'
 
+import { Loader2 } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 
 // Text+icon actions underline the label on hover, not the glyph.
@@ -25,36 +26,19 @@ const buttonVariants = cva(
         secondary:
           'bg-(--ui-bg-quaternary) text-(--ui-text-primary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
         ghost: 'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
+        grip: 'bg-transparent text-(--ui-text-tertiary) transition-colors hover:text-(--ui-text-secondary) focus-visible:text-(--ui-text-primary)',
+        // A control floating free of any surface (fan-menu discs, detached
+        // chips): the menu/popover treatment — opaque popover fill + the
+        // shared `shadow-md` ring-and-drop. Hover only lifts the glyph; a fill
+        // change on a lone disc reads as a toggle flipping.
+        floating: 'bg-popover text-(--ui-text-secondary) shadow-md hover:text-(--ui-text-primary)',
         link: `text-primary underline-offset-4 decoration-current/20 hover:underline ${TEXT_ACTION_ICON}`,
         // Boxless inline-text action (no bg/border). Quiet by default — reads as
         // muted label text, underlines on hover (e.g. "Cancel", "Clear").
         text: `text-muted-foreground underline-offset-4 hover:text-foreground hover:underline ${TEXT_ACTION_ICON}`,
         // Emphasized inline-text action: bold + always-underlined link. Use for
         // the actionable affordance in a row ("Change", "Set", "Open logs", …).
-        textStrong: `font-semibold text-muted-foreground underline underline-offset-4 hover:text-foreground ${TEXT_ACTION_ICON}`,
-        // ── Severity fills ───────────────────────────────────────────────────
-        // The solid action inside a severity surface (a toast/alert already
-        // wearing that severity's stripe + 12% tint). Each pairs a FILL token
-        // with that token's own `-foreground`, which is the opposite contrast
-        // problem from the `-text` reading role the title/icon wear: solid
-        // under text vs text on tint. Keep them separate — collapsing them is
-        // what made severity titles illegible before the reskin.
-        //
-        // `severityError` is NOT `destructive`. `destructive` is the
-        // destructive-ACTION semantic (delete, remove) and carries `text-white`
-        // plus a `dark:bg-destructive/60` softening; severity chrome must stay
-        // at full fill in both modes so the toast's stripe, tint, and button
-        // read as one object.
-        severityError: 'bg-destructive text-destructive-foreground hover:bg-destructive/90',
-        severityWarning: 'bg-warning text-warning-foreground hover:bg-warning/90',
-        // Success uses `-solid`, not the raw `--color-success`: the mid-ramp
-        // green clears 4.5:1 against neither white nor near-black, so the
-        // text-bearing role gets its own lightness (styles.css). Stripe and
-        // tint keep the raw token.
-        severitySuccess: 'bg-success-solid text-success-foreground hover:bg-success-solid/90',
-        // Non-severity notice (info): a neutral solid so an info toast's action
-        // does not borrow primary-blue emphasis it has not earned.
-        severityInfo: 'bg-secondary text-secondary-foreground hover:bg-secondary/80'
+        textStrong: `font-semibold text-muted-foreground underline underline-offset-4 hover:text-foreground ${TEXT_ACTION_ICON}`
       },
       size: {
         default: 'px-3 py-1.5 has-[>svg]:px-2.5',
@@ -72,6 +56,7 @@ const buttonVariants = cva(
         'icon-xs': "size-6 rounded-[4px] [&_svg:not([class*='size-'])]:size-3",
         'icon-sm': 'size-8 rounded-[4px]',
         'icon-lg': 'size-10 rounded-[4px]',
+        grip: 'h-4 w-12 rounded-full p-0',
         'icon-titlebar':
           'titlebar-icon-button h-(--titlebar-control-height) w-(--titlebar-control-size) rounded-[4px] [&_svg:not([class*="size-"])]:size-(--titlebar-icon-size)'
       }
@@ -96,21 +81,47 @@ function Button({
   variant = 'default',
   size = 'default',
   asChild = false,
+  loading = false,
+  children,
+  disabled,
   ...props
 }: React.ComponentProps<'button'> &
   VariantProps<typeof buttonVariants> & {
     asChild?: boolean
+    /** Working. The label stays in flow but goes invisible and a spinner
+     *  sits over it, so the button keeps its exact width and height — a
+     *  label swapped for a glyph reflows every sibling on the row. */
+    loading?: boolean
   }) {
   const Comp = asChild ? Slot.Root : 'button'
 
   return (
     <Comp
-      className={cn(buttonVariants({ variant, size }), className)}
+      aria-busy={loading || undefined}
+      className={cn(buttonVariants({ variant, size }), loading && 'relative', className)}
       data-size={size}
       data-slot="button"
       data-variant={variant}
+      disabled={disabled || loading}
       {...props}
-    />
+    >
+      {loading ? (
+        <>
+          {/* Same flex + gap as the button itself, so the ghost label measures
+              exactly what the live one did. The spinner sits in a wrapper so
+              it is never a direct-child svg — the size variants' `has-[>svg]`
+              would otherwise switch to icon padding and shave the width. */}
+          <span aria-hidden className="invisible inline-flex items-center gap-[inherit]">
+            {children}
+          </span>
+          <span aria-hidden className="absolute inset-0 grid place-items-center">
+            <Loader2 className="animate-spin" />
+          </span>
+        </>
+      ) : (
+        children
+      )}
+    </Comp>
   )
 }
 

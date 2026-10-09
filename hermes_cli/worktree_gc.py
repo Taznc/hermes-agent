@@ -23,8 +23,7 @@ logger = logging.getLogger(__name__)
 # Branches never considered for deletion, in any mode.
 _PROTECTED_BRANCHES = {"main", "master", "develop", "dev", "trunk"}
 
-# Trees owned by another lifecycle (kanban dispatcher gc) — never touched, unless a caller
-# opts in with ``include_kanban=True`` because it IS that lifecycle.
+# Trees owned by another lifecycle (kanban dispatcher gc) — never touched.
 _KANBAN_RE = re.compile(r"^t_[0-9a-f]+$")
 
 # Bounded cherry probe: a branch this far ahead of upstream is a stale-base
@@ -51,17 +50,36 @@ class BranchRecord:
     reason: str
 
 
-def _run(cmd: list, timeout: int, cwd: Optional[str] = None) -> subprocess.CompletedProcess:
+def _run(cmd: list, timeout: int, cwd: Optional[str] = None,
+         env: Optional[dict] = None) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                          timeout=timeout, cwd=cwd)
+                          timeout=timeout, cwd=cwd, env=env, stdin=subprocess.DEVNULL)
+
+
+@dataclass
+class ExternalTreeRecord:
+    """A linked worktree registered on the repo but living OUTSIDE
+    ``.worktrees/`` — created by hand or by another tool. Reported for
+    visibility only; the reclaim paths never touch these."""
+
+    path: str
+    branch: str           # branch name, or "detached @<sha>" when detached
+    locked: bool
+    missing: bool         # registered but the directory no longer exists
 
 
 def _git(args: list, cwd: str, timeout: int = 15) -> subprocess.CompletedProcess:
     """Run git, translating timeouts into returncode 124. Every verdict fails safe toward "keep"
     on nonzero, so a slow ``git cherry`` on a huge repo degrades to keep instead of aborting the
-    audit mid-list."""
+    audit mid-list. :func:`noninteractive_repo_git_env` because ``status`` executes the repo's
+    ``core.fsmonitor`` and clean filters (GHSA-7x36-8jrh-v4pw)."""
+    from hermes_cli._subprocess_compat import FILTER_DISCOVERY_FAILED, noninteractive_repo_git_env
+    env = noninteractive_repo_git_env(cwd)
+    if env is None:
+        return subprocess.CompletedProcess(args=["git", *args], returncode=1, stdout="",
+                                           stderr=FILTER_DISCOVERY_FAILED)
     try:
-        return _run(["git", *args], timeout, cwd)
+        return _run(["git", *args], timeout, cwd, env=env)
     except subprocess.TimeoutExpired:
         return subprocess.CompletedProcess(args=["git", *args], returncode=124, stdout="",
                                            stderr=f"timeout after {timeout}s")
@@ -92,7 +110,8 @@ def _dirty_split(path: str) -> tuple[bool, List[str]]:
 def _archive_untracked(tree: Path, untracked: List[str]) -> Optional[Path]:
     """Copy untracked files out of a doomed tree; None on any failure (caller must then keep)."""
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    dest = Path.home() / ".hermes" / "archive" / "worktree-prune" / f"{tree.name}-{stamp}"
+    from hermes_constants import get_hermes_home
+    dest = get_hermes_home() / "archive" / "worktree-prune" / f"{tree.name}-{stamp}"
     try:
         for rel in untracked:
             src = tree / rel
@@ -109,15 +128,10 @@ def _archive_untracked(tree: Path, untracked: List[str]) -> Optional[Path]:
         return None
 
 
-def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads,
-                   *, include_kanban: bool = False) -> tuple[str, str, List[str]]:
-    """Return (verdict, reason, untracked) for one tree under ``.worktrees/``.
-
-    ``include_kanban`` only controls whether kanban task trees are EVALUATED; the verdicts
-    below are identical either way.
-    """
+def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads) -> tuple[str, str, List[str]]:
+    """Return (verdict, reason, untracked) for one tree under ``.worktrees/``."""
     path = str(entry)
-    if not include_kanban and _KANBAN_RE.match(entry.name):
+    if _KANBAN_RE.match(entry.name):
         return "keep", "kanban task tree (owned by kanban gc)", []
     if _ops._worktree_lock_is_live(repo_root, path, timeout=5) == "live":
         return "keep", "in use by a running hermes session", []
@@ -140,13 +154,88 @@ def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads,
     return "reap", "clean and fully merged/pushed", []
 
 
+def audit_external_trees(repo_root: str) -> List[ExternalTreeRecord]:
+    """List linked worktrees registered OUTSIDE ``.worktrees/``.
+
+    ``hermes -w`` scratch trees all live under ``<repo>/.worktrees/``, but
+    ``git worktree list --porcelain`` also knows about trees the user (or
+    another tool) registered elsewhere. Those are someone else's state, so
+    the reclaim paths never touch them — but hiding them entirely makes the
+    audit lie about what the repo is carrying. Report them read-only, and
+    flag registrations whose directory has vanished (safe to
+    ``git worktree prune``).
+    """
+    result = _git(["worktree", "list", "--porcelain"], cwd=repo_root, timeout=10)
+    if result.returncode != 0:
+        return []
+
+    managed_root = os.path.realpath(str(Path(repo_root) / ".worktrees"))
+    main_root = os.path.realpath(repo_root)
+
+    records: List[ExternalTreeRecord] = []
+    current: dict = {}
+
+    def _flush():
+        path = current.get("path")
+        if not path:
+            return
+        real = os.path.realpath(path)
+        if real == main_root:
+            return  # the main checkout itself
+        if real == managed_root or real.startswith(managed_root + os.sep):
+            return  # hermes-managed scratch tree — covered by audit_worktrees
+        branch = current.get("branch", "")
+        if not branch and current.get("head"):
+            branch = f"detached @{current['head'][:10]}"
+        records.append(ExternalTreeRecord(
+            path=path,
+            branch=branch,
+            locked=bool(current.get("locked")),
+            missing=not os.path.exists(path),
+        ))
+
+    for line in result.stdout.splitlines():
+        line = line.rstrip()
+        if not line:
+            _flush()
+            current = {}
+            continue
+        if line.startswith("worktree "):
+            current["path"] = line[len("worktree "):]
+        elif line.startswith("branch refs/heads/"):
+            current["branch"] = line[len("branch refs/heads/"):]
+        elif line.startswith("HEAD "):
+            current["head"] = line[len("HEAD "):]
+        elif line == "locked" or line.startswith("locked "):
+            current["locked"] = True
+    _flush()
+    return records
+
+
+def prune_missing_registrations(repo_root: str, *, dry_run: bool = False) -> List[str]:
+    """Drop registrations whose directory no longer exists (any location).
+
+    The equivalent of a targeted ``git worktree prune``: purely
+    metadata-level, never removes files, so it is safe even for external
+    trees — a missing directory means there is nothing left to protect.
+    """
+    stale = [r for r in audit_external_trees(repo_root) if r.missing and not r.locked]
+    if not stale:
+        return []
+    if dry_run:
+        return [f"would prune stale registration {r.path}" for r in stale]
+    result = _git(["worktree", "prune"], cwd=repo_root, timeout=15)
+    if result.returncode != 0:
+        return [f"failed to prune stale registrations: {result.stderr.strip()}"]
+    return [f"pruned stale registration {r.path}" for r in stale]
+
+
 def audit_worktrees(repo_root: str, *, with_sizes: bool = True,
-                    include_kanban: bool = False) -> List[TreeRecord]:
+                    older_than_days: Optional[float] = None) -> List[TreeRecord]:
     """Classify every tree under ``.worktrees/`` without mutating anything.
 
-    ``include_kanban=True`` is the opt-in for the kanban dispatcher's own GC, which owns those
-    trees and needs real verdicts for them; every other caller leaves it off so ``hermes
-    worktree list/prune`` keeps deferring another lifecycle's trees.
+    ``older_than_days`` only ever RESTRICTS: a reapable tree younger than the threshold is kept
+    ("too recent"). It never widens eligibility — age alone can't doom a tree carrying unmerged work.
     """
     from hermes_cli import worktree_ops as _ops
     worktrees_dir = Path(repo_root) / ".worktrees"
@@ -174,8 +263,10 @@ def audit_worktrees(repo_root: str, *, with_sizes: bool = True,
             branch = _git(["branch", "--show-current"], cwd=str(entry), timeout=5).stdout.strip()
         except Exception:
             branch = ""
-        verdict, reason, untracked = _classify_tree(_ops, repo_root, entry, merge_cache, remote_heads,
-                                                    include_kanban=include_kanban)
+        verdict, reason, untracked = _classify_tree(_ops, repo_root, entry, merge_cache, remote_heads)
+        if older_than_days is not None and verdict in _REAP_VERDICTS and age_days < older_than_days:
+            verdict, reason, untracked = "keep", (
+                f"reapable but only {age_days:.1f}d old (--older-than {older_than_days:g})"), []
         records.append(TreeRecord(
             name=entry.name, path=str(entry), branch=branch,
             age_days=age_days, size_mb=_tree_size_mb(entry) if with_sizes else None,
@@ -245,10 +336,11 @@ def audit_branches(repo_root: str) -> List[BranchRecord]:
     def _lines(result) -> List[str]:
         return [b.strip() for b in result.stdout.splitlines() if b.strip()]
 
-    upstream = next(
-        (c for c in ("origin/HEAD", "origin/main", "origin/master")
-         if _git(["rev-parse", "--verify", "--quiet", c], cwd=repo_root, timeout=5).returncode == 0),
-        None)
+    # No remote at all -> the local trunk; no trunk either -> nothing can be judged, report nothing.
+    try:
+        upstream = _ops._worktree_merge_base_ref(repo_root)
+    except Exception:
+        upstream = None
     if upstream is None:
         return []
 

@@ -1,2 +1,0 @@
-Taznc
-# fork maintainer identity

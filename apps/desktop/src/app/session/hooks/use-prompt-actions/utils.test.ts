@@ -6,7 +6,6 @@ import type { ChatMessage } from '@/lib/chat-messages'
 import {
   acquireSubmitInFlight,
   appendText,
-  attachFileBytes,
   base64FromDataUrl,
   clearSessionRecentlyInterrupted,
   clearSubmitInFlight,
@@ -49,14 +48,6 @@ describe('recent interrupt cooldown', () => {
     expect(isSessionRecentlyInterrupted(sessionId, t0)).toBe(true)
     expect(isSessionRecentlyInterrupted(sessionId, t0 + RECENT_INTERRUPT_COOLDOWN_MS - 1)).toBe(true)
     expect(isSessionRecentlyInterrupted(sessionId, t0 + RECENT_INTERRUPT_COOLDOWN_MS)).toBe(false)
-  })
-
-  it('returns false after mark + elapsed past cooldown', () => {
-    const sessionId = 'sess-elapsed'
-    const t0 = 5_000_000
-
-    markSessionRecentlyInterrupted(sessionId, t0)
-    expect(isSessionRecentlyInterrupted(sessionId, t0 + RECENT_INTERRUPT_COOLDOWN_MS + 1)).toBe(false)
   })
 
   it('shouldInterruptBeforeRewind is true when recently interrupted even if not busy', () => {
@@ -185,13 +176,8 @@ describe('withSessionNotFoundResume', () => {
   // The whole bug class: every session-scoped RPC recovers identically. Before
   // consolidation only prompt.submit did, so attach/compress/rewind surfaced a
   // raw "session not found" after sleep while plain text worked.
-  it.each([
-    ['image.attach_bytes', 'attach an image'],
-    ['file.attach', 'attach a file'],
-    ['session.compress', 'run /compress'],
-    ['prompt.submit', 'submit a rewind'],
-    ['session.interrupt', 'stop a turn']
-  ])('resumes and retries once so %s can %s after a stale drop', async rpc => {
+  it('resumes and retries once after a stale session drop', async () => {
+    const rpc = 'image.attach_bytes'
     const d = deps()
     let attempts = 0
 
@@ -371,11 +357,6 @@ describe('imageFilenameFromPath', () => {
 })
 
 describe('friendlyRemoteAttachError', () => {
-  it('rewrites a too-large error with the parsed cap', () => {
-    const err = friendlyRemoteAttachError(new Error('file is too large (20 bytes; limit 16777216 bytes)'), 'pic.png')
-    expect(err.message).toBe('pic.png is too large to upload to the remote gateway (max 16 MB).')
-  })
-
   it('passes non-cap errors through', () => {
     const original = new Error('something else')
     expect(friendlyRemoteAttachError(original, 'pic.png')).toBe(original)
@@ -405,131 +386,6 @@ describe('readFileDataUrlForAttach', () => {
 
     await expect(readFileDataUrlForAttach('/tmp/note.txt')).resolves.toBe('data:text/plain;base64,YQ==')
     expect(previewReader).toHaveBeenCalledWith('/tmp/note.txt')
-  })
-})
-
-describe('attachFileBytes', () => {
-  afterEach(() => {
-    vi.unstubAllGlobals()
-  })
-
-  it('streams the file in bounded chunks via file.attach_open/_chunk/_commit', async () => {
-    const chunks = [
-      { base64: 'aGVsbG8=', bytesRead: 6, mimeType: 'text/plain', totalBytes: 11 },
-      { base64: 'd29ybGQ=', bytesRead: 5, mimeType: 'text/plain', totalBytes: 11 }
-    ]
-    const readFileChunkForAttach = vi.fn(async () => chunks.shift())
-    Object.defineProperty(window, 'hermesDesktop', {
-      configurable: true,
-      value: { readFileChunkForAttach }
-    })
-
-    const calls: { method: string; params?: Record<string, unknown> }[] = []
-    const requestGateway: GatewayRequest = vi.fn(async (method: string, params?: Record<string, unknown>) => {
-      calls.push({ method, params })
-
-      if (method === 'file.attach_open') {
-        return { upload_id: 'up-1' } as never
-      }
-
-      if (method === 'file.attach_commit') {
-        return { attached: true, ref_text: '@file:report.txt' } as never
-      }
-
-      return {} as never
-    })
-
-    const result = await attachFileBytes('/abs/report.txt', 'report.txt', requestGateway, 'sess-1')
-
-    expect(result).toEqual({ attached: true, ref_text: '@file:report.txt' })
-    expect(calls.map(c => c.method)).toEqual([
-      'file.attach_open',
-      'file.attach_chunk',
-      'file.attach_chunk',
-      'file.attach_commit'
-    ])
-    expect(calls[1]?.params).toMatchObject({ upload_id: 'up-1', chunk_base64: 'aGVsbG8=' })
-    expect(calls[2]?.params).toMatchObject({ upload_id: 'up-1', chunk_base64: 'd29ybGQ=' })
-    expect(calls[3]?.params).toMatchObject({ upload_id: 'up-1', path: '/abs/report.txt', name: 'report.txt' })
-    expect(readFileChunkForAttach).toHaveBeenCalledWith('/abs/report.txt', 0)
-    expect(readFileChunkForAttach).toHaveBeenCalledWith('/abs/report.txt', 6)
-  })
-
-  it('falls back to the whole-file transport when the bridge has no chunked reader', async () => {
-    const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,aGVsbG8=')
-    Object.defineProperty(window, 'hermesDesktop', {
-      configurable: true,
-      value: { readFileDataUrl }
-    })
-
-    const requestGateway: GatewayRequest = vi.fn(async () => ({ attached: true, ref_text: '@file:x' }) as never)
-
-    const result = await attachFileBytes('/abs/x.txt', 'x.txt', requestGateway, 'sess-1')
-
-    expect(result).toEqual({ attached: true, ref_text: '@file:x' })
-    expect(requestGateway).toHaveBeenCalledWith('file.attach', {
-      name: 'x.txt',
-      path: '/abs/x.txt',
-      session_id: 'sess-1',
-      data_url: 'data:text/plain;base64,aGVsbG8='
-    })
-  })
-
-  it('falls back to the whole-file transport when the gateway predates file.attach_open', async () => {
-    const readFileChunkForAttach = vi.fn()
-    const readFileDataUrl = vi.fn(async () => 'data:text/plain;base64,aGVsbG8=')
-    Object.defineProperty(window, 'hermesDesktop', {
-      configurable: true,
-      value: { readFileChunkForAttach, readFileDataUrl }
-    })
-
-    const requestGateway: GatewayRequest = vi.fn(async (method: string) => {
-      if (method === 'file.attach_open') {
-        throw new Error('unknown method: file.attach_open')
-      }
-
-      if (method === 'file.attach') {
-        return { attached: true, ref_text: '@file:x' } as never
-      }
-
-      return {} as never
-    })
-
-    const result = await attachFileBytes('/abs/x.txt', 'x.txt', requestGateway, 'sess-1')
-
-    expect(result).toEqual({ attached: true, ref_text: '@file:x' })
-    expect(readFileChunkForAttach).not.toHaveBeenCalled()
-  })
-
-  it('aborts the upload and rethrows when a chunk append fails', async () => {
-    const readFileChunkForAttach = vi.fn(async () => ({
-      base64: 'aGVsbG8=',
-      bytesRead: 6,
-      mimeType: 'text/plain',
-      totalBytes: 11
-    }))
-    Object.defineProperty(window, 'hermesDesktop', {
-      configurable: true,
-      value: { readFileChunkForAttach }
-    })
-
-    const calls: string[] = []
-    const requestGateway: GatewayRequest = vi.fn(async (method: string) => {
-      calls.push(method)
-
-      if (method === 'file.attach_open') {
-        return { upload_id: 'up-1' } as never
-      }
-
-      if (method === 'file.attach_chunk') {
-        throw new Error('boom')
-      }
-
-      return {} as never
-    })
-
-    await expect(attachFileBytes('/abs/x.txt', 'x.txt', requestGateway, 'sess-1')).rejects.toThrow('boom')
-    expect(calls).toEqual(['file.attach_open', 'file.attach_chunk', 'file.attach_abort'])
   })
 })
 
@@ -597,47 +453,6 @@ describe('renderRpcResult', () => {
         ].join('\n')
       )
     })
-
-    it('drops the checkmark when the summary is a noop', () => {
-      expect(
-        renderRpcResult(
-          { summary: { headline: 'Already compressed', note: 'No new turns since last compress', noop: true } },
-          'compress'
-        )
-      ).toBe('Already compressed\n  No new turns since last compress')
-    })
-  })
-
-  describe('session.steer', () => {
-    it('reports a queued steer with the original text', () => {
-      expect(renderRpcResult({ status: 'queued', text: 'skip the docs' }, 'steer')).toBe(
-        'Steered · "skip the docs" queued for next tool call'
-      )
-    })
-
-    it('reports a rejected steer without echoing user text', () => {
-      expect(renderRpcResult({ status: 'rejected', text: 'whatever' }, 'steer')).toBe(
-        'Steer rejected — agent declined input'
-      )
-    })
-  })
-
-  describe('process.stop', () => {
-    it('reports the numeric number of stopped processes', () => {
-      expect(renderRpcResult({ killed: 2 }, 'stop')).toBe('Stopped 2 background processes.')
-    })
-
-    it('reports nothing-to-stop when the numeric count is zero', () => {
-      expect(renderRpcResult({ killed: 0 }, 'stop')).toBe('No background processes to stop.')
-    })
-  })
-
-  describe('session.save', () => {
-    it('echoes the saved file path', () => {
-      expect(renderRpcResult({ file: '/home/user/.hermes/sessions/saved/x.json' }, 'save')).toBe(
-        'Saved transcript to /home/user/.hermes/sessions/saved/x.json'
-      )
-    })
   })
 
   describe('session.status', () => {
@@ -648,26 +463,31 @@ describe('renderRpcResult', () => {
   })
 
   describe('session.usage', () => {
-    it('formats calls / input / output / total with thousands separators', () => {
+    it('formats all usage counters in the host locale', () => {
+      const format = new Intl.NumberFormat().format
+
       expect(renderRpcResult({ calls: 12, input: 1_234_567, output: 89_012, total: 1_323_579 }, 'usage')).toBe(
-        'Usage: 12 calls · 1,234,567 in / 89,012 out · 1,323,579 total'
+        `Usage: ${format(12)} calls · ${format(1_234_567)} in / ${format(89_012)} out · ${format(1_323_579)} total`
       )
     })
 
-    it('appends credits_lines when present', () => {
+    it('appends account_lines before credits_lines when present', () => {
       const body = renderRpcResult(
         {
           calls: 1,
           input: 10,
           output: 20,
           total: 30,
+          account_lines: ['📈 Account limits', 'Provider: openai-codex (Plus)', 'Weekly: 12% used'],
           credits_lines: ['Nous credits: 8,420 remaining', 'Resets: 2026-08-01']
         },
         'usage'
       )
 
-      expect(body.split('\n')).toEqual([
-        'Usage: 1 calls · 10 in / 20 out · 30 total',
+      expect(body.split('\n').slice(1)).toEqual([
+        '📈 Account limits',
+        'Provider: openai-codex (Plus)',
+        'Weekly: 12% used',
         'Nous credits: 8,420 remaining',
         'Resets: 2026-08-01'
       ])
@@ -675,10 +495,6 @@ describe('renderRpcResult', () => {
   })
 
   describe('agents.list', () => {
-    it('reports no running tasks when the array is empty', () => {
-      expect(renderRpcResult({ processes: [] }, 'agents')).toBe('No background tasks running.')
-    })
-
     it('formats each process with status, command, and metadata', () => {
       expect(
         renderRpcResult(

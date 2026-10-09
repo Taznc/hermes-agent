@@ -46,15 +46,8 @@ def _board_slugs(kb: Any) -> list:
     return [b.get("slug") or kb.DEFAULT_BOARD for b in _list_boards(kb)]
 
 
-def _positive_int_setting(kanban_cfg: dict, key: str, *, quiet: bool = False) -> Optional[int]:
-    """Parse an optional ``kanban.<key>`` int cap; None when unset or invalid (< 1 is invalid).
-
-    ``quiet`` suppresses only the success INFO line, for callers that re-read
-    settings on every dispatcher tick — logging the same cap once a minute
-    forever buries real events. Warnings about *invalid* values are never
-    suppressed: a malformed cap is a standing misconfiguration the operator
-    still needs to see.
-    """
+def _positive_int_setting(kanban_cfg: dict, key: str) -> Optional[int]:
+    """Parse an optional ``kanban.<key>`` int cap; None when unset or invalid (< 1 is invalid)."""
     raw = kanban_cfg.get(key)
     if raw is None:
         return None
@@ -66,8 +59,7 @@ def _positive_int_setting(kanban_cfg: dict, key: str, *, quiet: bool = False) ->
     if value < 1:
         logger.warning("kanban dispatcher: kanban.%s=%r is below 1; ignoring", key, raw)
         return None
-    if not quiet:
-        logger.info("kanban dispatcher: %s=%d", key, value)
+    logger.info("kanban dispatcher: %s=%d", key, value)
     return value
 
 
@@ -129,7 +121,7 @@ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     Returns ``(handle, "held")`` (release via :func:`_release_singleton_lock`),
     ``(None, "contended")`` when another process holds it (caller must NOT
     dispatch), or ``(None, "unavailable")`` when locking cannot be performed
-    (caller must not dispatch without proven exclusion).
+    (caller falls back to config control).
     """
     try:
         from gateway.status import _try_acquire_file_lock  # deferred; same package
@@ -137,7 +129,7 @@ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
         return None, "unavailable"
     try:
         Path(lock_path).parent.mkdir(parents=True, exist_ok=True)
-        handle = open(str(lock_path), "a+", encoding="utf-8")
+        handle = open(str(lock_path), "a+", encoding="utf-8")  # windows-footgun: ok (append-mode lock handle, write not read)
     except OSError:
         return None, "unavailable"
     if not _try_acquire_file_lock(handle):

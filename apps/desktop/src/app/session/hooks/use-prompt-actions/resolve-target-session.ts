@@ -1,5 +1,3 @@
-import { $sessions, knownSessionOwner } from '@/store/session'
-
 import { resolveSessionProfile } from '../use-session-actions/utils'
 
 import { singleFlightSessionResume, takeRecoveredRuntime } from './single-flight-resume'
@@ -91,29 +89,30 @@ export async function resolveTargetSessionId(deps: ResolveTargetSessionDeps): Pr
   const storedTarget = routedNeedsResume ? routedStoredSessionId : (selectedStoredSessionId ?? routedStoredSessionId)
 
   if (storedTarget) {
-    const owner = knownSessionOwner($sessions.get(), storedTarget)
-
     try {
       // Reuse a runtime an aborted recovery already minted for this stored
       // session; otherwise resume once, shared across concurrent callers.
-      const cachedRuntimeId = takeRecoveredRuntime(storedTarget, undefined, owner)
+      const cachedRuntimeId = takeRecoveredRuntime(storedTarget)
 
       if (cachedRuntimeId) {
         return cachedRuntimeId
       }
 
-      const profile = await resolveSessionProfile(storedTarget)
+      const resumed = await singleFlightSessionResume(storedTarget, async () => {
+        const profile = await resolveSessionProfile(storedTarget)
 
-      const resumed = await singleFlightSessionResume(
-        storedTarget,
-        () =>
-          requestGateway<{ session_id?: string }>('session.resume', {
-            session_id: storedTarget,
-            source: 'desktop',
-            ...(profile ? { profile } : {})
-          }),
-        owner ?? profile
-      )
+        return requestGateway<{ session_id?: string }>('session.resume', {
+          session_id: storedTarget,
+          source: 'desktop',
+          // Same contract as every other desktop resume: the response must
+          // not inline a full compression lineage (deep ones exceed
+          // max_resume_messages and fail assert_resume_safe). Only the
+          // resolved tip session_id is consumed here; the gateway follows
+          // mid → tip itself (#125041).
+          omit_messages: true,
+          ...(profile ? { profile } : {})
+        })
+      })
 
       return resumed?.session_id || null
     } catch {

@@ -1,9 +1,18 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it } from 'vitest'
 
+import { group, split } from '@/components/pane-shell/tree/model'
+import { $layoutTree, noteActiveTreeGroup, noteHoveredTreeGroup } from '@/components/pane-shell/tree/store'
 import { $rightRailActiveTabId, selectRightRailTab } from '@/store/layout'
-import { closeRightRail, openPreview, type PreviewTarget } from '@/store/preview'
+import { $previewTabs, closeRightRail, openPreview, type PreviewTarget } from '@/store/preview'
+import { $selectedStoredSessionId } from '@/store/session'
 
+import { watchPreviewTiles } from '../preview-tile'
+
+import { resolveActivePreviewTab } from './preview-active-tab'
+import { activePreviewInput, registerPreviewInput } from './preview-input'
+import { activePreviewNav, registerPreviewNav } from './preview-nav'
 import { PREVIEW_READ_MAX_CHARS, readActivePreview, registerPreviewPageReader } from './preview-reader'
+import { activePreviewScriptRunner, registerPreviewScriptRunner } from './preview-script-runner'
 
 function urlTarget(url: string): PreviewTarget {
   return { kind: 'url', label: 'Browser', source: url, url }
@@ -11,27 +20,6 @@ function urlTarget(url: string): PreviewTarget {
 
 function fileTarget(path: string): PreviewTarget {
   return { kind: 'file', label: path, path, previewKind: 'text', source: path, url: `file://${path}` }
-}
-
-/** Say "this build has an Electron guest" for the length of a test.
- *
- *  jsdom is a plain browser document, so `<webview>` has no `loadURL` — which
- *  is exactly the WEB build's situation, not Electron's. A URL tab with no
- *  reader means two different things in the two builds ("the guest is still
- *  booting, retry" vs "there is no guest and never will be"), so a test about
- *  the booting case has to declare which build it is standing in. */
-function withElectronGuest() {
-  const create = document.createElement.bind(document)
-
-  vi.spyOn(document, 'createElement').mockImplementation(((tag: string, options?: ElementCreationOptions) => {
-    const element = create(tag, options)
-
-    if (String(tag).toLowerCase() === 'webview') {
-      Object.assign(element, { loadURL: () => undefined })
-    }
-
-    return element
-  }) as typeof document.createElement)
 }
 
 describe('readActivePreview (read_preview tool)', () => {
@@ -55,10 +43,9 @@ describe('readActivePreview (read_preview tool)', () => {
     cleanups = []
     closeRightRail()
     window.localStorage.clear()
-  })
-
-  afterEach(() => {
-    vi.restoreAllMocks()
+    noteActiveTreeGroup(null)
+    noteHoveredTreeGroup(null)
+    $layoutTree.set(null)
   })
 
   it('answers null when nothing is open, so the tool reports it cleanly', async () => {
@@ -66,7 +53,7 @@ describe('readActivePreview (read_preview tool)', () => {
   })
 
   it('serializes the Browser tab through its registered page reader', async () => {
-    openPreview(urlTarget('https://news.ycombinator.com'), 'tool-result')
+    openPreview(urlTarget('https://news.ycombinator.com'))
     register($rightRailActiveTabId.get()!, async () => ({
       text: 'Top stories…',
       title: 'Hacker News',
@@ -84,7 +71,7 @@ describe('readActivePreview (read_preview tool)', () => {
   })
 
   it('windows long pages with start/count and reports the full length', async () => {
-    openPreview(urlTarget('https://example.com'), 'tool-result')
+    openPreview(urlTarget('https://example.com'))
     register($rightRailActiveTabId.get()!, async () => ({
       text: 'abcdefghij',
       title: 't',
@@ -100,7 +87,7 @@ describe('readActivePreview (read_preview tool)', () => {
   })
 
   it('caps a single read at PREVIEW_READ_MAX_CHARS even when asked for more', async () => {
-    openPreview(urlTarget('https://example.com'), 'tool-result')
+    openPreview(urlTarget('https://example.com'))
     register($rightRailActiveTabId.get()!, async () => ({
       text: 'x'.repeat(PREVIEW_READ_MAX_CHARS + 5000),
       title: 't',
@@ -114,8 +101,7 @@ describe('readActivePreview (read_preview tool)', () => {
   })
 
   it('answers identity + retry note for a Browser tab whose pane is not mounted', async () => {
-    withElectronGuest()
-    openPreview(urlTarget('https://example.com'), 'tool-result')
+    openPreview(urlTarget('https://example.com'))
 
     expect(await readActivePreview()).toMatchObject({
       kind: 'url',
@@ -125,20 +111,8 @@ describe('readActivePreview (read_preview tool)', () => {
     })
   })
 
-  it('tells the agent the truth when the build has no guest engine at all', async () => {
-    // No withElectronGuest(): jsdom IS the web build's document. Same tab, same
-    // absent reader as the test above — the answer has to differ, because
-    // "retry in a moment" describes a capability that will never arrive.
-    openPreview(urlTarget('https://example.com'), 'tool-result')
-
-    const result = await readActivePreview()
-
-    expect(result?.note).not.toContain('retry')
-    expect(result?.note).toContain('web_extract')
-  })
-
   it('answers a file tab with its identity and points at read_file', async () => {
-    openPreview(fileTarget('/work/notes.md'), 'file-browser')
+    openPreview(fileTarget('/work/notes.md'))
 
     expect(await readActivePreview()).toMatchObject({
       kind: 'file',
@@ -148,16 +122,15 @@ describe('readActivePreview (read_preview tool)', () => {
   })
 
   it('reads the tab the user is LOOKING at, not the last one opened', async () => {
-    openPreview(fileTarget('/work/one.md'), 'file-browser')
-    openPreview(fileTarget('/work/two.md'), 'file-browser')
+    openPreview(fileTarget('/work/one.md'))
+    openPreview(fileTarget('/work/two.md'))
     selectRightRailTab('file:file:///work/one.md')
 
     expect(await readActivePreview()).toMatchObject({ path: '/work/one.md' })
   })
 
   it('falls back to the identity answer when the reader throws (webview booting)', async () => {
-    withElectronGuest()
-    openPreview(urlTarget('https://example.com'), 'tool-result')
+    openPreview(urlTarget('https://example.com'))
     register($rightRailActiveTabId.get()!, async () => {
       throw new Error('webview gone')
     })
@@ -166,7 +139,7 @@ describe('readActivePreview (read_preview tool)', () => {
   })
 
   it('unregister is idempotent and scoped to the same reader', async () => {
-    openPreview(urlTarget('https://example.com'), 'tool-result')
+    openPreview(urlTarget('https://example.com'))
     const tabId = $rightRailActiveTabId.get()!
     const first = register(tabId, async () => ({ text: 'first', title: '', url: '' }))
 
@@ -176,4 +149,152 @@ describe('readActivePreview (read_preview tool)', () => {
 
     expect(await readActivePreview()).toMatchObject({ text: 'second' })
   })
+
+  it('reads the hovered preview zone instead of the global right-rail tab', async () => {
+    openPreview(fileTarget('/work/a.md'))
+    const fileId = $rightRailActiveTabId.get()!
+    openPreview(urlTarget('https://example.com/tickets'))
+    const browserId = $rightRailActiveTabId.get()!
+    selectRightRailTab(fileId)
+    mountSplit(fileId, browserId)
+    noteHoveredTreeGroup('grp-browser')
+
+    expect(await readActivePreview()).toMatchObject({ kind: 'url', url: 'https://example.com/tickets' })
+  })
+
+  it('reads the focused preview zone instead of a stale global file tab', async () => {
+    openPreview(fileTarget('/work/a.md'))
+    const fileId = $rightRailActiveTabId.get()!
+    openPreview(urlTarget('https://example.com/tickets'))
+    const browserId = $rightRailActiveTabId.get()!
+    selectRightRailTab(fileId)
+    mountSplit(fileId, browserId)
+    noteActiveTreeGroup('grp-browser')
+
+    expect(await readActivePreview()).toMatchObject({ kind: 'url', url: 'https://example.com/tickets' })
+  })
+
+  it('reads the hovered file when that zone is what the user is looking at', async () => {
+    openPreview(fileTarget('/work/a.md'))
+    const fileId = $rightRailActiveTabId.get()!
+    openPreview(urlTarget('https://example.com/tickets'))
+    const browserId = $rightRailActiveTabId.get()!
+    mountSplit(fileId, browserId)
+    noteHoveredTreeGroup('grp-file')
+
+    expect(await readActivePreview()).toMatchObject({ kind: 'file', path: '/work/a.md' })
+  })
+
+  it('returns active_tab_id and the open tab list when more than one preview is mounted', async () => {
+    openPreview(fileTarget('/work/project-network.html'))
+    const fileId = $rightRailActiveTabId.get()!
+    openPreview(urlTarget('https://example.com/tickets'))
+    const browserId = $rightRailActiveTabId.get()!
+
+    expect(await readActivePreview()).toMatchObject({
+      active_tab_id: browserId,
+      kind: 'url',
+      tabs: [
+        { id: fileId, kind: 'file', label: '/work/project-network.html', url: 'file:///work/project-network.html' },
+        { id: browserId, kind: 'url', label: 'Browser', url: 'https://example.com/tickets' }
+      ],
+      url: 'https://example.com/tickets'
+    })
+    expect($previewTabs.get()).toHaveLength(2)
+  })
 })
+
+describe('agent preview reads stay inside the session (#73890)', () => {
+  beforeEach(() => {
+    closeRightRail()
+    window.localStorage.clear()
+    noteActiveTreeGroup(null)
+    noteHoveredTreeGroup(null)
+    $layoutTree.set(null)
+    $selectedStoredSessionId.set(null)
+  })
+
+  it('never answers with, or lists, another session hidden tab', async () => {
+    $selectedStoredSessionId.set('sess-a')
+    openPreview(fileTarget('/work/secret-a.txt'))
+    const hidden = $previewTabs.get()[0]!.id
+    const navA = { back: () => {}, forward: () => {}, reload: () => {} }
+    const inputA = { focus: () => {}, send: () => {} }
+    const runA = async () => 'a'
+    const unbindNav = registerPreviewNav(hidden, navA)
+    const unbindInput = registerPreviewInput(hidden, inputA)
+    const unbindRun = registerPreviewScriptRunner(hidden, runA)
+
+    try {
+      $selectedStoredSessionId.set('sess-b')
+      openPreview(fileTarget('/work/b1.txt'))
+      openPreview(fileTarget('/work/b2.txt'))
+      // No visible selection: the fallback must stay in sess-b's drawer.
+      selectRightRailTab(null)
+
+      expect(resolveActivePreviewTab()?.target.path).toMatch(/^\/work\/b/)
+      expect(activePreviewNav()).toBeNull()
+      expect(activePreviewInput()).toBeNull()
+      expect(activePreviewScriptRunner()).toBeNull()
+
+      const read = await readActivePreview()
+
+      expect(read?.path).toMatch(/^\/work\/b/)
+      expect(JSON.stringify(read)).not.toContain('secret-a')
+
+      // sess-a's own agent, while sess-b holds focus, drives sess-a's page.
+      expect(activePreviewNav('sess-a')).toBe(navA)
+      expect(activePreviewInput('sess-a')).toBe(inputA)
+      expect(activePreviewScriptRunner('sess-a')).toBe(runA)
+      // A requester with no resolved session sees no session's tabs.
+      expect(activePreviewScriptRunner(null)).toBeNull()
+    } finally {
+      unbindNav()
+      unbindInput()
+      unbindRun()
+    }
+  })
+})
+
+describe('follow() does not overwrite an explicit open in another group', () => {
+  beforeEach(() => {
+    closeRightRail()
+    window.localStorage.clear()
+    noteActiveTreeGroup(null)
+    noteHoveredTreeGroup(null)
+    $layoutTree.set(null)
+  })
+
+  it('keeps the opened URL when the other group is still the interacted zone', async () => {
+    watchPreviewTiles()
+    openPreview(fileTarget('/work/project-network.html'))
+    const fileId = $rightRailActiveTabId.get()!
+    openPreview(urlTarget('about:blank'))
+    const browserId = $rightRailActiveTabId.get()!
+    mountSplit(fileId, browserId)
+    noteActiveTreeGroup('grp-file')
+
+    openPreview(urlTarget('https://example.com/tickets'))
+    // reveal may not commit when the pane is already fronted; the layout
+    // listener is what copies the interacted zone. Fire that same listener.
+    $layoutTree.set(mountSplit(fileId, browserId))
+
+    expect($rightRailActiveTabId.get()).toBe(browserId)
+    expect(await readActivePreview()).toMatchObject({
+      active_tab_id: browserId,
+      kind: 'url',
+      url: 'https://example.com/tickets'
+    })
+  })
+})
+
+function mountSplit(fileId: string, browserId: string) {
+  const tree = split('row', [
+    group([`preview-tile:${browserId}`], { active: `preview-tile:${browserId}`, id: 'grp-browser' }),
+    group([`preview-tile:${fileId}`], { active: `preview-tile:${fileId}`, id: 'grp-file' })
+  ])
+
+  $layoutTree.set(tree)
+
+  return tree
+}

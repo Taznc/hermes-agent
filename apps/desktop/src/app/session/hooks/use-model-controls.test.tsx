@@ -9,12 +9,12 @@ import {
   $activeSessionId,
   $currentModel,
   $currentProvider,
-  $currentReasoningEffort,
+  $currentReasoningEffortWire,
   getCurrentModelSource,
   setCurrentModel,
   setCurrentModelSource,
   setCurrentProvider,
-  setCurrentReasoningEffort
+  setCurrentReasoningEffortWire
 } from '@/store/session'
 import * as SessionStates from '@/store/session-states'
 
@@ -23,6 +23,8 @@ import { deferred } from '../../../test/deferred'
 import { useModelControls } from './use-model-controls'
 
 const setGlobalModel = vi.fn()
+const tile = vi.hoisted(() => ({ delegate: null as unknown }))
+const confirmMock = vi.fn()
 const notify = vi.fn()
 const notifyError = vi.fn()
 const dismissNotification = vi.fn()
@@ -38,21 +40,25 @@ vi.mock('@/store/session-states', async importOriginal => {
 
   return {
     ...actual,
-    sessionTileDelegate: () => null
+    sessionTileDelegate: () => tile.delegate
   }
 })
 
-vi.mock('@/i18n', () => ({
+vi.mock('@/i18n', async importOriginal => ({
+  // Keep the real module so the applier's `translateNow` copy is the shipped
+  // string — the assertions below pin the labels a user actually sees.
+  ...(await importOriginal<Record<string, unknown>>()),
   useI18n: () => ({
     t: {
-      common: {
-        confirm: 'Confirm'
-      },
       desktop: {
         modelSwitchFailed: 'Model switch failed'
       }
     }
   })
+}))
+
+vi.mock('@/store/confirm', () => ({
+  confirm: (...args: Parameters<typeof confirmMock>) => confirmMock(...args)
 }))
 
 vi.mock('@/store/notifications', () => ({
@@ -82,12 +88,13 @@ function Harness({
 
 describe('useModelControls', () => {
   beforeEach(() => {
+    confirmMock.mockReset()
+    notifyError.mockReset()
     $activeGatewayProfile.set('default')
     $activeSessionId.set(null)
     setCurrentModel('')
     setCurrentModelSource('')
     setCurrentProvider('')
-    setCurrentReasoningEffort('')
     SessionStates.$sessionStates.set({})
   })
 
@@ -99,7 +106,6 @@ describe('useModelControls', () => {
     setCurrentModel('')
     setCurrentModelSource('')
     setCurrentProvider('')
-    setCurrentReasoningEffort('')
     SessionStates.$sessionStates.set({})
   })
 
@@ -123,26 +129,6 @@ describe('useModelControls', () => {
     })
     expect(queryClient.getQueryData(modelOptionsQueryKey('beta'))).toBeUndefined()
     expect(queryClient.getQueryData(modelOptionsQueryKey('beta', null, 'source-b'))).toBeUndefined()
-  })
-
-  it('applies the global model when there is no active runtime session', async () => {
-    vi.mocked(getGlobalModelInfo).mockResolvedValue({
-      model: 'openai/gpt-5.5',
-      provider: 'openai-codex'
-    })
-
-    const { result } = renderHook(() =>
-      useModelControls({
-        queryClient: new QueryClient(),
-        requestGateway: vi.fn()
-      })
-    )
-
-    await result.current.refreshCurrentModel()
-
-    expect($currentModel.get()).toBe('openai/gpt-5.5')
-    expect($currentProvider.get()).toBe('openai-codex')
-    expect(getCurrentModelSource()).toBe('default')
   })
 
   it('does not clobber the active session footer state with global model info', async () => {
@@ -336,7 +322,7 @@ describe('useModelControls', () => {
     expect(invalidate).toHaveBeenCalled()
   })
 
-  it('confirms a guarded model switch before retrying it', async () => {
+  it('asks in a dialog before retrying a guarded model switch, then applies the confirmed one', async () => {
     $activeSessionId.set('session-1')
     setCurrentModel('gpt-5.6-sol')
     setCurrentProvider('openai-codex')
@@ -351,6 +337,12 @@ describe('useModelControls', () => {
       })
       .mockResolvedValueOnce({ key: 'model', scope: 'global', value: 'muse-spark-1.2-contributor' })
 
+    // Hold the answer open: nothing may be applied or resent until the user
+    // actually answers the dialog.
+    const answer = deferred<boolean>()
+
+    confirmMock.mockReturnValueOnce(answer.promise)
+
     let controls!: Controls
 
     render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
@@ -361,18 +353,16 @@ describe('useModelControls', () => {
 
     expect($currentModel.get()).toBe('gpt-5.6-sol')
     expect($currentProvider.get()).toBe('openai-codex')
-    expect(notify).toHaveBeenCalledWith(
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+    expect(confirmMock).toHaveBeenCalledWith(
       expect.objectContaining({
-        action: expect.objectContaining({ label: 'Confirm' }),
-        kind: 'warning',
-        message: 'This contributor model trains on your data.'
+        description: 'This contributor model trains on your data.',
+        destructive: true
       })
     )
 
-    const action = notify.mock.calls.at(-1)?.[0]?.action
-
     await act(async () => {
-      await action?.onClick()
+      answer.resolve(true)
     })
 
     await waitFor(() => expect(requestGateway).toHaveBeenCalledTimes(2))
@@ -384,6 +374,37 @@ describe('useModelControls', () => {
     })
     expect($currentModel.get()).toBe('muse-spark-1.2-contributor')
     expect($currentProvider.get()).toBe('opencode-go')
+  })
+
+  it('keeps the current model when the guarded switch is declined (#112458)', async () => {
+    $activeSessionId.set('session-1')
+    setCurrentModel('gpt-5.6-sol')
+    setCurrentProvider('openai-codex')
+
+    const requestGateway = vi.fn().mockResolvedValueOnce({
+      confirm_message: 'This contributor model trains on your data.',
+      confirm_required: true,
+      key: 'model',
+      value: 'muse-spark-1.2-contributor'
+    })
+
+    confirmMock.mockResolvedValueOnce(false)
+
+    let controls!: Controls
+
+    render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+
+    await expect(controls.selectModel({ model: 'muse-spark-1.2-contributor', provider: 'opencode-go' })).resolves.toBe(
+      false
+    )
+
+    // Declining is free and silent: no resend, no error toast, the pick is gone.
+    await act(async () => {})
+    expect(confirmMock).toHaveBeenCalledTimes(1)
+    expect(requestGateway).toHaveBeenCalledTimes(1)
+    expect($currentModel.get()).toBe('gpt-5.6-sol')
+    expect($currentProvider.get()).toBe('openai-codex')
+    expect(notifyError).not.toHaveBeenCalled()
   })
 
   it('keeps the pick when an OLDER gateway refuses a mid-turn switch', async () => {
@@ -413,6 +434,7 @@ describe('useModelControls', () => {
     $activeSessionId.set('session-1')
     setCurrentModel('fable-5')
     setCurrentProvider('nous')
+    setCurrentReasoningEffortWire('max')
 
     const requestGateway = vi.fn(async () => {
       throw new Error('no such model')
@@ -426,6 +448,8 @@ describe('useModelControls', () => {
 
     expect($currentModel.get()).toBe('fable-5')
     expect($currentProvider.get()).toBe('nous')
+    // The old route's clamp is true again once the switch is undone.
+    expect($currentReasoningEffortWire.get()).toBe('max')
     expect(notifyError).toHaveBeenCalled()
   })
 
@@ -536,48 +560,42 @@ describe('useModelControls', () => {
     expect($currentProvider.get()).toBe('custom:local')
   })
 
-  it('reseeds a sticky manual pick that was removed from the catalog', async () => {
-    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'openai/gpt-5.5', provider: 'openai-codex' })
-
-    const queryClient = new QueryClient()
-    $activeGatewayProfile.set('compass')
-    queryClient.setQueryData(modelOptionsQueryKey('default'), {
-      providers: [{ models: ['openrouter/owl-alpha'], name: 'OpenRouter', slug: 'openrouter' }]
-    })
-    queryClient.setQueryData(modelOptionsQueryKey('compass'), {
-      providers: [{ models: ['openai/gpt-5.5'], name: 'OpenRouter', slug: 'openrouter' }]
-    })
-
-    // A manual pick whose model no longer exists on its provider.
-    setCurrentModel('openrouter/owl-alpha')
-    setCurrentProvider('openrouter')
+  it('drops a sticky manual pick back to the Settings default on request (#107410)', async () => {
+    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'deepseek-v4-flash', provider: 'custom:relay' })
+    setCurrentModel('claude-sonnet-4-6')
+    setCurrentProvider('anthropic')
     setCurrentModelSource('manual')
 
-    const { result } = renderHook(() => useModelControls({ queryClient, requestGateway: vi.fn() }))
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway: vi.fn() }))
 
-    await result.current.refreshCurrentModel()
+    result.current.followDefaultModel()
 
-    expect($currentModel.get()).toBe('openai/gpt-5.5')
+    await waitFor(() => expect($currentModel.get()).toBe('deepseek-v4-flash'))
+    expect($currentProvider.get()).toBe('custom:relay')
     expect(getCurrentModelSource()).toBe('default')
   })
 
-  it('keeps a sticky manual pick that is still in the catalog', async () => {
-    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'openai/gpt-5.5', provider: 'openai-codex' })
+  it('keeps a sticky manual pick even when its provider row does not list the model', async () => {
+    // Rows are hints: a custom endpoint serves ids the picker row lacks. The
+    // pick is the user's selection and must not be reseeded to the default.
+    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'deepseek-v4-flash-0731', provider: 'custom:hyper' })
 
     const queryClient = new QueryClient()
     queryClient.setQueryData(modelOptionsQueryKey('default'), {
-      providers: [{ models: ['openrouter/glm-4.7', 'openai/gpt-5.5'], name: 'OpenRouter', slug: 'openrouter' }]
+      providers: [
+        { aliases: ['custom:hyper', 'hyper'], models: ['deepseek-v4-flash-0731'], name: 'Hyper', slug: 'hyper' }
+      ]
     })
 
-    setCurrentModel('openrouter/glm-4.7')
-    setCurrentProvider('openrouter')
+    setCurrentModel('deepseek-v4.1-flash')
+    setCurrentProvider('custom:hyper')
     setCurrentModelSource('manual')
 
     const { result } = renderHook(() => useModelControls({ queryClient, requestGateway: vi.fn() }))
 
     await result.current.refreshCurrentModel()
 
-    expect($currentModel.get()).toBe('openrouter/glm-4.7')
+    expect($currentModel.get()).toBe('deepseek-v4.1-flash')
     expect(getCurrentModelSource()).toBe('manual')
   })
 
@@ -702,6 +720,32 @@ describe('useModelControls', () => {
     })
   })
 
+  it("withdraws the old route's wire stamp when a tile switches model", async () => {
+    let tileState: Record<string, unknown> = {
+      model: 'gpt-6.1-sol',
+      provider: 'openai-codex',
+      reasoningEffortWire: 'max'
+    }
+
+    tile.delegate = {
+      updateSession: (_id: string, update: (state: Record<string, unknown>) => Record<string, unknown>) => {
+        tileState = update(tileState)
+      }
+    }
+    $activeSessionId.set('runtime-a')
+    const requestGateway = vi.fn(async () => ({ key: 'model', value: 'gpt-6.1-luna' }) as never)
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway }))
+
+    try {
+      await result.current.selectModel({ model: 'gpt-6.1-luna', provider: 'openai-codex', sessionId: 'runtime-b' })
+    } finally {
+      tile.delegate = null
+    }
+
+    // Until session.info re-stamps it, the tile pill must not present the old route's clamp.
+    expect(tileState).toMatchObject({ model: 'gpt-6.1-luna', reasoningEffortWire: '' })
+  })
+
   it('rolls a failed focused-B selection back only in B cache', async () => {
     const queryClient = new QueryClient()
     const ownerBKey = modelOptionsQueryKey('profile-b', 'runtime-b', 'connection-b')
@@ -736,460 +780,170 @@ describe('useModelControls', () => {
     expect(notifyError).toHaveBeenCalled()
   })
 
-  // >>> FORK ANCHOR: composer-model-recommendation <<<
-  // A recommendation is ONE choice — provider, model and effort together — so
-  // it rides the same selection path rather than a second implementation that
-  // would have to re-derive primary-vs-tile scoping, the confirm handshake and
-  // rollback. `effort` is optional, so every existing caller is unchanged.
-  describe('selectModel with a reasoning effort', () => {
-    it('forces a PRIMARY recommendation to be session-only on the wire', async () => {
-      $activeSessionId.set('session-1')
-
-      const backend = {
-        profileDefault: { model: 'fable-5', provider: 'nous' },
-        session: { model: 'fable-5', provider: 'nous' }
-      }
-
-      const requestGateway = vi.fn(async (_method: string, params?: Record<string, unknown>) => {
-        const value = String(params?.value)
-
-        const next = {
-          model: value.split(' --provider ')[0],
-          provider: value.split(' --provider ')[1].split(' --session')[0]
-        }
-
-        if (value.endsWith(' --session')) {
-          backend.session = next
-        } else {
-          backend.profileDefault = next
-        }
-
-        return { key: 'model' } as never
-      })
-
-      let controls!: Controls
-
-      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
-
-      await controls.selectRecommendedModel({
-        effort: 'high',
-        model: 'claude-opus-5',
-        provider: 'anthropic',
-        sessionId: 'session-1'
-      })
-
-      expect(requestGateway).toHaveBeenCalledWith('config.set', {
-        key: 'model',
-        session_id: 'session-1',
-        value: 'claude-opus-5 --provider anthropic --session'
-      })
-      expect(backend.profileDefault).toEqual({ model: 'fable-5', provider: 'nous' })
-      expect(backend.session).toEqual({ model: 'claude-opus-5', provider: 'anthropic' })
+  // ── Stale MoA pick (#90244) ───────────────────────────────────────────────
+  // The composer pill kept reading `Model · moa: default` after every MoA
+  // preset was disabled: a manual pick is sticky by design, but the virtual
+  // `moa` provider's catalog row disappears entirely once no preset is
+  // enabled — that one absence is authoritative, so the pick reseeds from
+  // the profile default instead of persisting forever.
+  it('reseeds a manual moa pick when the catalog no longer carries it (#90244)', async () => {
+    const queryClient = new QueryClient()
+    setCurrentModel('default')
+    setCurrentProvider('moa')
+    setCurrentModelSource('manual')
+    // Populated catalog without a moa row: every preset disabled.
+    queryClient.setQueryData(modelOptionsQueryKey('default'), {
+      model: 'openai/gpt-5.5',
+      provider: 'openai',
+      providers: [{ models: ['gpt-5.5'], name: 'OpenAI', slug: 'openai' }]
     })
+    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'openai/gpt-5.5', provider: 'openai' })
 
-    it('keeps a TILE recommendation session-only on the exact tile wire route', async () => {
-      $activeSessionId.set('primary-1')
-      SessionStates.$sessionStates.set({ 'tile-9': { model: 'old', provider: 'nous' } as never })
-      const requestGateway = vi.fn(async () => ({ key: 'model' }) as never)
-      const updateSession = vi.fn()
-
-      vi.spyOn(SessionStates, 'sessionTileDelegate').mockReturnValue({ updateSession } as never)
-      let controls!: Controls
-
-      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
-
-      await controls.selectRecommendedModel({
-        effort: 'medium',
-        model: 'gpt-5.6-terra',
-        provider: 'openai-codex',
-        sessionId: 'tile-9'
+    const { result } = renderHook(() =>
+      useModelControls({
+        queryClient,
+        requestGateway: vi.fn()
       })
+    )
 
-      expect(requestGateway).toHaveBeenCalledWith('config.set', {
-        key: 'model',
-        session_id: 'tile-9',
-        value: 'gpt-5.6-terra --provider openai-codex --session'
-      })
+    await act(() => result.current.refreshCurrentModel())
+
+    expect($currentModel.get()).toBe('openai/gpt-5.5')
+    expect($currentProvider.get()).toBe('openai')
+    expect(getCurrentModelSource()).toBe('default')
+  })
+
+  it('keeps a manual moa pick while the catalog still offers the preset', async () => {
+    const queryClient = new QueryClient()
+    setCurrentModel('balanced')
+    setCurrentProvider('moa')
+    setCurrentModelSource('manual')
+    queryClient.setQueryData(modelOptionsQueryKey('default'), {
+      model: 'openai/gpt-5.5',
+      provider: 'openai',
+      providers: [{ models: ['default', 'balanced'], name: 'Mixture of Agents', slug: 'moa' }]
     })
+    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'openai/gpt-5.5', provider: 'openai' })
 
-    it('returns a discriminated failure and restores backend model state when reasoning fails', async () => {
-      $activeSessionId.set('session-1')
-      setCurrentModel('fable-5')
-      setCurrentProvider('nous')
-      setCurrentReasoningEffort('low')
-      const backend = { model: 'fable-5', provider: 'nous' }
-
-      const requestGateway = vi.fn(async (_method: string, params?: Record<string, unknown>) => {
-        if (params?.key === 'reasoning') {
-          throw new Error('reasoning rejected')
-        }
-
-        const value = String(params?.value)
-        backend.model = value.split(' --provider ')[0]
-        backend.provider = value.split(' --provider ')[1].split(' --session')[0]
-
-        return { key: 'model' } as never
+    const { result } = renderHook(() =>
+      useModelControls({
+        queryClient,
+        requestGateway: vi.fn()
       })
+    )
 
-      let controls!: Controls
+    await act(() => result.current.refreshCurrentModel())
 
-      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
+    expect($currentModel.get()).toBe('balanced')
+    expect($currentProvider.get()).toBe('moa')
+    expect(getCurrentModelSource()).toBe('manual')
+  })
 
-      await expect(
-        controls.selectRecommendedModel({
-          effort: 'high',
-          model: 'claude-opus-5',
-          provider: 'anthropic',
-          sessionId: 'session-1'
-        })
-      ).resolves.toEqual({ kind: 'failed', recovery: 'restored' })
+  it('keeps a manual moa pick when the catalog has not loaded yet', async () => {
+    const queryClient = new QueryClient()
+    setCurrentModel('default')
+    setCurrentProvider('moa')
+    setCurrentModelSource('manual')
+    // Empty cache AND a catalog dispatcher that fails: absence of data must
+    // never read as "the preset was removed".
+    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'openai/gpt-5.5', provider: 'openai' })
 
-      expect(backend).toEqual({ model: 'fable-5', provider: 'nous' })
-      expect(requestGateway).toHaveBeenLastCalledWith('config.set', {
-        confirm_expensive_model: true,
-        key: 'model',
-        session_id: 'session-1',
-        value: 'fable-5 --provider nous --session'
+    const { result } = renderHook(() =>
+      useModelControls({
+        queryClient,
+        requestGateway: vi.fn(() => Promise.reject(new Error('gateway unavailable')))
       })
+    )
+
+    await act(() => result.current.refreshCurrentModel())
+
+    expect($currentModel.get()).toBe('default')
+    expect($currentProvider.get()).toBe('moa')
+    expect(getCurrentModelSource()).toBe('manual')
+  })
+
+  it('never reseeds an ordinary manual pick the catalog lacks (custom slug)', async () => {
+    const queryClient = new QueryClient()
+    setCurrentModel('my-own-slug')
+    setCurrentProvider('custom')
+    setCurrentModelSource('manual')
+    queryClient.setQueryData(modelOptionsQueryKey('default'), {
+      model: 'openai/gpt-5.5',
+      provider: 'openai',
+      providers: [{ models: ['gpt-5.5'], name: 'OpenAI', slug: 'openai' }]
     })
+    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'openai/gpt-5.5', provider: 'openai' })
 
-    it('keeps the accepted backend model visible and reports when compensation also fails', async () => {
-      $activeSessionId.set('session-1')
-      setCurrentModel('fable-5')
-      setCurrentProvider('nous')
-      setCurrentReasoningEffort('low')
-      const queryClient = new QueryClient()
-      const invalidateQueries = vi.spyOn(queryClient, 'invalidateQueries')
-      let modelWrites = 0
-
-      const requestGateway = vi.fn(async (_method: string, params?: Record<string, unknown>) => {
-        if (params?.key === 'reasoning') {
-          throw new Error('reasoning rejected')
-        }
-
-        modelWrites += 1
-
-        if (modelWrites === 2) {
-          throw new Error('restore rejected')
-        }
-
-        return { key: 'model' } as never
+    const { result } = renderHook(() =>
+      useModelControls({
+        queryClient,
+        requestGateway: vi.fn()
       })
-
-      const { result } = renderHook(() => useModelControls({ queryClient, requestGateway }))
-
-      await expect(
-        result.current.selectRecommendedModel({
-          effort: 'high',
-          model: 'claude-opus-5',
-          provider: 'anthropic',
-          sessionId: 'session-1'
-        })
-      ).resolves.toEqual({ kind: 'failed', recovery: 'restore_failed' })
-
-      expect($currentModel.get()).toBe('claude-opus-5')
-      expect($currentProvider.get()).toBe('anthropic')
-      expect($currentReasoningEffort.get()).toBe('low')
-      expect(invalidateQueries).toHaveBeenCalled()
-    })
-
-    it('reports confirmation pending separately from a real failure', async () => {
-      $activeSessionId.set('session-1')
-      const requestGateway = vi.fn(async () => ({ confirm_message: 'Expensive model.', confirm_required: true }) as never)
-      let controls!: Controls
-
-      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
-
-      const outcome = await controls.selectRecommendedModel({
-        effort: 'high',
-        model: 'claude-opus-5',
-        provider: 'anthropic',
-        sessionId: 'session-1'
-      })
-
-      expect(outcome.kind).toBe('confirmation_pending')
-    })
-
-    // A confirmation is a suspended decision, not a terminal answer. The
-    // recommendation surface has to be able to replace its "confirm the
-    // switch" guidance once the user answers, so the pending outcome carries
-    // the promise of its own resolution. These four tests pin every way that
-    // promise can settle.
-    describe('a pending confirmation settles', () => {
-      const pendingThenGateway = (...after: unknown[]) => {
-        const gateway = vi.fn().mockResolvedValueOnce({ confirm_message: 'Expensive model.', confirm_required: true })
-
-        for (const value of after) {
-          gateway.mockResolvedValueOnce(value)
-        }
-
-        return gateway.mockResolvedValue({ key: 'model' })
-      }
-
-      // Returns the settlement promise in a BOX. An `async` helper returning
-      // the promise bare would await it — this function must hand back a
-      // still-pending promise so the test can click Confirm first.
-      const confirmPending = async (controls: Controls) => {
-        const outcome = await controls.selectRecommendedModel({
-          effort: 'high',
-          model: 'muse-spark-1.2',
-          provider: 'opencode-go',
-          sessionId: 'session-1'
-        })
-
-        if (outcome.kind !== 'confirmation_pending') {
-          throw new Error(`expected confirmation_pending, got ${outcome.kind}`)
-        }
-
-        return { settled: outcome.settled }
-      }
-
-      const clickConfirm = async () => {
-        await act(async () => {
-          await notify.mock.calls.at(-1)?.[0]?.action?.onClick()
-        })
-      }
-
-      beforeEach(() => {
-        // `vi.restoreAllMocks()` does not clear a plain `vi.fn()`'s call
-        // history, and `notify.mock.calls.at(-1)` would otherwise pick up the
-        // notification an EARLIER test in this file created — clicking that
-        // confirm resolves someone else's switch and leaves this test's
-        // settlement promise pending forever.
-        notify.mockClear()
-        notifyError.mockClear()
-        dismissNotification.mockClear()
-
-        $activeSessionId.set('session-1')
-        setCurrentModel('fable-5')
-        setCurrentProvider('nous')
-        setCurrentReasoningEffort('low')
-      })
-
-      it('as applied once the confirmed resend and its effort both succeed', async () => {
-        const requestGateway = pendingThenGateway({ key: 'model' }, { key: 'reasoning' })
-        let controls!: Controls
-
-        render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
-
-        const { settled } = await confirmPending(controls)
-
-        await clickConfirm()
-
-        await expect(settled).resolves.toEqual({ kind: 'applied' })
-        expect($currentModel.get()).toBe('muse-spark-1.2')
-      })
-
-      it('as failed when the confirmed resend is refused a second time', async () => {
-        const requestGateway = pendingThenGateway({ confirm_message: 'Expensive model.', confirm_required: true })
-        let controls!: Controls
-
-        render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
-
-        const { settled } = await confirmPending(controls)
-
-        await clickConfirm()
-
-        await expect(settled).resolves.toEqual({ kind: 'failed', recovery: 'not_needed' })
-        // The switch never applied, so the previous model must still be painted.
-        expect($currentModel.get()).toBe('fable-5')
-      })
-
-      it('as failed/restored when the post-confirm effort write fails and is compensated', async () => {
-        const requestGateway = vi
-          .fn()
-          .mockResolvedValueOnce({ confirm_message: 'Expensive model.', confirm_required: true })
-          .mockResolvedValueOnce({ key: 'model' })
-          .mockRejectedValueOnce(new Error('reasoning refused'))
-          .mockResolvedValue({ key: 'model' })
-
-        let controls!: Controls
-
-        render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
-
-        const { settled } = await confirmPending(controls)
-
-        await clickConfirm()
-
-        await expect(settled).resolves.toEqual({ kind: 'failed', recovery: 'restored' })
-        expect($currentModel.get()).toBe('fable-5')
-        expect($currentReasoningEffort.get()).toBe('low')
-      })
-
-      it('as failed/restore_failed when the compensation is refused too', async () => {
-        const requestGateway = vi
-          .fn()
-          .mockResolvedValueOnce({ confirm_message: 'Expensive model.', confirm_required: true })
-          .mockResolvedValueOnce({ key: 'model' })
-          .mockRejectedValueOnce(new Error('reasoning refused'))
-          .mockRejectedValue(new Error('restore refused'))
-
-        let controls!: Controls
-
-        render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
-
-        const { settled } = await confirmPending(controls)
-
-        await clickConfirm()
-
-        await expect(settled).resolves.toEqual({ kind: 'failed', recovery: 'restore_failed' })
-        // Never paint a rollback the gateway refused: the accepted model stays
-        // visible at the PREVIOUS effort.
-        expect($currentModel.get()).toBe('muse-spark-1.2')
-        expect($currentReasoningEffort.get()).toBe('low')
-      })
-
-      it('as superseded when the user moved on before confirming', async () => {
-        const requestGateway = pendingThenGateway({ key: 'model' })
-        let controls!: Controls
-
-        render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
-
-        const { settled } = await confirmPending(controls)
-
-        // The staleness guard's own condition: the live selection no longer
-        // matches the snapshot the confirmation was created for.
-        act(() => {
-          setCurrentModel('gpt-5.6-sol')
-          setCurrentProvider('openai-codex')
-        })
-
-        await clickConfirm()
-
-        await expect(settled).resolves.toEqual({ kind: 'superseded' })
-        expect(dismissNotification).toHaveBeenCalled()
-        // A superseded confirmation resends nothing.
-        expect(requestGateway).toHaveBeenCalledTimes(1)
-      })
-    })
-
-    it('applies effort to the PRIMARY composer, not through the tile delegate', async () => {
-      $activeSessionId.set('session-1')
-      setCurrentReasoningEffort('low')
-
-      const requestGateway = vi.fn(async () => ({ key: 'model' }) as never)
-      let controls!: Controls
-
-      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
-
-      await expect(
-        controls.selectModel({ effort: 'high', model: 'claude-opus-5', provider: 'anthropic' })
-      ).resolves.toBe(true)
-
-      expect($currentReasoningEffort.get()).toBe('high')
-      expect(requestGateway).toHaveBeenCalledWith('config.set', {
-        key: 'reasoning',
-        session_id: 'session-1',
-        value: 'high'
-      })
-    })
-
-    it('applies a TILE’s effort to that tile’s slice and leaves the primary alone', async () => {
-      $activeSessionId.set('primary-1')
-      setCurrentReasoningEffort('low')
-      SessionStates.$sessionStates.set({ 'tile-9': { reasoningEffort: 'low' } as never })
-
-      const updateSession = vi.fn()
-
-      vi.spyOn(SessionStates, 'sessionTileDelegate').mockReturnValue({ updateSession } as never)
-
-      const requestGateway = vi.fn(async () => ({ key: 'model' }) as never)
-      let controls!: Controls
-
-      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
-
-      await controls.selectModel({
-        effort: 'high',
-        model: 'claude-opus-5',
-        provider: 'anthropic',
-        sessionId: 'tile-9'
-      })
-
-      expect($currentReasoningEffort.get()).toBe('low')
-      expect(requestGateway).toHaveBeenCalledWith('config.set', {
-        key: 'reasoning',
-        session_id: 'tile-9',
-        value: 'high'
-      })
-    })
-
-    it('defers effort until a guarded switch is CONFIRMED, then applies it', async () => {
-      $activeSessionId.set('session-1')
-      setCurrentModel('gpt-5.6-sol')
-      setCurrentProvider('openai-codex')
-      setCurrentReasoningEffort('low')
-
-      const requestGateway = vi
-        .fn()
-        .mockResolvedValueOnce({ confirm_message: 'Expensive model.', confirm_required: true })
-        .mockResolvedValueOnce({ key: 'model' })
-        .mockResolvedValue({ key: 'reasoning' })
-
-      let controls!: Controls
-
-      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
-
-      await expect(
-        controls.selectModel({ effort: 'high', model: 'muse-spark-1.2', provider: 'opencode-go' })
-      ).resolves.toBe(false)
-
-      // Confirmation pending: nothing applied yet, and NO reasoning write.
-      expect($currentReasoningEffort.get()).toBe('low')
-      expect(requestGateway.mock.calls.some(([, params]) => params?.key === 'reasoning')).toBe(false)
-
-      await act(async () => {
-        await notify.mock.calls.at(-1)?.[0]?.action?.onClick()
-      })
-
-      await waitFor(() => expect($currentReasoningEffort.get()).toBe('high'))
-      expect($currentModel.get()).toBe('muse-spark-1.2')
-    })
-
-    it('rolls the whole selection back when only the reasoning write fails', async () => {
-      $activeSessionId.set('session-1')
-      setCurrentModel('fable-5')
-      setCurrentProvider('nous')
-      setCurrentReasoningEffort('low')
-
-      const requestGateway = vi.fn(async (_method: string, params?: Record<string, unknown>) => {
-        if (params?.key === 'reasoning') {
-          throw new Error('reasoning rejected')
-        }
-
-        return { key: 'model' } as never
-      })
-
-      let controls!: Controls
-
-      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
-
-      // Applying a recommendation is ONE choice. A half-applied session (new
-      // model, old effort) is worse than not applying it, so it is atomic.
-      await expect(
-        controls.selectModel({ effort: 'high', model: 'claude-opus-5', provider: 'anthropic' })
-      ).resolves.toBe(false)
-
-      expect($currentReasoningEffort.get()).toBe('low')
-      expect($currentModel.get()).toBe('fable-5')
-      expect($currentProvider.get()).toBe('nous')
-      expect(notifyError).toHaveBeenCalled()
-    })
-
-    it('never writes reasoning without a live session (that would rewrite the profile default)', async () => {
-      $activeSessionId.set(null)
-      setCurrentReasoningEffort('low')
-
-      const requestGateway = vi.fn(async () => ({}) as never)
-      let controls!: Controls
-
-      render(<Harness onReady={value => (controls = value)} requestGateway={requestGateway} />)
-
-      await expect(
-        controls.selectModel({ effort: 'high', model: 'claude-opus-5', provider: 'anthropic' })
-      ).resolves.toBe(true)
-
-      expect($currentReasoningEffort.get()).toBe('high')
-      expect(requestGateway).not.toHaveBeenCalled()
-    })
+    )
+
+    await act(() => result.current.refreshCurrentModel())
+
+    // d595e636c83: a picked id is never rewritten to a catalog neighbour —
+    // the moa exception must not leak into the general design.
+    expect($currentModel.get()).toBe('my-own-slug')
+    expect($currentProvider.get()).toBe('custom')
+    expect(getCurrentModelSource()).toBe('manual')
+  })
+
+  // ── Stale native pick superseded by a custom default (#81922) ─────────────
+  // `nvidia` -> `custom:nvidia` in config.yaml: the bare slug is the
+  // pre-migration spelling of the SAME endpoint (#87035 aliases the two for one
+  // catalog row), but shipping it builds the NATIVE provider and silently drops
+  // the custom entry's `extra_body` (e.g. `thinking: {type: adaptive}`). The
+  // bare slug must yield to the configured default.
+  it('reseeds a sticky manual pick the profile default migrated to its custom-provider form (#81922)', async () => {
+    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'z-ai/glm-5.2', provider: 'custom:nvidia' })
+    setCurrentModel('z-ai/glm-5.2')
+    setCurrentProvider('nvidia')
+    setCurrentModelSource('manual')
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway: vi.fn() }))
+
+    await act(() => result.current.refreshCurrentModel())
+
+    expect($currentProvider.get()).toBe('custom:nvidia')
+    expect($currentModel.get()).toBe('z-ai/glm-5.2')
+    // 'default' means the next session.create omits the override entirely, so
+    // the gateway resolves config.yaml's custom entry (with its extra_body).
+    expect(getCurrentModelSource()).toBe('default')
+  })
+
+  it('keeps a manual pick of a different provider while the default is a custom entry', async () => {
+    vi.mocked(getGlobalModelInfo).mockResolvedValue({ model: 'z-ai/glm-5.2', provider: 'custom:nvidia' })
+    setCurrentModel('claude-sonnet-4-6')
+    setCurrentProvider('anthropic')
+    setCurrentModelSource('manual')
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway: vi.fn() }))
+
+    await act(() => result.current.refreshCurrentModel())
+
+    expect($currentModel.get()).toBe('claude-sonnet-4-6')
+    expect($currentProvider.get()).toBe('anthropic')
+    expect(getCurrentModelSource()).toBe('manual')
+  })
+
+  it('keeps a manual custom:* pick without consulting the profile default', async () => {
+    setCurrentModel('deepseek-v4-flash')
+    setCurrentProvider('custom:relay')
+    setCurrentModelSource('manual')
+    // getGlobalModelInfo is a shared module mock; count only this test's calls.
+    vi.mocked(getGlobalModelInfo).mockClear()
+
+    const { result } = renderHook(() => useModelControls({ queryClient: new QueryClient(), requestGateway: vi.fn() }))
+
+    await act(() => result.current.refreshCurrentModel())
+
+    expect($currentModel.get()).toBe('deepseek-v4-flash')
+    expect($currentProvider.get()).toBe('custom:relay')
+    expect(getCurrentModelSource()).toBe('manual')
+    // A provider-class pick can never be shadowed by a custom:<key> default, so
+    // the sticky path must not pay for a /api/model/info round trip.
+    expect(getGlobalModelInfo).not.toHaveBeenCalled()
   })
 })

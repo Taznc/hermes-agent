@@ -57,17 +57,11 @@ export function overrideLabel(value: TaskModelOverride, inheritCopy: string): st
 /**
  * The picker itself. Controlled: the caller owns the value, so the New Task
  * dialog can hold it as form state and the drawer can PATCH on change.
- *
- * `inheritLabel` (optional) replaces the generic "Inherit" copy with the
- * RESOLVED inheritance — the assignee profile's own model/effort — so the
- * row answers "what will this actually run" instead of "it's the default".
  */
 export function ModelOverrideField({
-  inheritLabel,
   onChange,
   value
 }: {
-  inheritLabel?: string
   onChange: (next: TaskModelOverride) => void
   value: TaskModelOverride
 }) {
@@ -75,6 +69,7 @@ export function ModelOverrideField({
   const [open, setOpen] = useState(false)
 
   const controller: ModelMenuController = {
+    allowSpeed: false,
     // Picking a model seeds the depth from what the user last used for it, so
     // the board behaves like the composer. We only READ presets — a per-task
     // choice must never rewrite what the composer opens at.
@@ -117,7 +112,7 @@ export function ModelOverrideField({
           type="button"
           variant="outline"
         >
-          <span className="min-w-0 truncate">{overrideLabel(value, inheritLabel || k.modelInherit)}</span>
+          <span className="min-w-0 truncate">{overrideLabel(value, k.modelInherit)}</span>
           <span className="flex shrink-0 items-center gap-1">
             {!isInherited(value) && (
               <span

@@ -3,7 +3,7 @@ import { type MutableRefObject, useEffect, useRef } from 'react'
 import { isNewChatRoute } from '@/app/routes'
 import { type SessionResumeRequest, setResumeExhaustedSessionId } from '@/store/session'
 import type { SessionProfileRoute } from '@/store/session-request-router'
-import { focusOpenSession, markSelectionRestore } from '@/store/session-states'
+import { markSelectionRestore } from '@/store/session-states'
 
 interface RouteResumeOptions {
   activeSessionId: string | null
@@ -13,10 +13,6 @@ interface RouteResumeOptions {
   freshDraftReady: boolean
   gatewayState: string | undefined
   locationPathname: string
-  /** A session route created solely to clear a workspace page behind a focused
-   * tile. The tile remains this history entry's foreground target: replay must
-   * re-front it, never resume it into main (which would close the tile). */
-  preserveSessionTile?: boolean
   resumeSession: (sessionId: string, focus: boolean, ownerRoute?: SessionProfileRoute) => Promise<unknown>
   // Stored-session id whose most recent resume failed terminally (set by
   // useSessionActions, mirrored from $resumeFailedSessionId). While this equals
@@ -34,7 +30,7 @@ interface RouteResumeOptions {
   runtimeIdByStoredSessionIdRef: MutableRefObject<Map<string, string>>
   selectedStoredSessionId: string | null
   selectedStoredSessionIdRef: MutableRefObject<string | null>
-  startFreshSessionDraft: (focus: boolean) => unknown
+  startFreshSessionDraft: (options: boolean | { replaceRoute?: boolean; rotateFreshDraftKey?: boolean }) => unknown
 }
 
 // Bounded auto-retry for a stranded session window. A resume can fail terminally
@@ -66,7 +62,7 @@ function rawHashLooksLikeSession(): boolean {
 
   return (
     !hash.startsWith('/settings') &&
-    !hash.startsWith('/skills') &&
+    !hash.startsWith('/capabilities') &&
     !hash.startsWith('/messaging') &&
     !hash.startsWith('/artifacts')
   )
@@ -80,7 +76,6 @@ export function useRouteResume({
   freshDraftReady,
   gatewayState,
   locationPathname,
-  preserveSessionTile,
   resumeSession,
   resumeFailedSessionId,
   resumeExhaustedSessionId,
@@ -125,35 +120,11 @@ export function useRouteResume({
     seenGatewayStateRef.current = true
     wasGatewayOpenRef.current = gatewayOpen
 
-    if (currentView !== 'chat') {
+    if (currentView !== 'chat' || !gatewayOpen) {
       return
     }
 
     if (routedSessionId) {
-      // The sidebar routed away from a full workspace page after it had already
-      // focused this session's tile. The URL now correctly classifies as chat
-      // (and the page/sidebar selection clears), but routing it through main
-      // would deliberately close the tile in resumeSession. The wiring proves
-      // the tile still exists before setting this flag; if it closes, the flag
-      // drops and an ordinary route resume is available again. Re-front it only
-      // when this history entry is visited: Kanban fronts `workspace`, so Back
-      // must actively restore the tile rather than merely suppressing resume.
-      // Other dependencies (resume requests, gateway state, session data) also
-      // re-run this effect; they must not let an old route steal focus from a
-      // newer explicit sidebar selection.
-      if (preserveSessionTile) {
-        if (!pathnameChanged || focusOpenSession(routedSessionId) === 'tile') {
-          return
-        }
-
-        // The tile vanished between validation and this effect. Fall through
-        // to the ordinary main-session resume path.
-      }
-
-      if (!gatewayOpen) {
-        return
-      }
-
       const cachedRuntime = runtimeIdByStoredSessionIdRef.current.get(routedSessionId)
 
       const alreadyActive =
@@ -179,7 +150,24 @@ export function useRouteResume({
       // pathname flips to / (same null+/:sid signature). freshDraftReady is the
       // discriminator: it's true while heading into a blank new chat, false when
       // genuinely stranded on a routed session.
-      const stuckOnRoutedSession = routedSessionId !== selectedStoredSessionIdRef.current && !freshDraftReady
+      //
+      // Also must NOT fire when create/fork already moved selection + runtime to
+      // a new session B while the router still shows stale A (#66057). That looks
+      // "stuck on A" but resuming A yanks the UI back off the new chat.
+      //
+      // Scope this suppression to an active pending-create hold only. Once
+      // creatingSessionRef drops (route caught up, user left, or the safety
+      // timeout), a lingering A-route / B-selection mismatch must be able to
+      // self-heal via stuckOnRoutedSession — otherwise ChatView stays in its
+      // route/selection loading state forever after a stuck navigate.
+      const selectionMovedAheadOfRoute =
+        creatingSessionRef.current &&
+        Boolean(selectedStoredSessionIdRef.current) &&
+        selectedStoredSessionIdRef.current !== routedSessionId &&
+        Boolean(activeSessionIdRef.current)
+
+      const stuckOnRoutedSession =
+        routedSessionId !== selectedStoredSessionIdRef.current && !freshDraftReady && !selectionMovedAheadOfRoute
 
       // Resume when the route meaningfully changed, the gateway just opened, or
       // we're stranded on a routed session that never loaded. The first two
@@ -222,8 +210,16 @@ export function useRouteResume({
       return
     }
 
+    // A sleep/wake WS reconnect can reopen on a new-chat route while the active
+    // runtime session is still the user's current chat. The gateway re-opened;
+    // nothing navigated. Forcing a fresh draft here is what turned every
+    // Windows/macOS sleep/wake cycle into a brand-new session and parked the
+    // previous chat in the sidebar (#53374). Preserve the active chat instead.
+    if (isNewChatRoute(locationPathname) && gatewayBecameOpen && activeSessionId && !freshDraftReady) {
+      return
+    }
+
     if (
-      gatewayOpen &&
       isNewChatRoute(locationPathname) &&
       !creatingSessionRef.current &&
       (selectedStoredSessionId || activeSessionId || !freshDraftReady) &&
@@ -231,7 +227,7 @@ export function useRouteResume({
     ) {
       // A fresh draft is a real navigation — any later resume homes normally.
       bootResumeRef.current = false
-      startFreshSessionDraft(true)
+      startFreshSessionDraft({ replaceRoute: true, rotateFreshDraftKey: false })
     }
   }, [
     activeSessionId,
@@ -241,7 +237,6 @@ export function useRouteResume({
     freshDraftReady,
     gatewayState,
     locationPathname,
-    preserveSessionTile,
     resumeSession,
     sessionResumeRequest,
     routedSessionId,
@@ -281,7 +276,7 @@ export function useRouteResume({
       retryAttemptRef.current = 0
     }
 
-    if (currentView !== 'chat' || gatewayState !== 'open' || preserveSessionTile) {
+    if (currentView !== 'chat' || gatewayState !== 'open') {
       return
     }
 
@@ -351,7 +346,6 @@ export function useRouteResume({
     creatingSessionRef,
     currentView,
     gatewayState,
-    preserveSessionTile,
     resumeSession,
     resumeFailedSessionId,
     resumeExhaustedSessionId,

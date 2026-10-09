@@ -175,7 +175,7 @@ def test_initial_auth_failure_parks_and_revives_after_relogin(
 
     Ending the task drops the only listener on ``_reconnect_event``, so the
     server stayed dead for the life of the process even after the user
-    re-authenticated. Parking keeps it revivable by the explicit reconnect signal.
+    re-authenticated. Parking keeps it revivable via the self-probe.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
@@ -183,6 +183,10 @@ def test_initial_auth_failure_parks_and_revives_after_relogin(
 
     from tools import mcp_tool
 
+    monkeypatch.setattr(mcp_tool, "_PARKED_RETRY_INTERVAL", 0.05)
+
+    from tools import mcp_tool_config as _config
+    monkeypatch.setattr(_config, "_load_mcp_config", lambda: {"figma": {"command": "x"}})
 
     _real_sleep = asyncio.sleep
 
@@ -231,10 +235,9 @@ def test_initial_auth_failure_parks_and_revives_after_relogin(
                 "run task exited on a 401 — the server is now unrevivable"
             )
 
-            # Re-authentication is followed by the lifecycle reconnect signal
-            # that the refresh path emits after credentials change.
+            # The user re-authenticates. Nothing sets _reconnect_event:
+            # revival must come from the timed self-probe alone.
             state["authenticated"] = True
-            task._reconnect_event.set()
             for _ in range(200):
                 await _real_sleep(0.01)
                 if task.session is not None:

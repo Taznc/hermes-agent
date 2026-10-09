@@ -1,3 +1,5 @@
+import { execSync } from 'node:child_process'
+
 // vite.config.web.ts — SPIKE: serve the desktop renderer as a plain web page.
 //
 // Wraps the real vite.config.ts (function config) and overlays:
@@ -10,8 +12,7 @@
 //
 // Run:  npx vite --config vite.config.web.ts
 // Open: http://127.0.0.1:<port>/index-web.html?token=<session-token>
-import { defineConfig, mergeConfig, type ConfigEnv, type UserConfig } from 'vite'
-import { execSync } from 'node:child_process'
+import { type ConfigEnv, defineConfig, mergeConfig, type UserConfig } from 'vite'
 
 import baseConfig from './vite.config'
 

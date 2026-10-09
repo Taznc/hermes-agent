@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import sqlite3
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -130,79 +129,69 @@ def test_loop_stops_when_worker_already_completed(monkeypatch):
     assert turns == []  # no extra turns
 
 
-def test_claimed_goal_worker_continues_before_clean_exit_finalization(
-    kanban_home,
-    monkeypatch,
-):
-    """A successful nonterminal turn must reach the goal-loop continuation."""
-    import cli as cli_module
+def test_loop_stops_on_judge_transport_failure(monkeypatch):
+    """Regression #91264: judge transport failure must stop the loop instead of
+    being coerced to continue via WAIT."""
+    def _failing_judge(*args, **kwargs):
+        # 5-tuple: verdict, reason, parse_failed, wait, transport_failed
+        return "wait", "judge transport unreachable", False, None, True
 
-    with kbc.connect() as conn:
-        task_id = kb.create_task(
-            conn,
-            title="finish the claimed goal",
-            body="Continue once, then complete the task.",
-            assignee="worker",
-        )
-        # New mutations reject goal mode; retain coverage for imported/legacy
-        # rows that still carry the retired columns.
-        conn.execute(
-            "UPDATE tasks SET goal_mode = 1, goal_max_turns = 3 WHERE id = ?",
-            (task_id,),
-        )
-        conn.commit()
-        claimed = kb.claim_task(conn, task_id)
-        assert claimed is not None and claimed.current_run_id is not None
-        run_id = claimed.current_run_id
+    monkeypatch.setattr(goals, "judge_goal", _failing_judge)
+    turns = []
 
-    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
-    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run_id))
-    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
-    monkeypatch.setattr(
-        goals,
-        "judge_goal",
-        lambda *_args, **_kwargs: ("continue", "one more step", False, None, False),
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: turns.append(p) or "x",
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: pytest.fail("should not block"),
+        first_response="first attempt",
     )
-    calls = 0
+    assert res["outcome"] == "stopped"
+    assert "judge transport failure" in res["reason"]
+    assert turns == []
 
-    def run_conversation(**_kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 2:
-            with kbc.connect() as conn:
-                assert kb.complete_task(
-                    conn,
-                    task_id,
-                    summary="completed on the continuation",
-                    expected_run_id=run_id,
-                )
-        return {"failed": False, "final_response": f"turn {calls}"}
 
-    agent = SimpleNamespace(
-        run_conversation=run_conversation,
-        session_id="goal-session",
-        provider="test",
+def test_loop_stops_on_worker_failed_flag(monkeypatch):
+    """Regression #91264: worker returning {'failed': True} stops the loop
+    immediately with the failure reason."""
+    _patch_judge(monkeypatch, ["continue", "continue"])
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: {
+            "response": "crashed mid-execution",
+            "failed": True,
+            "failure_reason": "context_window_exceeded",
+        },
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: pytest.fail("should not block"),
+        first_response="first attempt",
     )
-    worker_cli = SimpleNamespace(
-        agent=agent,
-        session_id="goal-session",
-        conversation_history=[],
+    assert res["outcome"] == "stopped"
+    assert res["reason"] == "worker failed: context_window_exceeded"
+
+
+def test_loop_stops_on_worker_failed_flag_default_reason(monkeypatch):
+    """Regression #91264: worker returning {'failed': True} without failure_reason
+    uses 'unknown' as fallback."""
+    _patch_judge(monkeypatch, ["continue", "continue"])
+
+    res = goals.run_kanban_goal_loop(
+        task_id="t1",
+        goal_text="do the thing",
+        run_turn=lambda p: {
+            "response": "crashed without reason",
+            "failed": True,
+        },
+        task_status_fn=lambda: "running",
+        block_fn=lambda r: pytest.fail("should not block"),
+        first_response="first attempt",
     )
+    assert res["outcome"] == "stopped"
+    assert res["reason"] == "worker failed: unknown"
 
-    with pytest.raises(SystemExit) as exc:
-        cli_module._run_quiet_single_query(worker_cli, "work the goal")
-
-    assert exc.value.code == 0
-    assert calls == 2
-    with kbc.connect() as conn:
-        task = kb.get_task(conn, task_id)
-        run = conn.execute(
-            "SELECT outcome FROM task_runs WHERE id = ?",
-            (run_id,),
-        ).fetchone()
-    assert task is not None and task.status == "done"
-    assert run is not None and run["outcome"] == "completed"
 
 
 
@@ -229,6 +218,7 @@ class TestCLIJudgeGate:
         from hermes_cli.kanban import _cmd_complete
 
         fake_task = types.SimpleNamespace(
+            id="t_goal",
             goal_mode=goal_mode,
             title="Finish report",
             body="acceptance: criteria",
@@ -283,20 +273,16 @@ class TestCLIJudgeGate:
         assert rc == 0
         assert complete_calls == ["t1"]
 
-    def test_judge_blocked_verdict_rejects_completion(self, monkeypatch, capsys):
+    def test_judge_blocked_verdict_rejects_completion(self, monkeypatch):
         """#100954: an unachievable goal must not complete silently.
 
         The judge's ``blocked`` verdict is a refusal, not a completion —
-        ``complete_task`` must never run and stderr must steer the user
-        toward re-scoping / recording the block.
+        ``complete_task`` must never run.
         """
         rc, complete_calls = self._run(
             monkeypatch,
             verdict="blocked",
             reason="the target repository does not exist",
         )
-        err = capsys.readouterr().err
         assert rc != 0, "blocked verdict must reject the completion"
         assert complete_calls == [], "an unachievable goal must never reach complete_task"
-        assert "unachievable" in err.lower()
-        assert "kanban block" in err.lower()

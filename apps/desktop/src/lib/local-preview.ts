@@ -1,6 +1,7 @@
 import DOMPurify from 'dompurify'
 
 import { isDesktopFsRemoteMode, readDesktopFileDataUrl, readDesktopFileText } from '@/lib/desktop-fs'
+import { isWindowsAbsolutePath } from '@/lib/path-compare'
 import type { PreviewTarget } from '@/store/preview'
 
 const HTML_EXTENSIONS = new Set(['.htm', '.html'])
@@ -56,15 +57,35 @@ function extension(value: string) {
   return idx >= 0 ? clean.slice(idx).toLowerCase() : ''
 }
 
+// Collapses `.`/`..` so a note's `../other.md` lands on the sibling, not on a
+// path the fs bridge rejects. Never climbs above the root of `base`.
 function joinPath(base: string, rel: string) {
   if (!base) {
     return rel
   }
 
-  return `${base.replace(/\/+$/, '')}/${rel.replace(/^\.?\//, '')}`
+  const normalizedBase = base.replace(/\\/g, '/')
+  const root = normalizedBase.match(/^(?:\/\/|(?:[A-Za-z]:)?\/)/)?.[0] ?? ''
+  const parts = normalizedBase.slice(root.length).split('/').filter(Boolean)
+
+  for (const part of rel.replace(/\\/g, '/').split('/')) {
+    if (!part || part === '.') {
+      continue
+    }
+
+    if (part === '..') {
+      parts.pop()
+
+      continue
+    }
+
+    parts.push(part)
+  }
+
+  return `${root}${parts.join('/')}`
 }
 
-export function pathToFileUrl(path: string) {
+function pathToFileUrl(path: string) {
   const isWindowsUnc = path.startsWith('\\\\')
   const normalized = isWindowsUnc || /^[a-z]:[\\/]/i.test(path) ? path.replace(/\\/g, '/') : path
 
@@ -80,101 +101,28 @@ export function pathToFileUrl(path: string) {
   return `file://${encoded.startsWith('/') ? encoded : `/${encoded}`}`
 }
 
-/**
- * The single resolver for a chat-link href naming a file: plain `/abs`,
- * `~/…`, or `file://…` (percent-encoded). Every file verb — Open with
- * default app, Reveal, Copy path — must derive its path through this, not
- * a per-call-site strip/encode, or the shapes drift out of sync (#103951
- * follow-up: `~` reaching the URL host, `file://` paths staying encoded).
- *
- * `~` is expanded HERE, renderer-side, before any `file:` URL is built —
- * it must never reach the host position of a `file:` URL (`new
- * URL('file://~/x').host === '~'`, which `fileURLToPath` rejects on every
- * OS). Expansion needs a home directory; the renderer has no `os.homedir()`
- * so the caller supplies one (`window.hermesDesktop`'s reported home, when
- * available) — with no home known, `~/…` is left as a literal leading
- * segment rather than silently mis-resolving into `process.cwd()`-relative.
- *
- * `~` expansion is further gated on the path actually naming THIS machine's
- * filesystem (`isLocalHost`, defaulted from `!isDesktopFsRemoteMode()`). On
- * a remote gateway the reported home dir is always the LOCAL Electron
- * host's (`app.getPath('home')`), never the remote backend's — expanding
- * there would put a real-looking but wrong-machine path on the clipboard.
- * Remote mode already hides every other file verb (`canUseNativeFileActions`),
- * so Copy path is the only one reachable here, and it must stay portable:
- * copy the literal `~/…` back.
- *
- * A `file://` href whose host is non-empty and not `localhost` is likewise
- * untrustworthy: `new URL(raw).pathname` silently drops the host, so
- * `file://~/todo.md` would resolve to `/todo.md` — a real-looking but
- * entirely different file. A host of exactly `~` is the one shape chat
- * links can produce (from a `~/…` href re-wrapped as `file://`) and is
- * routed back through the tilde branch; any other host returns the raw
- * href untouched rather than fabricate a truncated path.
- */
-export interface ChatLinkPath {
-  /** The raw on-disk path — what Reveal and Copy path act on. */
-  path: string
-  /** The `file:` URL built from `path` — what Open-with-default-app hands
-   *  the OS (via `openExternal`). */
-  url: string
-}
+/** Loopback hosts — "this machine". The one address family an agent's dev
+ *  server lives on, and the one whose meaning changes with WHICH machine loads
+ *  it (a remote gateway's `localhost` is not ours). */
+const LOOPBACK_HOST_RE = /^(localhost|127(?:\.\d{1,3}){3}|0\.0\.0\.0|::1)$/
 
-export function resolveChatLinkPath(
-  href: string,
-  homeDir?: null | string,
-  isLocalHost: boolean = !isDesktopFsRemoteMode()
-): ChatLinkPath {
-  const raw = href.trim()
+export function isLoopbackPreviewUrl(value: string): boolean {
+  try {
+    const url = new URL(value)
 
-  if (/^file:\/\//i.test(raw)) {
-    let parsed: URL | null
-
-    try {
-      parsed = new URL(raw)
-    } catch {
-      parsed = null
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') {
+      return false
     }
 
-    const host = parsed?.host ?? ''
-
-    if (host && host !== 'localhost') {
-      if (host === '~') {
-        let tildePath = '/'
-
-        try {
-          tildePath = decodeURIComponent(parsed!.pathname)
-        } catch {
-          tildePath = parsed!.pathname
-        }
-
-        return resolveChatLinkPath(`~${tildePath}`, homeDir, isLocalHost)
-      }
-
-      // Any other non-empty host cannot be trusted: `.pathname` would
-      // silently drop it and hand every verb a truncated, WRONG path.
-      // Fail closed — return the href untouched rather than fabricate one.
-      return { path: raw, url: raw }
-    }
-
-    let decoded: string
-
-    try {
-      decoded = decodeURIComponent((parsed ?? new URL(raw)).pathname)
-    } catch {
-      decoded = raw.replace(/^file:\/\//i, '')
-    }
-
-    return { path: decoded, url: pathToFileUrl(decoded) }
+    return LOOPBACK_HOST_RE.test(
+      url.hostname
+        .toLowerCase()
+        .replace(/^\[|\]$/g, '')
+        .replace(/\.$/, '')
+    )
+  } catch {
+    return false
   }
-
-  if (raw === '~' || raw.startsWith('~/')) {
-    const expanded = isLocalHost && homeDir ? `${homeDir.replace(/\/+$/, '')}${raw.slice(1)}` : raw
-
-    return { path: expanded, url: pathToFileUrl(expanded) }
-  }
-
-  return { path: raw, url: pathToFileUrl(raw) }
 }
 
 export function validatedRemoteHtmlDataUrl(value: string): string | null {
@@ -294,7 +242,7 @@ export function localPreviewTarget(rawTarget: string, cwd?: string | null): Prev
     } catch {
       path = raw.replace(/^file:\/\//i, '')
     }
-  } else if (!raw.startsWith('/') && cwd) {
+  } else if (!raw.startsWith('/') && !isWindowsAbsolutePath(raw) && cwd) {
     path = joinPath(cwd, raw)
   }
 
@@ -362,7 +310,27 @@ export async function normalizeOrLocalPreviewTarget(
     const normalized = await window.hermesDesktop?.normalizePreviewTarget?.(rawTarget, cwd || undefined)
 
     if (normalized) {
+      // Directories and dead links arrive as typed non-previewable results
+      // (#101683). Locally they must not fall through to the renderer's blind
+      // classification below, which would fabricate a text tab for a path
+      // that cannot be previewed. A remote backend's paths are not on this
+      // machine, so remote mode keeps the fabricated fallback the gateway
+      // read resolves later.
+      if (normalized.previewKind === 'directory' || normalized.previewKind === 'missing') {
+        return isDesktopFsRemoteMode() ? enrichPreviewTarget(localPreviewTarget(rawTarget, cwd)) : null
+      }
+
       return enrichPreviewTarget(normalized)
+    }
+
+    // The main process resolved the target against the real filesystem and
+    // found nothing openable (`null`); an absent bridge yields `undefined` from
+    // the optional call above instead. In local mode the main process's answer
+    // is authoritative — the fallback below can only fabricate a broken
+    // preview tab (#101683). Remote-backend paths, and a dev server without
+    // the bridge, keep it.
+    if (!isDesktopFsRemoteMode() && normalized === null) {
+      return null
     }
   } catch {
     // Running Electron may still have the old HTML-only preview IPC. Fall

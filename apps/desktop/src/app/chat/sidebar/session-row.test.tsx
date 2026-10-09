@@ -1,19 +1,23 @@
+import { KeyboardSensor, PointerSensor, useSensor, useSensors } from '@dnd-kit/core'
+import { sortableKeyboardCoordinates } from '@dnd-kit/sortable'
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { atom } from 'nanostores'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
+import { registry } from '@/contrib/registry'
 import type { SessionInfo } from '@/hermes'
 import { createClientSessionState } from '@/lib/chat-runtime'
 import type * as ChatRuntime from '@/lib/chat-runtime'
+import { SESSION_ROW_AREAS, type SessionRowSlotProps } from '@/lib/session-row-slots'
 import type * as Time from '@/lib/time'
 import type * as ComposerStatusStore from '@/store/composer-status'
-import { setSidebarWidth, SIDEBAR_DEFAULT_WIDTH, SIDEBAR_MAX_WIDTH } from '@/store/layout'
 import type * as SessionStore from '@/store/session'
 import { clearAllSessionStates, publishSessionState } from '@/store/session-states'
 import type * as SessionStatesStore from '@/store/session-states'
 import type * as WindowsStore from '@/store/windows'
 
+import { ReorderableList, useSortableBindings } from './reorderable-list'
 import { SidebarSessionRow } from './session-row'
 
 afterEach(cleanup)
@@ -30,20 +34,12 @@ vi.mock('@/i18n', () => ({
         row: {
           ageMin: 'm',
           ageNow: 'now',
-          archiveSession: 'Archive session',
           backgroundRunning: 'Running in background',
           finishedUnread: 'Finished',
           handoffOrigin: (platform: string) => `Started on ${platform}`,
+          continuationOrigin: 'Automatic continuation — this conversation was compressed and continued',
           messageCount: (count: number) => `${count} messages`,
           needsInput: 'Needs input',
-          rateLimited: {
-            unknown: 'Rate limited',
-            withTime: (time: string) => `Rate limited until ${time}`
-          },
-          providerConfigured: (family: string) => `Configured model: ${family}`,
-          providerConfiguredVia: (configuredFamily: string, servedFamily: string) =>
-            `Configured model: ${configuredFamily}, currently served via ${servedFamily}`,
-          providerVia: (family: string) => `via ${family}`,
           sessionActions: 'Session actions',
           sessionRunning: 'Running',
           todoProgress: 'Tasks completed',
@@ -70,9 +66,7 @@ vi.mock('@/app/chat/session-drag', () => ({ startSessionDrag: vi.fn() }))
 // regression in its ref/prop forwarding fails here again.
 // Only `sessionTitle` is overridden (makeSession fakes a bare `title` the real
 // one wouldn't read); the rest of the module is genuine so the arc test can
-// build session state with the same factory the app uses. It is a spy because
-// the row calls it exactly once per render, which is how the isolation test
-// below counts repaints.
+// build session state with the same factory the app uses.
 const sessionTitle = vi.fn((s: SessionInfo) => (s as unknown as { title: string }).title)
 
 vi.mock('@/lib/chat-runtime', async importOriginal => {
@@ -132,14 +126,25 @@ vi.mock('@/store/windows', async importOriginal => {
 
 // SessionActionsMenu open behavior is covered in session-actions-menu.test.tsx
 // against the real component. Stub it here so this file stays focused on the
-// row chrome (handoff avatar tip, etc.).
+// row chrome (handoff avatar tip, etc.) — but record the props so the row's
+// own state plumbing (e.g. the archived flag, #98813) is still asserted.
+const menuProps = vi.hoisted(() => vi.fn())
+
 vi.mock('./session-actions-menu', () => ({
-  SessionActionsMenu: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-  SessionContextMenu: ({ children }: { children: React.ReactNode }) => <>{children}</>
+  SessionActionsMenu: (props: { children?: React.ReactNode }) => {
+    menuProps(props)
+
+    return <>{props.children}</>
+  },
+  SessionContextMenu: (props: { children?: React.ReactNode }) => {
+    menuProps(props)
+
+    return <>{props.children}</>
+  }
 }))
 
 vi.mock('./use-profile-prewarm', () => ({
-  useProfilePrewarm: () => ({ cancelPrewarm: vi.fn(), startPrewarm: vi.fn() })
+  useProfilePrewarm: () => ({ cancelPrewarm: vi.fn(), notePointerMove: vi.fn(), startPrewarm: vi.fn() })
 }))
 
 function makeSession(overrides: Partial<SessionInfo> & { title: string }): SessionInfo {
@@ -153,16 +158,6 @@ function makeSession(overrides: Partial<SessionInfo> & { title: string }): Sessi
     ...overrides
   } as unknown as SessionInfo
 }
-
-const tipTrigger = (el: HTMLElement) => el.closest('[data-slot="tooltip-trigger"]')
-
-// The status dot always paints an aria-hidden placeholder so every row's title
-// keeps the same left edge, so "the row's aria-hidden span" no longer names the
-// avatar on its own. `inline-grid` is PlatformAvatar's own layout class in both
-// of its branches — brand glyph and first-letter fallback — and the row passes
-// it no display class that tailwind-merge could drop it for.
-const handoffAvatar = (container: HTMLElement) =>
-  container.querySelector<HTMLElement>('span[aria-hidden="true"].inline-grid')
 
 const noop = vi.fn()
 
@@ -191,7 +186,7 @@ describe('SidebarSessionRow running arc', () => {
     clearAllSessionStates()
   })
 
-  const arc = (container: HTMLElement) => container.querySelector('.working-bar')
+  const arc = (container: HTMLElement) => container.querySelector('.arc-row')
 
   it('paints no arc for a settled session', () => {
     const { container } = renderRow(makeSession({ title: 'Settled' }))
@@ -206,148 +201,11 @@ describe('SidebarSessionRow running arc', () => {
 
     expect(arc(container)).toBeTruthy()
   })
-
-  // The row owns its status subscription so a turn starting repaints that row
-  // and nothing else — not its siblings, and not the list around them. Rows
-  // render once per fiber, so counting `sessionTitle` counts repaints.
-  it('repaints only the session whose turn started', () => {
-    render(
-      <>
-        {[makeSession({ id: 's1', title: 'One' }), makeSession({ id: 's2', title: 'Two' })].map(session => (
-          <SidebarSessionRow
-            isPinned={false}
-            isSelected={false}
-            key={session.id}
-            onArchive={noop}
-            onDelete={noop}
-            onPin={noop}
-            onResume={noop}
-            onToggleUnread={noop}
-            session={session}
-            unread={false}
-          />
-        ))}
-      </>
-    )
-    sessionTitle.mockClear()
-
-    act(() => {
-      publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
-    })
-
-    expect(sessionTitle).toHaveBeenCalledTimes(1)
-    expect(sessionTitle).toHaveBeenCalledWith(expect.objectContaining({ id: 's1' }))
-  })
-})
-
-// Attention ring (A3): the breathing amber border for a session blocked on the
-// user, and its steady orange rate-limited variant. Drives the mocked
-// $attentionSessionIds atom / the real rate-limited store the way the app does,
-// so this covers the row wiring, not just the CSS class existing.
-describe('SidebarSessionRow attention ring', () => {
-  afterEach(() => {
-    void import('@/store/session-states').then(({ $attentionSessionIds }) =>
-      ($attentionSessionIds as ReturnType<typeof atom<string[]>>).set([])
-    )
-    void import('@/store/session-dot-state').then(({ clearSessionRateLimited }) => clearSessionRateLimited('s1'))
-    clearAllSessionStates()
-  })
-
-  const ring = (container: HTMLElement) => container.querySelector('.attention-ring')
-
-  it('paints no ring for a settled session', () => {
-    const { container } = renderRow(makeSession({ title: 'Settled' }))
-
-    expect(ring(container)).toBeNull()
-  })
-
-  it('paints the breathing ring while the session needs input', async () => {
-    const { $attentionSessionIds } = await import('@/store/session-states')
-
-    act(() => {
-      ;($attentionSessionIds as ReturnType<typeof atom<string[]>>).set(['s1'])
-    })
-
-    const { container } = renderRow(makeSession({ title: 'Waiting' }))
-    const el = ring(container)
-
-    expect(el).toBeTruthy()
-    expect(el?.hasAttribute('data-rate-limited')).toBe(false)
-  })
-
-  it('paints the steady variant for a rate-limited session', async () => {
-    const { markSessionRateLimited } = await import('@/store/session-dot-state')
-
-    act(() => {
-      markSessionRateLimited('s1')
-    })
-
-    const { container } = renderRow(makeSession({ title: 'Limited' }))
-
-    expect(ring(container)?.hasAttribute('data-rate-limited')).toBe(true)
-  })
-
-  it('never paints the ring and the working bar together', async () => {
-    const { $attentionSessionIds } = await import('@/store/session-states')
-
-    // Busy AND blocked: needs-input outranks working in the dot-state
-    // priority, so the row shows the ring, not the bar.
-    publishSessionState('rt1', { ...createClientSessionState('s1'), busy: true })
-    act(() => {
-      ;($attentionSessionIds as ReturnType<typeof atom<string[]>>).set(['s1'])
-    })
-
-    const { container } = renderRow(makeSession({ title: 'Blocked' }))
-
-    expect(ring(container)).toBeTruthy()
-    expect(container.querySelector('.working-bar')).toBeNull()
-  })
 })
 
 describe('SidebarSessionRow', () => {
   afterEach(() => {
     vi.useRealTimers()
-  })
-
-  it('keeps an aria-label on the kebab without wrapping it in a Tip', () => {
-    render(
-      <SidebarSessionRow
-        isPinned={false}
-        isSelected={false}
-        onArchive={noop}
-        onDelete={noop}
-        onPin={noop}
-        onResume={noop}
-        onToggleUnread={noop}
-        session={makeSession({ title: 'Hermes doctor health check results' })}
-        unread={false}
-      />
-    )
-
-    const kebab = screen.getByRole('button', { name: 'Session actions' })
-    expect(tipTrigger(kebab)).toBeNull()
-  })
-
-  // The dedicated one-click row archive/unarchive icon button (#7b52ebc2) is
-  // removed by this card: only the kebab (Session actions) and context menus
-  // may offer Archive/Unarchive, never a second always-visible affordance.
-  it('renders no dedicated archive button — only the kebab menu trigger', () => {
-    render(
-      <SidebarSessionRow
-        isPinned={false}
-        isSelected={false}
-        onArchive={noop}
-        onDelete={noop}
-        onPin={noop}
-        onResume={noop}
-        onToggleUnread={noop}
-        session={makeSession({ title: 'Archivable session' })}
-        unread={false}
-      />
-    )
-
-    expect(screen.queryByRole('button', { name: 'Archive session' })).toBeNull()
-    expect(screen.getByRole('button', { name: 'Session actions' })).toBeTruthy()
   })
 
   // Full-title tooltip on hover (#83000-class ask): the label is a tooltip
@@ -366,12 +224,6 @@ describe('SidebarSessionRow', () => {
       Object.defineProperty(el, 'scrollWidth', { configurable: true, value: scrollWidth })
       Object.defineProperty(el, 'clientWidth', { configurable: true, value: clientWidth })
     }
-
-    it('wraps the title in a tooltip trigger', () => {
-      renderRow(makeSession({ title }))
-
-      expect(label()).toBeTruthy()
-    })
 
     it('opens with the full title after a settled hover when the title overflows', () => {
       vi.useFakeTimers()
@@ -421,213 +273,191 @@ describe('SidebarSessionRow', () => {
     })
   })
 
-  it('exposes the exact session time through a focusable Tip trigger', () => {
-    // Pin the clock before deriving the timestamp.  The assertion below is
-    // about the *composition* of the label (relative age + absolute time),
-    // but "5 minutes ago" only falls on today when the run does not straddle
-    // local midnight.  Between 00:00 and 00:05 the row correctly renders
-    // "Yesterday at 11:5x PM" and this test failed for a day boundary it was
-    // never written to exercise.  Only `Date` is faked, so the component's
-    // own timers (the running arc, the tooltip open delay) keep running for
-    // real.
-    vi.useFakeTimers({ toFake: ['Date'] })
-    vi.setSystemTime(new Date(2026, 2, 5, 12, 0, 0))
+  // The Archived view reuses the row menu, and the menu needs the row's
+  // archived state to label its shared verb Unarchive (#98813).
+  it('forwards the archived state to the row menu', () => {
+    menuProps.mockClear()
+    renderRow(makeSession({ archived: true, title: 'Archived row' }))
 
-    const startedAt = Math.floor(Date.now() / 1000) - 5 * 60
-
-    render(
-      <SidebarSessionRow
-        isPinned={false}
-        isSelected={false}
-        onArchive={noop}
-        onDelete={noop}
-        onPin={noop}
-        onResume={noop}
-        onToggleUnread={noop}
-        session={makeSession({ started_at: startedAt, title: 'Timestamped session' })}
-        unread={false}
-      />
-    )
-
-    const age = screen.getByText('5m')
-    expect(age.tagName).toBe('TIME')
-    expect(age.getAttribute('datetime')).toBe(new Date(startedAt * 1000).toISOString())
-    expect(age.getAttribute('aria-label')).toMatch(/^5m, Today at /)
-    expect(age.getAttribute('tabindex')).toBe('0')
-    expect(age.getAttribute('title')).toBeNull()
-    expect(tipTrigger(age)).toBeTruthy()
+    expect(menuProps).toHaveBeenCalledWith(expect.objectContaining({ archived: true }))
   })
 
-  it('does not render a handoff avatar for a locally-started session', () => {
-    const { container } = render(
-      <SidebarSessionRow
-        isPinned={false}
-        isSelected={false}
-        onArchive={noop}
-        onDelete={noop}
-        onPin={noop}
-        onResume={noop}
-        onToggleUnread={noop}
-        session={makeSession({ title: 'Local session' })}
-        unread={false}
-      />
-    )
+  it('forwards the non-archived state to the row menu', () => {
+    menuProps.mockClear()
+    renderRow(makeSession({ title: 'Live row' }))
 
-    expect(handoffAvatar(container)).toBeNull()
-  })
-
-  it('wraps the handoff platform avatar in a Tip for a session started on another platform', () => {
-    const { container } = render(
-      <SidebarSessionRow
-        isPinned={false}
-        isSelected={false}
-        onArchive={noop}
-        onDelete={noop}
-        onPin={noop}
-        onResume={noop}
-        onToggleUnread={noop}
-        session={makeSession({
-          handoff_platform: 'telegram',
-          handoff_state: 'active',
-          title: 'Continued from Telegram'
-        })}
-        unread={false}
-      />
-    )
-
-    // PlatformAvatar is the REAL component here (see the note above the vi.mock
-    // block, #67500 third pass) — it renders the Telegram brand SVG rather
-    // than the platform name as text, so query the avatar span itself rather
-    // than text content, and confirm its tooltip trigger actually attaches to
-    // it — proving the real forwardRef/...rest path works, not a mock that
-    // fakes it.
-    const avatar = handoffAvatar(container)
-    expect(avatar).toBeTruthy()
-    expect(tipTrigger(avatar as HTMLElement)).toBeTruthy()
+    expect(menuProps).toHaveBeenCalledWith(expect.objectContaining({ archived: false }))
   })
 })
 
-describe('Inbox-style session card', () => {
-  it('gives truncated card lines room for glyph ink instead of clipping them', () => {
-    renderRow(
-      makeSession({
-        cwd: '/Users/tomek/pursuit-support-agent',
-        message_count: 133,
-        model: 'gpt-4.1',
-        title: 'Ruff lint and pytest verification'
-      }),
-      { card: true }
+// Regression for #83617: the row shell once spread the FULL dnd-kit handle, so
+// Space on a focused control inside the row (the ⋯ button that opens Rename)
+// reached the KeyboardSensor's activator — a drag armed, and the sensor then
+// ate the next Space at window level (the rename input dropped the keystroke).
+describe('SidebarSessionRow inside the sortable list', () => {
+  function SortableRow({ onResume, session }: { onResume: () => void; session: SessionInfo }) {
+    const { dragHandleProps, dragging, ref, reorderable, style } = useSortableBindings(session.id)
+
+    return (
+      <SidebarSessionRow
+        dragging={dragging}
+        dragHandleProps={dragHandleProps}
+        isPinned={false}
+        isSelected={false}
+        onArchive={noop}
+        onDelete={noop}
+        onPin={noop}
+        onResume={onResume}
+        onToggleUnread={noop}
+        ref={ref}
+        reorderable={reorderable}
+        session={session}
+        style={style}
+        unread={false}
+      />
+    )
+  }
+
+  function Host({ onResume, session }: { onResume: () => void; session: SessionInfo }) {
+    // The sidebar's own sensor set (index.tsx dndSensors).
+    const sensors = useSensors(
+      useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+      useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
     )
 
-    const workspace = screen.getByText('pursuit-support-agent')
-    const title = screen.getByText('Ruff lint and pytest verification').parentElement
-    const footer = screen.getByText('GPT-4.1').parentElement
+    return (
+      <ReorderableList ids={[session.id]} onReorder={noop} sensors={sensors}>
+        <SortableRow onResume={onResume} session={session} />
+      </ReorderableList>
+    )
+  }
 
-    expect(title).toBeTruthy()
-    expect(footer).toBeTruthy()
+  const space = { code: 'Space', key: ' ' }
 
-    for (const el of [workspace, title!, footer!]) {
-      expect(el.className).not.toMatch(/\bleading-none\b/)
-      expect(el.className).toMatch(/leading-\[1\.35\]/)
-    }
+  it('lets Space through to a focused row control instead of arming a keyboard drag', () => {
+    const { container } = render(<Host onResume={noop} session={makeSession({ title: 'Renamable' })} />)
+    const kebab = screen.getByRole('button', { name: 'Session actions' })
+    kebab.focus()
 
-    expect(workspace.className).toMatch(/\btruncate\b/)
-    expect(screen.getByText('133 messages')).toBeTruthy()
+    // Not defaultPrevented (the ⋯ menu is stubbed in this file, so only
+    // dnd-kit could have claimed the key) and no grabber reports a drag.
+    expect(fireEvent.keyDown(kebab, space)).toBe(true)
+    expect(container.querySelector('[aria-pressed="true"]')).toBeNull()
+  })
+
+  it('still starts a keyboard reorder from the grabber', () => {
+    const { container } = render(<Host onResume={noop} session={makeSession({ title: 'Renamable' })} />)
+    const grabber = container.querySelector<HTMLElement>('[data-reorder-handle]')!
+
+    grabber.focus()
+    fireEvent.keyDown(grabber, space)
+    expect(grabber.getAttribute('aria-pressed')).toBe('true')
+  })
+
+  // #38072 finding 3 (axe nested-interactive): the grabber (dnd-kit
+  // role="button" + tabIndex) must be a SIBLING of the row's primary action,
+  // never a descendant of it. The row body is a div carrying the gesture
+  // handlers; the title is the row's real button and its click bubbles to
+  // the body's resolver, so pointer users keep click-anywhere-on-the-row.
+  it('renders the grabber outside any button, with the title as the row button', () => {
+    const onResume = vi.fn()
+    const { container } = render(<Host onResume={onResume} session={makeSession({ title: 'Renamable' })} />)
+
+    const grabber = container.querySelector<HTMLElement>('[data-reorder-handle]')!
+
+    // Handle semantics survive (keyboard reorder above depends on them)…
+    expect(grabber.getAttribute('role')).toBe('button')
+    expect(grabber.tabIndex).toBe(0)
+    // …but it no longer nests inside the row's primary button.
+    expect(grabber.closest('button')).toBeNull()
+
+    // The title line is the row button; clicks on it resume via the body
+    // div's bubbled resolver (no onClick of its own).
+    const title = screen.getByRole('button', { name: 'Renamable' })
+    expect(title.closest('[data-reorder-handle]')).toBeNull()
+    fireEvent.click(title)
+    expect(onResume).toHaveBeenCalledTimes(1)
   })
 })
 
-describe('Provider identity (Phase 2.13)', () => {
+// Row-decoration slots: a plugin decorates rows through the registry with the
+// row's stored session id handed to its render — the seam the session-list API
+// pairs with (see #116305 item 3).
+describe('SidebarSessionRow decoration slots', () => {
+  const disposers: Array<() => void> = []
+
   afterEach(() => {
-    setSidebarWidth(SIDEBAR_MAX_WIDTH)
+    disposers.splice(0).forEach(dispose => dispose())
   })
 
-  it('shows only the configured family when the served route matches', () => {
-    renderRow(
-      makeSession({
-        configured_provider: 'anthropic',
-        served_provider: 'anthropic',
-        title: 'Matching route'
-      }),
-      { card: true }
+  const decorate = (area: string, id: string, testId: string) =>
+    disposers.push(
+      registry.register({
+        area,
+        data: {
+          render: ({ sessionId }: SessionRowSlotProps) => <span data-testid={testId}>{sessionId}</span>
+        },
+        id,
+        source: 'disk'
+      })
     )
 
-    expect(screen.getByText('Claude')).toBeTruthy()
-    expect(screen.queryByText(/^via /)).toBeNull()
+  it('mounts leading and trailing decorations, each handed the DURABLE row id', () => {
+    act(() => {
+      decorate(SESSION_ROW_AREAS.leading, 'deco-lead', 'lead-deco')
+      decorate(SESSION_ROW_AREAS.trailing, 'deco-tail', 'tail-deco')
+    })
+
+    // Auto-compression rotates the live id. A plugin that remembered the live
+    // one decorates this row until the next compaction and then silently stops
+    // matching — so the slot hands the lineage root, the id core's own
+    // pin/reorder and `host.sessions.*` address.
+    renderRow(makeSession({ _lineage_root_id: 'root-9', id: 'live-9', title: 'Compressed' }))
+
+    expect(screen.getByTestId('lead-deco').textContent).toBe('root-9')
+    expect(screen.getByTestId('tail-deco').textContent).toBe('root-9')
   })
 
-  it('surfaces a "via <provider>" note only when the served route differs (fallback)', () => {
-    renderRow(
-      makeSession({
-        configured_provider: 'anthropic',
-        served_provider: 'openai-codex',
-        title: 'Fell back mid-conversation'
-      }),
-      { card: true }
-    )
+  it('renders nothing for an area with no registrations and survives an unmount', () => {
+    const { container } = renderRow(makeSession({ id: 'row-7', title: 'Plain' }))
 
-    expect(screen.getByText('Claude')).toBeTruthy()
-    expect(screen.getByText('via Codex')).toBeTruthy()
+    expect(container.querySelector('[data-testid="lead-deco"]')).toBeNull()
+
+    act(() => {
+      decorate(SESSION_ROW_AREAS.leading, 'deco-lead', 'lead-deco')
+    })
+
+    // Same row, contribution arriving late: the slot mounts it in place.
+    expect(screen.getByTestId('lead-deco').textContent).toBe('row-7')
+
+    act(() => {
+      disposers.splice(0).forEach(dispose => dispose())
+    })
+
+    expect(screen.queryByTestId('lead-deco')).toBeNull()
+  })
+})
+
+// #121148: a projected compression continuation renders as a plain
+// top-level row that reads as a brand-new conversation — and the sealed
+// predecessor it replaced used to nest like a branch users deleted as
+// accidents. The row must carry a visible continuation affordance.
+describe('SidebarSessionRow continuation badge', () => {
+  const continuationGlyph = (container: HTMLElement) => container.querySelector('.codicon-layers')
+
+  it('paints the continuation glyph for a projected compression tip', () => {
+    const { container } = renderRow(makeSession({ continuation_kind: 'compression', title: 'Long-running chat' }))
+
+    expect(continuationGlyph(container)).not.toBeNull()
   })
 
-  it('renders no identity chip for a legacy session with no resolvable provider', () => {
-    renderRow(
-      makeSession({
-        configured_provider: null,
-        served_provider: null,
-        title: 'Legacy session'
-      }),
-      { card: true }
-    )
+  it('paints nothing for a plain session and for a branch', () => {
+    const plain = renderRow(makeSession({ title: 'Plain' }))
 
-    expect(screen.queryByText('Claude')).toBeNull()
-    expect(screen.queryByText('Codex')).toBeNull()
-    expect(screen.queryByText(/^via /)).toBeNull()
-  })
+    expect(continuationGlyph(plain.container)).toBeNull()
 
-  it('title-cases an unrecognized provider instead of implying a false Claude/Codex identity', () => {
-    renderRow(
-      makeSession({
-        configured_provider: 'my-custom-endpoint',
-        served_provider: 'my-custom-endpoint',
-        title: 'Custom endpoint session'
-      }),
-      { card: true }
-    )
+    const branch = renderRow(makeSession({ parent_session_id: 'parent', title: 'A real branch' }))
 
-    expect(screen.getByText('My Custom Endpoint')).toBeTruthy()
-  })
-
-  it('exposes the full mismatch text as the accessible name of the identity chip', () => {
-    renderRow(
-      makeSession({
-        configured_provider: 'anthropic',
-        served_provider: 'openai-codex',
-        title: 'Accessible mismatch'
-      }),
-      { card: true }
-    )
-
-    expect(screen.getByLabelText('Configured model: Claude, currently served via Codex')).toBeTruthy()
-  })
-
-  it('collapses the "via" note to a tooltip-only glyph below the narrow-sidebar threshold', () => {
-    setSidebarWidth(SIDEBAR_DEFAULT_WIDTH)
-
-    renderRow(
-      makeSession({
-        configured_provider: 'anthropic',
-        served_provider: 'openai-codex',
-        title: 'Narrow sidebar'
-      }),
-      { card: true }
-    )
-
-    // The full "via Codex" text is gone from the DOM at the narrow width...
-    expect(screen.queryByText('via Codex')).toBeNull()
-    // ...but the mismatch is still discoverable: the tooltip trigger carries
-    // the same text as its label, and the wrapper's accessible name is intact.
-    expect(screen.getByText('•')).toBeTruthy()
-    expect(tipTrigger(screen.getByText('•'))).toBeTruthy()
-    expect(screen.getByLabelText('Configured model: Claude, currently served via Codex')).toBeTruthy()
+    expect(continuationGlyph(branch.container)).toBeNull()
   })
 })

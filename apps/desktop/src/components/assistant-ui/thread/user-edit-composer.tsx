@@ -16,6 +16,7 @@ import {
 import { ComposerDirectiveActions } from '@/app/chat/composer/directive-actions'
 import { COMPOSER_DROP_ACTIVE_CLASS, COMPOSER_DROP_FADE_CLASS } from '@/app/chat/composer/drop-affordance'
 import {
+  ackComposerInsert,
   type ComposerInsertMode,
   focusComposerInput,
   markActiveComposer,
@@ -36,8 +37,10 @@ import {
 } from '@/app/chat/composer/inline-refs'
 import { chipTypedPathOnSpace, pathifyRefs } from '@/app/chat/composer/path-refs'
 import {
+  beginComposerComposition,
   composerPlainText,
   insertComposerContentsAtCaret,
+  markEditorEmptiness,
   placeCaretEnd,
   refChipElement,
   renderComposerContents,
@@ -71,11 +74,13 @@ import { sanitizeComposerInput } from '@/lib/composer-input-sanitize'
 import { DATA_IMAGE_URL_RE } from '@/lib/embedded-images'
 import { triggerHaptic } from '@/lib/haptics'
 import { Loader2Icon } from '@/lib/icons'
+import { isMacPlatform } from '@/lib/platform'
 import { cn } from '@/lib/utils'
 import type { ComposerAttachment } from '@/store/composer'
 import { notifyError } from '@/store/notifications'
 import { $terminalBackend } from '@/store/session'
 import { isSessionRemote } from '@/store/session-states'
+import { useForcedTextDirection } from '@/store/text-direction'
 import { notifyThreadEditClose } from '@/store/thread-scroll'
 
 interface UserEditComposerProps {
@@ -89,6 +94,7 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   const copy = t.assistant.thread
   const aui = useAui()
   const draft = useAuiState(s => s.composer.text)
+  const textDirection = useForcedTextDirection()
   const rootRef = useRef<HTMLDivElement | null>(null)
   const editorRef = useRef<HTMLDivElement | null>(null)
   // Capture the original draft immediately before the first edit. The runtime
@@ -183,11 +189,11 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   }, [])
 
   const appendExternalText = useCallback(
-    (text: string, mode: ComposerInsertMode) => {
+    (text: string, mode: ComposerInsertMode): boolean => {
       const value = text.trim()
 
       if (!value) {
-        return
+        return false
       }
 
       rememberInitialDraft()
@@ -206,6 +212,8 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
       }
 
       setFocusRequestId(id => id + 1)
+
+      return true
     },
     [aui, rememberInitialDraft]
   )
@@ -243,9 +251,11 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
       }
     })
 
-    const offInsert = onComposerInsertRequest(({ mode, target, text }) => {
+    const offInsert = onComposerInsertRequest(({ mode, target, text, token }) => {
       if (target === 'edit') {
-        appendExternalText(text, mode)
+        // Tokened inserts come from the plugin SDK: acknowledge whether the
+        // text landed instead of reporting success unconditionally.
+        ackComposerInsert(token, appendExternalText(text, mode))
       }
     })
 
@@ -257,6 +267,9 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
 
   const syncDraftFromEditor = useCallback(
     (editor: HTMLDivElement) => {
+      // Native edits bypass renderComposerContents, so refresh the placeholder
+      // marker here as well, just like the main composer.
+      markEditorEmptiness(editor)
       const nextDraft = sanitizeComposerInput(composerPlainText(editor))
 
       if (nextDraft !== draftRef.current) {
@@ -440,13 +453,6 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
   // composer uses, then insert the *gateway-side* ref the agent can resolve —
   // never the raw local path (the MahmoudR remote-attach bug, which the main
   // composer fixes but this edit composer used to reproduce).
-  //
-  // The web build never has a local path at all (browsers don't expose one —
-  // see web-bridge-shim.ts's getPathForFile), so a path-only candidate here
-  // used to be silently dropped. Stage the raw File bytes through the bridge
-  // first (saveImageBuffer/saveFileBuffer — both web-shim-only; Electron
-  // always has a real path and skips straight to uploadComposerAttachment)
-  // to get a gateway-visible path before staging the attachment itself.
   const uploadOsDropRefs = useCallback(
     async (osDrops: ReturnType<typeof extractDroppedFiles>): Promise<InlineRefInput[]> => {
       if (!gateway || !sessionId) {
@@ -462,44 +468,18 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
       const refs: InlineRefInput[] = []
 
       for (const candidate of osDrops) {
-        let path = candidate.path || ''
-        const isImage = candidate.file?.type.startsWith('image/') || isImagePath(candidate.file?.name || path)
-
-        if (!path && candidate.file) {
-          try {
-            path = isImage
-              ? await window.hermesDesktop?.saveImageBuffer(
-                  new Uint8Array(await candidate.file.arrayBuffer()),
-                  `.${candidate.file.name.split('.').pop() || 'png'}`
-                )
-              : ((await window.hermesDesktop?.saveFileBuffer?.(
-                  new Uint8Array(await candidate.file.arrayBuffer()),
-                  candidate.file.name
-                )) ?? '')
-          } catch (err) {
-            notifyError(err, t.desktop.dropFiles)
-
-            continue
-          }
-        }
+        const path = candidate.path || ''
 
         if (!path) {
           continue
         }
 
-        const kind: ComposerAttachment['kind'] = isImage ? 'image' : 'file'
-        // Web build: a staged (bytes-uploaded) path's own basename is an
-        // internal timestamp/hash name assigned by the backend (see
-        // upload_chat_file/upload_chat_image), not the name the user
-        // dropped. web-bridge-shim remembers the original name for
-        // non-image files staged via saveFileBuffer; fall back to the
-        // path's basename when unavailable (Electron, or an in-place path
-        // that needed no staging).
-        const stagedName = !isImage ? window.hermesDesktop?.getStagedDisplayName?.(path) : undefined
+        const kind: ComposerAttachment['kind'] =
+          candidate.file?.type.startsWith('image/') || isImagePath(candidate.file?.name || path) ? 'image' : 'file'
 
         try {
           const uploaded = await uploadComposerAttachment(
-            { detail: path, id: attachmentId(kind, path), kind, label: stagedName || pathLabel(path), path },
+            { detail: path, id: attachmentId(kind, path), kind, label: pathLabel(path), path },
             { backendCwd: cwd, remote, requestGateway, sessionId, terminalBackend: $terminalBackend.get() }
           )
 
@@ -556,6 +536,11 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
 
   const handleDrop = (event: ReactDragEvent<HTMLElement>) => {
     if (!dragHasAttachments(event.dataTransfer, HERMES_PATHS_MIME)) {
+      // A plain text drag within the editor mutates the DOM without a
+      // React-visible beforeinput (insertFromDrop), so the undo snapshot has
+      // to be banked here — before Chromium applies the move.
+      recordUndoPoint()
+
       return
     }
 
@@ -571,8 +556,14 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
 
     // In-app drags (project tree / gutter) are workspace-relative paths that
     // resolve on the gateway as-is, so they stay inline refs. OS drops need to
-    // be staged + uploaded first, then their gateway-side ref is inserted.
-    const { inAppRefs, osDrops } = partitionDroppedFiles(candidates)
+    // be staged + uploaded first, then their gateway-side ref is inserted —
+    // unless the backend resolves this machine's paths as-is, in which case
+    // the drop keeps its original-path inline ref too (#52427).
+    const { inAppRefs, osDrops } = partitionDroppedFiles(candidates, {
+      backendCwd: cwd,
+      remote: isSessionRemote(sessionId),
+      terminalBackend: $terminalBackend.get()
+    })
 
     if (insertDroppedRefs(inAppRefs)) {
       triggerHaptic('selection')
@@ -624,6 +615,15 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
     }
 
     recordUndoPoint({ coalesce: inputType === 'insertText' || inputType === 'deleteContentBackward' })
+  }
+
+  // Cut never reaches the handler above: React's onBeforeInput is a
+  // keypress/textInput polyfill and does not observe the native
+  // `beforeinput` event, so Chromium's deleteByCut input type is invisible to
+  // it. The native `cut` clipboard event still fires before the DOM mutation,
+  // which is where the pre-edit snapshot has to be banked or ⌘Z skips the cut.
+  const handleCut = () => {
+    recordUndoPoint()
   }
 
   const handlePaste = (event: ClipboardEvent<HTMLDivElement>) => {
@@ -872,7 +872,8 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
             <div
               aria-label={copy.editMessage}
               autoCapitalize="off"
-              autoCorrect="off"
+              // Match the main composer: allow macOS replacements, not spellcheck.
+              autoCorrect={isMacPlatform() ? 'on' : 'off'}
               className={cn(
                 'ui-prompt-input-editor__input max-h-48 w-full resize-none overflow-y-auto bg-transparent p-0 pr-7 text-[length:var(--conversation-text-font-size)] text-foreground/95 outline-none',
                 '**:data-ref-text:cursor-default',
@@ -881,15 +882,18 @@ export const UserEditComposer: FC<UserEditComposerProps> = ({ cwd, gateway, sess
               contentEditable
               data-placeholder={copy.editMessage}
               data-slot={RICH_INPUT_SLOT}
+              dir={textDirection}
               onBeforeInput={handleBeforeInput}
               onBlur={() => scheduleTimeout(closeTrigger, 80)}
               onCompositionEnd={event => {
                 composingRef.current = false
                 flushEditorToDraft(event.currentTarget)
               }}
-              onCompositionStart={() => {
+              onCompositionStart={event => {
                 composingRef.current = true
+                beginComposerComposition(event.currentTarget)
               }}
+              onCut={handleCut}
               onDragOver={handleDragOver}
               onDrop={handleDrop}
               onFocus={() => markActiveComposer('edit')}

@@ -4,7 +4,6 @@ import type { ChatView } from '../chat'
 import type { ChatSidebar } from '../chat/sidebar'
 import type { CommandCenterSection } from '../command-center'
 import type { useGatewayRequest } from '../gateway/hooks/use-gateway-request'
-import type { useModelControls } from '../session/hooks/use-model-controls'
 import type { ModelMenuPanel } from '../shell/model-menu-panel'
 
 export type GatewayRequester = ReturnType<typeof useGatewayRequest>['requestGateway']
@@ -17,13 +16,13 @@ export type SidebarActions = Pick<
   | 'onDeleteSession'
   | 'onLoadMoreMessaging'
   | 'onLoadMoreSessions'
+  | 'onRetrySessions'
   | 'onManageCronJob'
   | 'onNavigate'
   | 'onNewSessionInWorkspace'
   | 'onNewSessionSplit'
   | 'onResumeSession'
   | 'onTriggerCronJob'
-  | 'onUnarchiveSession'
 >
 
 /** The ChatView handlers the controller owns — forwarded verbatim. */
@@ -33,7 +32,7 @@ export type ChatActions = Pick<
   | 'onAddUrl'
   | 'onAttachDroppedItems'
   | 'onAttachImageBlob'
-  | 'onAttachPrCommentUrl'
+  | 'onAttachPastedText'
   | 'onBranchInNewChat'
   | 'onCancel'
   | 'onDeleteSelectedSession'
@@ -48,6 +47,7 @@ export type ChatActions = Pick<
   | 'onRestoreToMessage'
   | 'onRetryResume'
   | 'onSteer'
+  | 'onSteerHidden'
   | 'onSubmit'
   | 'onThreadMessagesChange'
   | 'onToggleSelectedPin'
@@ -61,14 +61,13 @@ export type ChatActions = Pick<
  * the latest closure.
  */
 export interface WiringActions extends SidebarActions, ChatActions {
+  followDefaultModel: () => void
   /** Imperative access to the live gateway for controller-owned callbacks.
    *  Rendered surfaces subscribe to the active `$gateway` atom directly. */
   getGateway: () => ComponentProps<typeof ChatView>['gateway']
   openAgents: () => void
   openCommandCenterSection: (section: CommandCenterSection) => void
   requestGateway: GatewayRequester
-  // >>> FORK ANCHOR: composer-model-recommendation <<<
-  selectRecommendedModel: ReturnType<typeof useModelControls>['selectRecommendedModel']
   selectModel: ComponentProps<typeof ModelMenuPanel>['onSelectModel']
   toggleCommandCenter: () => void
 }

@@ -7,15 +7,24 @@
  * (the app's standard, via the SDK). This module owns the query keys, the REST
  * calls, and the selected-board atom — every call passes `?board=<slug>` so the
  * desktop's selection never flips the server-wide current-board pointer.
+ *
+ * Every query key and the persisted board selection are scoped by the ACTIVE
+ * CONNECTION (`host.state.connectionId`): a board lives on ONE gateway, so a
+ * connection switch must be a clean cache miss (the hermes-bots roster
+ * pattern), and each gateway remembers its own selected board instead of
+ * pinning a slug the next gateway 404s on.
  */
 
 import {
   atom,
+  captureGatewayFileDownload,
+  host,
   type PluginOs,
   type PluginRestOptions,
   type PluginStorage,
   type PluginTranslate,
-  queryClient
+  queryClient,
+  useValue
 } from '@hermes/plugin-sdk'
 
 // Native completion notification.
@@ -25,64 +34,24 @@ import type {
   BoardImportResult,
   BoardMeta,
   BoardsResponse,
-  ChoiceResponse,
-  DispatchPauseResult,
-  DispatchResumeResult,
-  DispatchStatus,
   KanbanBoard,
   KanbanProfile,
   KanbanProject,
   KanbanTask,
   KanbanTaskDetail,
   OrchestrationSettings,
-  PostDrainCancelResult,
-  PostDrainQueueResult,
-  StagedAttachment,
   TaskEstimate,
   WorkerLog
 } from './types'
-
-export interface ArchiveDonePreflight {
-  done_count: number
-  scope: { kind: 'all_boards' | 'board'; label: string; board?: string }
-}
-
-export interface ArchiveDoneResult {
-  scope: ArchiveDonePreflight['scope']
-  archived_count: number
-  boards: string[]
-  candidate_count: number
-  failures: Array<{ board: string; error: string; task_id: string }>
-  skipped_count: number
-}
 
 type Rest = <T>(path: string, opts?: PluginRestOptions) => Promise<T>
 type Socket = (path: string, onMessage: (data: unknown) => void) => () => void
 
 let rest: null | Rest = null
 let os: null | PluginOs = null
-let socketDoor: null | Socket = null
-let closeEventsSocket: (() => void) | null = null
-/** Whether this backend understands the aggregate dispatch `boards=*` scope.
- * Older managed backends ignore that query parameter and silently operate on
- * their current board, so All Boards must fan out explicit `board=` calls when
- * aggregate fields are absent. */
-let dispatchAggregateSupported: boolean | null = null
-// Whether the multi-board `boards=*` socket has been opened for the CURRENT All Boards
-// session (reset whenever `$boardSlug` changes). Guards against re-opening on every 60s
-// poll refetch — the socket already advances its own cursor live; reseeding from a stale
-// fetch would reset it backwards and could re-fire notifications for already-seen events.
-let allBoardsPrimed = false
 
 /** Selected board slug ('' = the server's current board). Persisted. */
 export const $boardSlug = atom<string>('')
-
-/** Sentinel `$boardSlug` value for the consolidated "All Boards" view — never
- *  a real board slug (board slugs are filesystem-safe identifiers that never
- *  contain `*`), so it can't collide with an on-disk board. Every call site
- *  that reaches the server MUST route around this value explicitly (see
- *  `fetchAllBoards`, `withExplicitBoard`) rather than send it as `?board=*`. */
-export const ALL_BOARDS = '*'
 
 /** Whether the "how this board works" intro was dismissed. Persisted. */
 export const $introDismissed = atom<boolean>(false)
@@ -95,100 +64,130 @@ export const $lanesByProfile = atom<boolean>(false)
  *  auto: empty lanes collapse to a rail, occupied lanes expand. Persisted. */
 export const $collapsedLanes = atom<Record<string, boolean>>({})
 
-/** Board VISIBILITY overrides for the All Boards filter chip row (true =
- *  hidden). Absence means visible — a newly appearing board defaults to
- *  shown. Persisted, same shape/pattern as `$collapsedLanes`. Client-side
- *  only: the server always returns every board's cards, this just filters
- *  what's rendered. */
-export const $hiddenBoards = atom<Record<string, boolean>>({})
+/** Cache scope of the local pool — the SDK atom's own spelling. */
+const LOCAL_SCOPE = 'local'
 
-/** Per-board visibility of the two wishlist lanes (`idea` + `roadmap`), keyed
- *  by board slug (true = hidden). Absence means SHOWN — a board nobody has
- *  touched shows its full structure. Persisted alongside `$collapsedLanes` /
- *  `$hiddenBoards`; scoped per board because a wishlist is a property of one
- *  board, not of the app: hiding a 200-card roadmap on one board must not
- *  hide a 3-card one on another. Distinct from `$collapsedLanes`, which
- *  renders a thin rail — this removes the lanes entirely, and their cards
- *  drop out of the board's counts with them. */
-export const $roadmapHidden = atom<Record<string, boolean>>({})
-
-/** Focus-mode line marks: direction chevrons along each dependency line (on
- *  by default) and the animated "moving dots" that flow blocker → blocked
- *  (off by default — motion is opt-in). Toggled from the answer bar's
- *  legend. Persisted. */
-export const $depChevrons = atom<boolean>(true)
-export const $depFlow = atom<boolean>(false)
+const KANBAN_KEY_ROOT = ['kanban'] as const
 
 const BOARD_SLUG_KEY = 'boardSlug'
 const INTRO_KEY = 'introDismissed'
 const LANES_KEY = 'lanesByProfile'
 const COLLAPSED_KEY = 'collapsedLanes'
-const HIDDEN_BOARDS_KEY = 'hiddenBoards'
-const ROADMAP_HIDDEN_KEY = 'roadmapHidden'
-const DEP_CHEVRONS_KEY = 'depChevrons'
-const DEP_FLOW_KEY = 'depFlow'
+
+// Last frame cursor per (connection, board) this plugin bind. The socket
+// reopens on every board switch and connection change; resuming from the last
+// frame replays only what was missed. Keyed by connection so one gateway's
+// cursor cannot resume another's stream. Cleared on bind/unbind — events that
+// land while the plugin is unloaded are not replayed.
+const eventCursorByBoard = new Map<string, number>()
+
+function cursorKey(scope: string, slug: string): string {
+  return `${scope}\0${slug}`
+}
+
+function snapshotCursor(scope: string, slug: string): number | undefined {
+  for (const archived of [false, true]) {
+    const board = queryClient.getQueryData<KanbanBoard>(boardKey(scope, slug, archived))
+
+    if (typeof board?.latest_event_id === 'number') {
+      return board.latest_event_id
+    }
+  }
+
+  return undefined
+}
+
+/** Cursor a fresh socket starts from: the last frame this connection saw, else
+ *  the cached board snapshot's tail. Undefined means nothing is known yet —
+ *  fetch the snapshot before opening, never open at since=0. */
+function eventsSince(scope: string, slug: string): number | undefined {
+  const seen = eventCursorByBoard.get(cursorKey(scope, slug))
+
+  if (typeof seen === 'number') {
+    return seen
+  }
+
+  return snapshotCursor(scope, slug)
+}
+
+function eventsUrl(slug: string, since: number | undefined): string {
+  const params = new URLSearchParams()
+
+  if (slug) {
+    params.set('board', slug)
+  }
+
+  if (since !== undefined) {
+    params.set('since', String(since))
+  }
+
+  const query = params.toString()
+
+  return query ? `/events?${query}` : '/events'
+}
+
+function boardSnapshotPath(slug: string): string {
+  return slug ? `/board?board=${encodeURIComponent(slug)}` : '/board'
+}
+
+/** Cache-scope id for the active connection — the segment every query key
+ *  embeds. `'local'` covers the pre-descriptor null; the SDK atom already
+ *  reports 'local' for the local pool. For NON-rendering code (mutations,
+ *  socket frames); rendering components use `useKanbanScope` so the keys they
+ *  build during render recompute when the connection changes. */
+export function kanbanConnectionScope(): string {
+  return host.state.connectionId.get() ?? LOCAL_SCOPE
+}
+
+export function useKanbanScope(): string {
+  return useValue(host.state.connectionId) ?? LOCAL_SCOPE
+}
+
+/** Where a request issued NOW is routed, as a cache scope. The request tag
+ *  moves before the connection descriptor publishes, and React re-keys the
+ *  observers later still — so between the two an observer can sit on the
+ *  outgoing scope's key while a fetch would land on the incoming backend. */
+const routedScope = (): string => host.activeConnectionId() ?? LOCAL_SCOPE
+
+/** `enabled` for every kanban query: only fetch while the key's scope is the
+ *  routed one. A switch's app-wide invalidation then leaves the outgoing
+ *  observers alone (the incoming keys are already a cache miss) instead of
+ *  writing the new gateway's payload under the old connection's key — which
+ *  would paint on the way back. Installed as the `['kanban']` query default in
+ *  `bindApi`; sites with their own `enabled` compose it. */
+export const routedToScope = (query: { queryKey: readonly unknown[] }): boolean => query.queryKey[2] === routedScope()
 
 /** One live `task_events` frame → precise cache invalidation: the board, plus
  *  each touched task's detail. The polls (8s board / 4s drawer) stay as the
  *  fallback — the socket just makes the board feel instant. */
-function onEventsFrame(slug: string, data: unknown): void {
-  const events = (data as { events?: CompletionEvent[] })?.events
+function onEventsFrame(scope: string, slug: string, data: unknown, selectedSlug = slug): void {
+  const frame = data as { cursor?: unknown; events?: CompletionEvent[] }
+
+  if (typeof frame?.cursor === 'number') {
+    eventCursorByBoard.set(cursorKey(scope, slug), frame.cursor)
+  }
+
+  const events = frame?.events
 
   if (!events?.length) {
     return
   }
 
-  void queryClient.invalidateQueries({ queryKey: ['kanban', 'board'] })
+  void queryClient.invalidateQueries({ queryKey: boardKeyPrefix(scope) })
   // Any event can change a board's card count — keep the switcher badge honest.
-  void queryClient.invalidateQueries({ queryKey: BOARDS_KEY })
+  void queryClient.invalidateQueries({ queryKey: boardsKey(scope) })
 
   for (const taskId of new Set(events.map(event => event.task_id).filter(Boolean))) {
-    void queryClient.invalidateQueries({ queryKey: taskKey(slug, taskId!) })
+    void queryClient.invalidateQueries({ queryKey: taskKey(scope, slug, taskId!) })
+
+    if (selectedSlug !== slug) {
+      void queryClient.invalidateQueries({ queryKey: taskKey(scope, selectedSlug, taskId!) })
+    }
   }
 
   // Completion notification (after invalidation so notify failure
   // never interferes with cache invalidation).
   void onKanbanEventsFrame(slug, events).catch(() => undefined)
-}
-
-/** The multi-board twin of `onEventsFrame`, for frames from the `boards=*` socket (the
- *  consolidated All Boards view). Each event on the frame carries its OWN `board` field (see
- *  the backend's `_MultiEventTail`), so per-task cache invalidation and per-board notification
- *  baselines route correctly even though every card in this view shares one query cache entry
- *  keyed on the `ALL_BOARDS` sentinel (matching how `board.tsx`/`drawer.tsx` key their queries
- *  in this mode — see `taskKey(ALL_BOARDS, id)` in `drawer.tsx`). */
-function onEventsFrameMulti(data: unknown): void {
-  const events = (data as { events?: CompletionEvent[] })?.events
-
-  if (!events?.length) {
-    return
-  }
-
-  void queryClient.invalidateQueries({ queryKey: boardKey(ALL_BOARDS, false) })
-  void queryClient.invalidateQueries({ queryKey: boardKey(ALL_BOARDS, true) })
-  void queryClient.invalidateQueries({ queryKey: BOARDS_KEY })
-
-  const byBoard = new Map<string, CompletionEvent[]>()
-
-  for (const event of events) {
-    if (event.task_id) {
-      void queryClient.invalidateQueries({ queryKey: taskKey(ALL_BOARDS, event.task_id) })
-    }
-
-    if (event.board) {
-      const bucket = byBoard.get(event.board) ?? []
-
-      bucket.push(event)
-      byBoard.set(event.board, bucket)
-    }
-  }
-
-  // Notify per-board: `onKanbanEventsFrame`'s baseline/cursor tracking is keyed by board slug,
-  // so a merged frame is split back apart before it's fed in — never notify against the '*'
-  // sentinel itself, which has no baseline (`onKanbanEventsFrame` suppresses empty slugs).
-  for (const [board, boardEvents] of byBoard) {
-    void onKanbanEventsFrame(board, boardEvents).catch(() => undefined)
-  }
 }
 
 // A persisted, subscribable atom (the structural slice we need — avoids
@@ -201,22 +200,24 @@ interface Persisted<T> {
 
 /** Bind the plugin's doors at register time and return a disposer the host
  *  runs on unload/disable — so nothing (store sync, socket) survives a toggle
- *  or duplicates on re-enable. The single-board events socket is pinned to a
- *  board at handshake, so a board switch closes + reopens it. The All Boards
- *  sentinel opens the MULTI-board socket (`boards=*`) instead, seeded from
- *  `/board/all`'s `cursors` map via `primeAllBoardsSocket` — see `board.tsx`. */
+ *  or duplicates on re-enable. The events socket is pinned to a board at
+ *  handshake, so a board switch closes + reopens it. */
 export function bindApi(
   r: Rest,
   storage: PluginStorage,
   socket: Socket,
   notifyDoors?: { os?: PluginOs; t?: PluginTranslate }
 ): () => void {
+  // >>> FORK ANCHOR: kanban-all-boards <<< seam: host.fork.kanban from '@/fork/kanban/host'
+  r = host.fork?.kanban?.routeRest(r, $boardSlug) ?? r
+  // <<< FORK ANCHOR >>>
   rest = r
   os = notifyDoors?.os ?? null
-  socketDoor = socket
-  dispatchAggregateSupported = null
   bindCompletionNotify(r, notifyDoors?.t, notifyDoors?.os)
   const unsubs: Array<() => void> = []
+
+  queryClient.setQueryDefaults(KANBAN_KEY_ROOT, { enabled: routedToScope })
+  unsubs.push(() => queryClient.setQueryDefaults(KANBAN_KEY_ROOT, {}))
 
   // Hydrate an atom from storage and keep storage in sync with it.
   const persist = <T>(atom: Persisted<T>, key: string, fallback: T) => {
@@ -224,62 +225,129 @@ export function bindApi(
     unsubs.push(atom.listen(value => storage.set(key, value)))
   }
 
-  persist($boardSlug, BOARD_SLUG_KEY, '')
   persist($introDismissed, INTRO_KEY, false)
   persist($lanesByProfile, LANES_KEY, false)
   persist($collapsedLanes, COLLAPSED_KEY, {})
-  persist($hiddenBoards, HIDDEN_BOARDS_KEY, {})
-  persist($roadmapHidden, ROADMAP_HIDDEN_KEY, {})
-  persist($depChevrons, DEP_CHEVRONS_KEY, true)
-  persist($depFlow, DEP_FLOW_KEY, false)
 
-  const open = (slug: string) => {
-    // A board switch (including into/out of the sentinel) always invalidates any prior
-    // priming — the next All Boards selection must re-seed its cursors from a fresh
-    // `/board/all` fetch, never resume the OLD selection's cursor map.
-    allBoardsPrimed = false
-    closeEventsSocket?.()
+  eventCursorByBoard.clear()
 
-    closeEventsSocket =
-      slug === ALL_BOARDS
-        ? null // opened lazily once fetchAllBoards resolves — see primeAllBoardsSocket
-        : socket(slug ? `/events?board=${encodeURIComponent(slug)}` : '/events', data => onEventsFrame(slug, data))
+  let close: (() => void) | null = null
+  let socketGeneration = 0
+
+  const dial = (scope: string, slug: string, since: number | undefined) => {
+    const generation = socketGeneration
+    const selectedSlug = $boardSlug.get()
+
+    return socket(eventsUrl(slug, since), data => {
+      if (generation === socketGeneration) {
+        onEventsFrame(scope, slug, data, selectedSlug)
+      }
+    })
   }
 
+  const open = (selectedSlug: string) => {
+    const generation = ++socketGeneration
+    const scope = kanbanConnectionScope()
+
+    close?.()
+    close = null
+
+    const openResolved = (slug: string) => {
+      if (generation !== socketGeneration) {
+        return
+      }
+
+      const since = eventsSince(scope, slug)
+
+      if (since !== undefined) {
+        close = dial(scope, slug, since)
+
+        return
+      }
+
+      // No cached tail yet. Wait for the snapshot and open at its
+      // latest_event_id. A board switch or unload bumps the generation so a
+      // late snapshot cannot open a stale socket. A failed fetch still opens
+      // with no since — the server starts at the tail rather than replaying.
+      void queryClient
+        .fetchQuery({
+          queryFn: () => r<KanbanBoard>(boardSnapshotPath(slug)),
+          queryKey: boardKey(scope, slug, false)
+        })
+        .then(board => {
+          if (generation !== socketGeneration) {
+            return
+          }
+
+          const tail = typeof board?.latest_event_id === 'number' ? board.latest_event_id : undefined
+
+          close = dial(scope, slug, tail)
+        })
+        .catch(() => {
+          if (generation !== socketGeneration) {
+            return
+          }
+
+          close = dial(scope, slug, undefined)
+        })
+    }
+
+    if (selectedSlug) {
+      openResolved(selectedSlug)
+
+      return
+    }
+
+    // Resolve the alias BEFORE the handshake: /events is pinned to its board
+    // when opened. Resolving on each frame could classify an old socket's
+    // events against a different server-current board's cursor.
+    void r<BoardsResponse>('/boards')
+      .then(boards => openResolved(typeof boards.current === 'string' ? boards.current : ''))
+      .catch(() => openResolved('')) // Keep live cache invalidation; notifications fail closed.
+  }
+
+  // The local connection keeps the BARE key (the bare-local rule of
+  // lib/connection-scoped: byte-identical storage for single-backend users, and
+  // the slug picked before per-connection keys existed survives the upgrade).
+  // Remotes are suffixed by registry id.
+  const slugStorageKey = () => {
+    const scope = kanbanConnectionScope()
+
+    return scope === LOCAL_SCOPE ? BOARD_SLUG_KEY : `${BOARD_SLUG_KEY}.${scope}`
+  }
+
+  $boardSlug.set(storage.get(slugStorageKey(), ''))
+  unsubs.push($boardSlug.listen(slug => storage.set(slugStorageKey(), slug)))
   open($boardSlug.get())
   unsubs.push($boardSlug.listen(open))
+  unsubs.push(
+    host.state.connectionId.listen((next, prev) => {
+      // Query keys embed the scope, so the new connection is already a cache
+      // miss; only the LIVE bindings (socket, slug) follow it. The boot-time
+      // null → 'local' publish is the same scope, not a switch. A changed slug
+      // reopens the socket through the $boardSlug listener above; an unchanged
+      // slug still needs a dial because the backend behind it changed.
+      if ((next ?? LOCAL_SCOPE) === (prev ?? LOCAL_SCOPE)) {
+        return
+      }
+
+      const previous = $boardSlug.get()
+      $boardSlug.set(storage.get(slugStorageKey(), ''))
+
+      if ($boardSlug.get() === previous) {
+        open(previous)
+      }
+    })
+  )
 
   return () => {
+    socketGeneration += 1
+    eventCursorByBoard.clear()
     unsubs.forEach(unsub => unsub())
-    closeEventsSocket?.()
-    closeEventsSocket = null
-    socketDoor = null
-    allBoardsPrimed = false
+    close?.()
     rest = null
     os = null
   }
-}
-
-/** Open the multi-board events socket for the All Boards view, seeded from the `cursors` map
- *  `GET /board/all` returned — so the socket resumes exactly where that fetch ended, no gap,
- *  no replay (the decided design in the WS follow-on card). Idempotent per All-Boards
- *  session, guarded by `allBoardsPrimed`: safe to call on every poll refetch (`board.tsx` does),
- *  but only the FIRST call after selecting the sentinel actually opens a socket — reseeding on
- *  every poll would reset the live cursor backwards to that poll's snapshot and could re-fire
- *  notifications for events the socket already delivered. `bindApi`'s `open()` resets the guard
- *  whenever the board selection changes, so the next `ALL_BOARDS` selection primes fresh.
- *  No-op outside All Boards mode or before `bindApi` has bound a socket door. */
-export function primeAllBoardsSocket(cursors: Record<string, number>): void {
-  if (allBoardsPrimed || $boardSlug.get() !== ALL_BOARDS || !socketDoor) {
-    return
-  }
-
-  allBoardsPrimed = true
-  closeEventsSocket?.()
-  closeEventsSocket = socketDoor(
-    `/events?boards=*&cursors=${encodeURIComponent(JSON.stringify(cursors))}`,
-    onEventsFrameMulti
-  )
 }
 
 /** The plugin's OS door, for components too deep to be handed `ctx`. Null
@@ -290,32 +358,10 @@ function call<T>(path: string, opts?: PluginRestOptions): Promise<T> {
   return rest ? rest<T>(path, opts) : Promise.reject(new Error('kanban api not ready'))
 }
 
-/** Append the selected board (and other params) to a path. Never emits the
- *  All Boards sentinel as a literal `board=*` — the backend has no such
- *  board, so that would 400/404 on every mutation fired while the sentinel is
- *  selected. Falling through to "no board param" resolves server-side to the
- *  active board, which is a safe default for any call site not yet migrated
- *  to pass an explicit board (see `withExplicitBoard`). */
+/** Append the selected board (and other params) to a path. */
 function withBoard(path: string, params: Record<string, string> = {}): string {
   const search = new URLSearchParams(params)
   const slug = $boardSlug.get()
-
-  if (slug && slug !== ALL_BOARDS) {
-    search.set('board', slug)
-  }
-
-  const qs = search.toString()
-
-  return qs ? `${path}?${qs}` : path
-}
-
-/** Like `withBoard`, but the board comes from the CALLER, never the
- *  `$boardSlug` atom — the explicit-board escape hatch every mutation the
- *  consolidated All Boards view can reach must use, so a write always lands
- *  on the card's own board, never the sentinel. Empty string means "no board
- *  param" (server falls back to its active board), matching `withBoard`. */
-function withExplicitBoard(path: string, slug: string, params: Record<string, string> = {}): string {
-  const search = new URLSearchParams(params)
 
   if (slug) {
     search.set('board', slug)
@@ -326,46 +372,34 @@ function withExplicitBoard(path: string, slug: string, params: Record<string, st
   return qs ? `${path}?${qs}` : path
 }
 
-/** Route a board-scoped path: an explicit `board` (even '') pins the request
- *  to that board; `undefined` (the default on every existing call site) keeps
- *  today's behavior of reading `$boardSlug`. This is the seam every mutation
- *  helper below uses so single-board call sites are byte-for-byte unchanged
- *  while all-boards call sites can pass a card's own board explicitly. */
-function boardPath(path: string, board: string | undefined, params?: Record<string, string>): string {
-  return board === undefined ? withBoard(path, params) : withExplicitBoard(path, board, params)
-}
+// ── query keys (connection- and board-scoped; scope is always segment [2]) ────
 
-// ── query keys (all board-scoped so switching boards is a clean cache miss) ──
-
-export const boardKey = (slug: string, archived: boolean) => ['kanban', 'board', slug, archived] as const
-export const taskKey = (slug: string, id: string) => ['kanban', 'task', slug, id] as const
-export const logKey = (slug: string, id: string, tailBytes: number) => ['kanban', 'log', slug, id, tailBytes] as const
-export const BOARDS_KEY = ['kanban', 'boards'] as const
-export const PROFILES_KEY = ['kanban', 'profiles'] as const
-export const PROJECTS_KEY = ['kanban', 'projects'] as const
-export const ORCHESTRATION_KEY = ['kanban', 'orchestration'] as const
-/** Board-scoped: a pause is per board, so switching boards must be a cache miss. */
-export const dispatchStatusKey = (slug: string) => ['kanban', 'dispatch-status', slug] as const
+/** Prefix matching every board query on one connection (all slugs, both
+ *  archived views) — the mutation-settled invalidation target. */
+export const boardKeyPrefix = (scope: string) => ['kanban', 'board', scope] as const
+export const boardKey = (scope: string, slug: string, archived: boolean) =>
+  [...boardKeyPrefix(scope), slug, archived] as const
+export const taskKey = (scope: string, slug: string, id: string) => ['kanban', 'task', scope, slug, id] as const
+export const logKey = (scope: string, slug: string, id: string) => ['kanban', 'log', scope, slug, id] as const
+export const boardsKey = (scope: string) => ['kanban', 'boards', scope] as const
+export const profilesKey = (scope: string) => ['kanban', 'profiles', scope] as const
+export const projectsKey = (scope: string) => ['kanban', 'projects', scope] as const
+export const orchestrationKey = (scope: string) => ['kanban', 'orchestration', scope] as const
 
 // ── reads ─────────────────────────────────────────────────────────────────────
 
 export const fetchBoard = (archived: boolean) =>
   call<KanbanBoard>(withBoard('/board', archived ? { include_archived: 'true' } : {}))
 
-/** The consolidated All Boards view — merges every board's cards into the
- *  standard status columns, each task tagged `board`/`board_name`. Deliberately
- *  bypasses `withBoard`/`$boardSlug`: `GET /board/all` has no `board` query
- *  param (it takes `boards=<csv>` to RESTRICT the set, which this always-fetch-
- *  everything call never sends). */
-export const fetchAllBoards = (archived: boolean) =>
-  call<KanbanBoard>(`/board/all${archived ? '?include_archived=true' : ''}`)
+export const fetchTask = async (id: string) => {
+  const downloadAttachment = captureGatewayFileDownload()
+  const detail = await call<KanbanTaskDetail>(withBoard(`/tasks/${id}`))
 
-export const fetchTask = (id: string, board?: string) => call<KanbanTaskDetail>(boardPath(`/tasks/${id}`, board))
+  return { ...detail, downloadAttachment }
+}
 
-/** Worker stdout/stderr tail. Callers may request the 2 MiB API ceiling, which
- * matches the retained active-log rotation limit. */
-export const fetchLog = (id: string, tailBytes = 16384, board?: string) =>
-  call<WorkerLog>(boardPath(`/tasks/${id}/log`, board, { tail: String(tailBytes) }))
+/** Worker stdout/stderr tail (last 16 KiB — plenty for the drawer). */
+export const fetchLog = (id: string) => call<WorkerLog>(withBoard(`/tasks/${id}/log`, { tail: '16384' }))
 
 export const fetchBoards = () => call<BoardsResponse>('/boards')
 
@@ -376,32 +410,6 @@ export const fetchProjects = () => call<{ projects: KanbanProject[] }>('/project
 
 export const fetchOrchestration = () => call<OrchestrationSettings>('/orchestration')
 
-/** Completed-card archive uses the dashboard's two established scope forms:
- * an individual board, or `boards=*` for the existing consolidated view.
- * It deliberately does not route the All Boards sentinel through `withBoard`.
- */
-function archiveDonePath(path: string): string {
-  return $boardSlug.get() === ALL_BOARDS ? `${path}?boards=*` : withBoard(path)
-}
-
-/** Archiving every done card on every board is a bulk write whose duration
- * scales with the candidate set (~76 cards observed), and the REST layer
- * otherwise applies its generic 30s ceiling — which aborted the request in the
- * UI while the backend kept going and completed. A per-call budget only ever
- * RAISES that ceiling, so this is the one archive-done knob, not a global one. */
-export const ARCHIVE_DONE_TIMEOUT_MS = 300_000
-
-export const fetchArchiveDonePreflight = () =>
-  call<ArchiveDonePreflight>(archiveDonePath('/tasks/archive-done/preflight'), {
-    timeoutMs: ARCHIVE_DONE_TIMEOUT_MS
-  })
-
-export const archiveDone = () =>
-  call<ArchiveDoneResult>(archiveDonePath('/tasks/archive-done'), {
-    method: 'POST',
-    timeoutMs: ARCHIVE_DONE_TIMEOUT_MS
-  })
-
 // ── writes ────────────────────────────────────────────────────────────────────
 
 // Every board edit nudges the dispatcher (debounced, fire-and-forget) so the
@@ -410,135 +418,57 @@ export const archiveDone = () =>
 // is lock-guarded and ~1ms when there's nothing to do, so over-nudging is
 // free; failures are non-events (the periodic tick still exists).
 let nudgeTimer: null | ReturnType<typeof setTimeout> = null
-// The set of explicit boards (plus a `true` marker for "use $boardSlug") that
-// have a write pending since the last nudge fired — so a debounced burst of
-// all-boards writes across several real boards nudges every one of them,
-// never just the last board that happened to settle the timer.
-const pendingNudgeBoards = new Set<string | true>()
 
-function autoNudge(board?: string): void {
-  pendingNudgeBoards.add(board ?? true)
-
+function autoNudge(): void {
   if (nudgeTimer != null) {
     clearTimeout(nudgeTimer)
   }
 
   nudgeTimer = setTimeout(() => {
     nudgeTimer = null
-    const boards = [...pendingNudgeBoards]
-    pendingNudgeBoards.clear()
-
-    for (const board of boards) {
-      nudgeDispatcher(board === true ? undefined : board).catch(() => undefined)
-    }
+    nudgeDispatcher().catch(() => undefined)
   }, 400)
 }
 
 /** Resolve the write, then kick the dispatcher. Rejections pass through. */
-function nudged<T>(write: Promise<T>, board?: string): Promise<T> {
+function nudged<T>(write: Promise<T>): Promise<T> {
   return write.then(value => {
-    autoNudge(board)
+    autoNudge()
 
     return value
   })
 }
 
-export const patchTask = (id: string, patch: Record<string, unknown>, board?: string) =>
-  nudged(call(boardPath(`/tasks/${id}`, board), { method: 'PATCH', body: patch }), board)
+export const patchTask = (id: string, patch: Record<string, unknown>) =>
+  nudged(call(withBoard(`/tasks/${id}`), { method: 'PATCH', body: patch }))
 
-/** `board` pins the new task to a specific board. Required from the
- *  consolidated All Boards view: without it `withBoard` drops the sentinel and
- *  the server silently creates the card on whatever board happens to be
- *  ACTIVE, with nothing in the UI saying which. */
-export const createTask = (body: Record<string, unknown>, board?: string) =>
-  nudged(
-    call<{ task: KanbanTask | null; warning?: string }>(boardPath('/tasks', board), { method: 'POST', body }),
-    board
-  )
+export const createTask = (body: Record<string, unknown>) =>
+  nudged(call<{ task: KanbanTask | null; warning?: string }>(withBoard('/tasks'), { method: 'POST', body }))
 
 // Deleting can unblock dependants (a gone parent no longer gates), so it
 // nudges too.
-export const deleteTask = (id: string, board?: string) =>
-  nudged(call(boardPath(`/tasks/${id}`, board), { method: 'DELETE' }), board)
+export const deleteTask = (id: string) => nudged(call(withBoard(`/tasks/${id}`), { method: 'DELETE' }))
 
 /** One patch, many ids — independent per-id application; returns per-id
- *  outcomes so the UI can toast partial failures. `board` pins every id in
- *  ONE call to the same board; a selection spanning multiple boards (only
- *  possible in the All Boards view) must be grouped by board and called once
- *  per group by the caller — the backend endpoint is single-board. */
-export const bulkTasks = (ids: string[], patch: Record<string, unknown>, board?: string) =>
+ *  outcomes so the UI can toast partial failures. */
+export const bulkTasks = (ids: string[], patch: Record<string, unknown>) =>
   nudged(
-    call<{ results: Array<{ id: string; ok: boolean; error?: string }> }>(boardPath('/tasks/bulk', board), {
+    call<{ results: Array<{ id: string; ok: boolean; error?: string }> }>(withBoard('/tasks/bulk'), {
       method: 'POST',
       body: { ids, ...patch }
-    }),
-    board
+    })
   )
 
-/** `choice`, when present, is the clicked multiple-choice option — see
- *  docs/design/blocked-callout-multiple-choice-spec.md. Optional so every
- *  free-text reply keeps sending exactly the payload it always has. */
-export const addComment = (id: string, body: string, choice?: ChoiceResponse, board?: string) =>
-  call(boardPath(`/tasks/${id}/comments`, board), {
-    method: 'POST',
-    body: { author: 'desktop', body, choice: choice ?? null }
-  })
+export const addComment = (id: string, body: string) =>
+  call(withBoard(`/tasks/${id}/comments`), { method: 'POST', body: { author: 'desktop', body } })
 
-export const reassignTask = (id: string, profile: string, board?: string) =>
-  nudged(
-    call(boardPath(`/tasks/${id}/reassign`, board), { method: 'POST', body: { profile, reclaim_first: true } }),
-    board
-  )
+export const reassignTask = (id: string, profile: string) =>
+  nudged(call(withBoard(`/tasks/${id}/reassign`), { method: 'POST', body: { profile, reclaim_first: true } }))
 
-export const reclaimTask = (id: string, board?: string) =>
-  nudged(call(boardPath(`/tasks/${id}/reclaim`, board), { method: 'POST', body: {} }), board)
+export const reclaimTask = (id: string) => nudged(call(withBoard(`/tasks/${id}/reclaim`), { method: 'POST', body: {} }))
 
-/** Create a dependency edge: `parentId` BLOCKS `childId`. Nudges, because a
- *  new gate can change what the dispatcher is allowed to spawn. `board`
- *  should be the CHILD's board (the task the drawer is open on) — a link only
- *  makes sense between tasks the backend can see from one board's DB. */
-export const linkTasks = (parentId: string, childId: string, board?: string) =>
-  nudged(call(boardPath('/links', board), { method: 'POST', body: { parent_id: parentId, child_id: childId } }), board)
-
-/** Cut a dependency edge. Nudges: removing the last gate on a todo task can
- *  promote it to ready immediately. */
-export const unlinkTasks = (parentId: string, childId: string, board?: string) =>
-  nudged(
-    call(boardPath('/links', board, { parent_id: parentId, child_id: childId }), {
-      method: 'DELETE'
-    }),
-    board
-  )
-
-export const uploadAttachment = (
-  id: string,
-  upload: { filename: string; contentType?: string; bytes: ArrayBuffer },
-  board?: string
-) => call(boardPath(`/tasks/${id}/attachments`, board), { method: 'POST', upload })
-
-/** Fetch an attachment's bytes as a base64 data URL — the desktop plugin
- *  host has no authenticated `<img src>` door of its own (REST goes over
- *  the Electron IPC bridge, JSON only), so rendering a pasted image inline
- *  in the drawer needs the bytes delivered as a data URL rather than a URL
- *  to point an `<img>` at. */
-export const fetchAttachmentDataUrl = (id: number | string, board?: string) =>
-  call<{ data_url: string; content_type: string; size: number }>(boardPath(`/attachments/${id}/data-url`, board))
-
-/** Upload a pasted image before the task exists (new-task dialog paste flow).
- *  Returns a `token` that travels in `pending_attachment_tokens` on
- *  `createTask` and is promoted into a real attachment server-side. Staged
- *  blobs live in the TARGET board's own staging DB, so `board` must match the
- *  board the task will be created on or the token won't resolve at promotion. */
-export const stageAttachment = (
-  upload: { filename: string; contentType?: string; bytes: ArrayBuffer },
-  board?: string
-) => call<{ attachment: StagedAttachment }>(boardPath('/attachments/staged', board), { method: 'POST', upload })
-
-/** Remove a staged (pre-submit) image — used by the remove (×) button and by
- *  best-effort cleanup when the new-task dialog closes without submitting.
- *  `board` must be the board the token was staged against. */
-export const deleteStagedAttachment = (token: string, board?: string) =>
-  call(boardPath(`/attachments/staged/${encodeURIComponent(token)}`, board), { method: 'DELETE' })
+export const uploadAttachment = (id: string, upload: { filename: string; contentType?: string; bytes: ArrayBuffer }) =>
+  call(withBoard(`/tasks/${id}/attachments`), { method: 'POST', upload })
 
 export const createBoard = (slug: string, name: string, projectId?: string) =>
   call<{ board: { slug: string } }>('/boards', {
@@ -548,8 +478,8 @@ export const createBoard = (slug: string, name: string, projectId?: string) =>
 
 /** Rough auxiliary-model estimate for a task (tokens + complexity). Makes a
  *  model call — gate behind an explicit user action + disclaimer. */
-export const estimateTask = (id: string, board?: string) =>
-  call<TaskEstimate>(boardPath(`/tasks/${id}/estimate`, board), { method: 'POST', body: {} })
+export const estimateTask = (id: string) =>
+  call<TaskEstimate>(withBoard(`/tasks/${id}/estimate`), { method: 'POST', body: {} })
 
 /** Estimate from typed title/body before a task exists (create dialog). */
 export const estimateNew = (title: string, body: string) =>
@@ -576,214 +506,10 @@ export const exportBoard = (slug: string, output: string) =>
 export const importBoard = (archive: string) =>
   call<BoardImportResult>('/boards/import', { method: 'POST', body: { archive } })
 
-export const nudgeDispatcher = (board?: string) =>
-  call<{ spawned?: unknown[] }>(boardPath('/dispatch', board), { method: 'POST', body: {} })
-
-/** Capture a free-typed idea as a card in the board's `idea` lane. Never
- *  rejects on an unavailable outcome — the backend is fail-open by contract —
- *  so callers branch on `ok`/`reason` (`empty_idea` | `roadmap_unavailable`)
- *  rather than a thrown error, matching `estimateNew`'s shape. */
-export const addRoadmapIdea = (text: string, sourceId?: string, board?: string) =>
-  call<{ ok: boolean; reason?: null | string }>(boardPath('/roadmap/idea', board), {
-    method: 'POST',
-    body: { text, ...(sourceId ? { source_id: sourceId } : {}) }
-  })
+export const nudgeDispatcher = () => call<{ spawned?: unknown[] }>(withBoard('/dispatch'), { method: 'POST', body: {} })
 
 export const saveOrchestration = (patch: Record<string, unknown>) =>
   call<OrchestrationSettings>('/orchestration', { method: 'PUT', body: patch })
-
-/** Dispatch pause circuit for the maintenance-drain control. All Boards uses
- * the backend's explicit aggregate scope (`boards=*`) when available. During a
- * rolling Desktop/backend upgrade, older backends silently ignore `boards=*`;
- * missing aggregate fields trigger safe explicit per-board fan-out instead. */
-function dispatchPath(path: string): string {
-  return $boardSlug.get() === ALL_BOARDS ? `${path}?boards=*` : withBoard(path)
-}
-
-function dispatchError(reason: unknown): string {
-  return reason instanceof Error ? reason.message : String(reason)
-}
-
-async function activeDispatchBoards(): Promise<string[]> {
-  return (await fetchBoards()).boards.map(board => board.slug)
-}
-
-async function fetchAllDispatchStatuses(): Promise<DispatchStatus> {
-  const slugs = await activeDispatchBoards()
-
-  const settled = await Promise.allSettled(
-    slugs.map(slug => call<DispatchStatus>(withExplicitBoard('/dispatch/status', slug)))
-  )
-
-  const boards: Array<DispatchStatus & { board: string }> = []
-  const errors: Array<{ board: string; error: string }> = []
-
-  settled.forEach((result, index) => {
-    const board = slugs[index]!
-
-    if (result.status === 'fulfilled') {
-      boards.push({ board, ...result.value })
-    } else {
-      errors.push({ board, error: dispatchError(result.reason) })
-    }
-  })
-
-  const pausedCount = boards.filter(status => status.paused).length
-  const allPaused = slugs.length > 0 && errors.length === 0 && pausedCount === slugs.length
-
-  return {
-    all_paused: allPaused,
-    board_count: slugs.length,
-    boards,
-    errors,
-    message: null,
-    paused: allPaused,
-    paused_count: pausedCount,
-    running_count: boards.reduce((total, status) => total + status.running_count, 0),
-    state: null
-  }
-}
-
-export async function fetchDispatchStatus(): Promise<DispatchStatus> {
-  if ($boardSlug.get() !== ALL_BOARDS) {
-    return call<DispatchStatus>(dispatchPath('/dispatch/status'))
-  }
-
-  const result = await call<DispatchStatus>(dispatchPath('/dispatch/status'))
-  dispatchAggregateSupported = typeof result.board_count === 'number'
-
-  return dispatchAggregateSupported ? result : fetchAllDispatchStatuses()
-}
-
-async function pauseAllDispatch(note?: null | string): Promise<DispatchPauseResult> {
-  if (dispatchAggregateSupported !== false) {
-    const result = await call<DispatchPauseResult>(dispatchPath('/dispatch/pause'), {
-      method: 'POST',
-      body: { note: note ?? null }
-    })
-
-    dispatchAggregateSupported = typeof result.board_count === 'number'
-
-    if (dispatchAggregateSupported) {
-      return result
-    }
-  }
-
-  const slugs = await activeDispatchBoards()
-
-  const settled = await Promise.allSettled(
-    slugs.map(slug =>
-      call<DispatchPauseResult>(withExplicitBoard('/dispatch/pause', slug), {
-        method: 'POST',
-        body: { note: note ?? null }
-      })
-    )
-  )
-
-  const results: Array<DispatchPauseResult & { board: string }> = []
-  const failures: Array<{ board: string; error: string }> = []
-
-  settled.forEach((result, index) => {
-    const board = slugs[index]!
-
-    if (result.status === 'fulfilled') {
-      results.push({ board, ...result.value })
-    } else {
-      failures.push({ board, error: dispatchError(result.reason) })
-    }
-  })
-
-  const pausedCount = results.filter(result => result.paused).length
-
-  return {
-    board_count: slugs.length,
-    failures,
-    paused: slugs.length > 0 && failures.length === 0 && pausedCount === slugs.length,
-    paused_count: pausedCount,
-    results,
-    state: null
-  }
-}
-
-/** Refusal is a 200 with `paused: false` (at least one dispatch tick owns its
- * target lock), NOT an error — callers must branch on `paused`, never assume
- * the scope drained just because the request resolved. */
-export const pauseDispatch = (note?: null | string) =>
-  $boardSlug.get() === ALL_BOARDS
-    ? pauseAllDispatch(note)
-    : call<DispatchPauseResult>(dispatchPath('/dispatch/pause'), { method: 'POST', body: { note: note ?? null } })
-
-async function resumeAllDispatch(): Promise<DispatchResumeResult> {
-  if (dispatchAggregateSupported !== false) {
-    const result = await call<DispatchResumeResult>(dispatchPath('/dispatch/resume'), { method: 'POST' })
-
-    dispatchAggregateSupported = typeof result.board_count === 'number'
-
-    if (dispatchAggregateSupported) {
-      return result
-    }
-  }
-
-  const slugs = await activeDispatchBoards()
-
-  const settled = await Promise.allSettled(
-    slugs.map(slug => call<DispatchResumeResult>(withExplicitBoard('/dispatch/resume', slug), { method: 'POST' }))
-  )
-
-  const results: Array<DispatchResumeResult & { board: string }> = []
-  const failures: Array<{ board: string; error: string }> = []
-
-  settled.forEach((result, index) => {
-    const board = slugs[index]!
-
-    if (result.status === 'fulfilled') {
-      results.push({ board, ...result.value })
-    } else {
-      failures.push({ board, error: dispatchError(result.reason) })
-    }
-  })
-
-  const resumedCount = results.filter(result => result.resumed).length
-
-  return {
-    board_count: slugs.length,
-    failures,
-    resumed: slugs.length > 0 && failures.length === 0 && resumedCount === slugs.length,
-    resumed_count: resumedCount,
-    results,
-    was_paused: results.some(result => result.was_paused)
-  }
-}
-
-export const resumeDispatch = () =>
-  $boardSlug.get() === ALL_BOARDS
-    ? resumeAllDispatch()
-    : call<DispatchResumeResult>(dispatchPath('/dispatch/resume'), { method: 'POST' })
-
-/** Queue an action to fire once the selected scope drains to 0 running.
- *
- * Reuses the same `dispatchPath` scope contract as pause/resume, so All Boards
- * arms every active board under one group and a single board arms only itself.
- * Only the intent travels here — the dispatcher tick is what fires it, with or
- * without this dashboard still open. */
-export const queuePostDrainAction = (input: {
-  actionKind: string
-  target?: null | string
-  expiresInSeconds?: null | number
-}) =>
-  call<PostDrainQueueResult>(dispatchPath('/dispatch/post-drain'), {
-    method: 'POST',
-    body: {
-      action_kind: input.actionKind,
-      expires_in_seconds: input.expiresInSeconds ?? null,
-      target: input.target ?? null
-    }
-  })
-
-/** Cancel a waiting action. `cancelled: false` means nothing was waiting to
- *  cancel (already firing or already settled) — not an error. */
-export const cancelPostDrainAction = () =>
-  call<PostDrainCancelResult>(dispatchPath('/dispatch/post-drain'), { method: 'DELETE' })
 
 export const saveProfileDescription = (name: string, description: string) =>
   call(`/profiles/${encodeURIComponent(name)}`, { method: 'PATCH', body: { description } })

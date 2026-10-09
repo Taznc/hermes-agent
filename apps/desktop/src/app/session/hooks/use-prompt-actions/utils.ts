@@ -1,15 +1,17 @@
 import type { AppendMessage } from '@assistant-ui/react'
+import { JsonRpcGatewayError } from '@hermes/shared'
 
-import type { FileAttachResponse } from '@/app/types'
 import { translateNow, type Translations } from '@/i18n'
 import type { ChatMessage } from '@/lib/chat-messages'
-import { isDesktopFsRemoteMode, readDesktopFileDataUrl, readDesktopFileDataUrlLocalFirst } from '@/lib/desktop-fs'
+import {
+  isDesktopFsRemoteMode,
+  isReadFileErrorResult,
+  readDesktopFileDataUrl,
+  readDesktopFileDataUrlLocalFirst
+} from '@/lib/desktop-fs'
 import { type CommandsCatalogLike, filterDesktopCommandsCatalog } from '@/lib/desktop-slash-commands'
-import { isMissingRpcMethod } from '@/lib/gateway-rpc'
 import { isProviderSetupErrorMessage } from '@/lib/provider-setup-errors'
 import type { ComposerAttachment } from '@/store/composer'
-import { $sessions, knownSessionOwner } from '@/store/session'
-import type { SessionOwnerScope } from '@/store/session-request-router'
 
 import { registerRecoveredRuntime, singleFlightSessionResume, takeRecoveredRuntime } from './single-flight-resume'
 
@@ -77,7 +79,6 @@ export class SessionRecoveryAborted extends Error {
 }
 
 export interface SessionRecoveryDeps {
-  owner?: SessionOwnerScope
   requestGateway: GatewayRequest
   /**
    * Owning profile for a stored session. A resume without it lands on
@@ -125,21 +126,17 @@ export async function resumeStoredRuntimeSession(
   // same dead runtime at once, and each independent session.resume mints a new
   // runtime — every loser is an orphan for the reaper. Sharing one in-flight
   // promise makes concurrent recoveries converge on ONE runtime.
-  const owner = deps.owner ?? knownSessionOwner($sessions.get(), storedSessionId)
-  const resolveProfile = deps.resolveProfile ?? defaultResolveProfile
-  const profile = await resolveProfile(storedSessionId)
+  const resumed = await singleFlightSessionResume(storedSessionId, async () => {
+    const resolveProfile = deps.resolveProfile ?? defaultResolveProfile
+    const profile = await resolveProfile(storedSessionId)
 
-  const resumed = await singleFlightSessionResume(
-    storedSessionId,
-    () =>
-      deps.requestGateway<{ session_id: string }>('session.resume', {
-        session_id: storedSessionId,
-        source: 'desktop',
-        omit_messages: true,
-        ...(profile ? { profile } : {})
-      }),
-    owner ?? profile
-  )
+    return deps.requestGateway<{ session_id: string }>('session.resume', {
+      session_id: storedSessionId,
+      source: 'desktop',
+      omit_messages: true,
+      ...(profile ? { profile } : {})
+    })
+  })
 
   return resumed?.session_id ?? null
 }
@@ -168,8 +165,6 @@ export async function withSessionNotFoundResume<T>(
   deps: SessionRecoveryDeps,
   options?: { alsoTimeout?: boolean }
 ): Promise<{ recovered: boolean; result: T; sessionId: string }> {
-  const owner = deps.owner ?? knownSessionOwner($sessions.get(), storedSessionId ?? null)
-
   try {
     return { recovered: false, result: await call(sessionId), sessionId }
   } catch (err) {
@@ -186,14 +181,14 @@ export async function withSessionNotFoundResume<T>(
     // A previous recovery for this stored session already minted a runtime
     // that its caller drift-aborted away from. Reuse it before resuming
     // again — re-minting would strand yet another runtime for the reaper.
-    const cachedRecoveredId = takeRecoveredRuntime(storedSessionId, sessionId, owner)
+    const cachedRecoveredId = takeRecoveredRuntime(storedSessionId, sessionId)
 
     if (cachedRecoveredId) {
       const cachedDrift = deps.driftReason?.()
 
       if (cachedDrift) {
         // Still drifted: keep the runtime findable for whoever acts next.
-        registerRecoveredRuntime(storedSessionId, cachedRecoveredId, owner)
+        registerRecoveredRuntime(storedSessionId, cachedRecoveredId)
         throw new SessionRecoveryAborted(cachedDrift, cachedRecoveredId)
       }
 
@@ -213,7 +208,7 @@ export async function withSessionNotFoundResume<T>(
     let recoveredId: null | string
 
     try {
-      recoveredId = await resumeStoredRuntimeSession(storedSessionId, { ...deps, owner })
+      recoveredId = await resumeStoredRuntimeSession(storedSessionId, deps)
     } catch {
       throw err
     }
@@ -229,7 +224,7 @@ export async function withSessionNotFoundResume<T>(
       // (the user moved on), so record it in the stored->runtime recovery
       // cache. The next action targeting this stored session reuses it
       // instead of minting another orphan (#91276).
-      registerRecoveredRuntime(storedSessionId, recoveredId, owner)
+      registerRecoveredRuntime(storedSessionId, recoveredId)
       throw new SessionRecoveryAborted(drift, recoveredId)
     }
 
@@ -291,6 +286,17 @@ export const SESSION_BUSY_RETRY_INTERVAL_MS = 150
 
 export function isSessionBusyError(error: unknown): boolean {
   return /session busy/i.test(error instanceof Error ? error.message : String(error))
+}
+
+// prompt.submit refused because another surface (TUI, messaging gateway)
+// holds this session's lease (4090 / SESSION_NOT_OWNED, #106217). The gateway
+// stamps the machine reason in `error.data.reason`; the prose fallback covers
+// backends older than that contract. Deterministic until the owner lets go —
+// Retry reproduces it, so the card offers "Start new session" instead.
+export function isSessionNotOwnedError(error: unknown): boolean {
+  const reason = error instanceof JsonRpcGatewayError ? (error.data as { reason?: unknown } | undefined)?.reason : null
+
+  return reason === 'SESSION_NOT_OWNED' || /already has a live owner/i.test(error instanceof Error ? error.message : '')
 }
 
 const sleep = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms))
@@ -421,30 +427,21 @@ export function imageFilenameFromPath(filePath: string): string {
 // not the gateway's, so read the bytes here and upload them via
 // image.attach_bytes. Returns null when the file can't be read.
 //
-// `cachedDataUrl` is the attachment's `previewUrl` when the composer already
-// read the file for the chip thumbnail — that preview is the FULL file as a
-// base64 data URL (attachmentPreviewDataUrl → readFileDataUrl), not a
-// downscaled copy, so reusing it skips a second disk read + IPC round-trip of
-// the same bytes at submit. Only a `;base64,` data URL qualifies; anything
-// else falls through to the disk read.
+// Always re-reads from disk rather than trusting `attachment.previewUrl` as a
+// cache: once a thumbnail is generated, `attachImagePath` keeps only the
+// bounded (≤512px) `thumbnailUrl` and drops `previewUrl` — so a cached
+// `previewUrl` is never guaranteed to be the full-resolution bytes the model
+// needs, and trusting it here would risk silently uploading a downscaled copy.
 export async function readImageForRemoteAttach(
-  filePath: string,
-  cachedDataUrl?: string
+  filePath: string
 ): Promise<{ contentBase64: string; filename: string } | null> {
-  if (cachedDataUrl?.includes(';base64,')) {
-    const cached = base64FromDataUrl(cachedDataUrl)
+  // Local disk first, then the gateway: the web-served build has no bridge readFileDataUrl.
+  const dataUrl = await readDesktopFileDataUrlLocalFirst(filePath)
 
-    if (cached) {
-      return { contentBase64: cached, filename: imageFilenameFromPath(filePath) }
-    }
+  if (isReadFileErrorResult(dataUrl)) {
+    return null
   }
 
-  // readDesktopFileDataUrlLocalFirst, not the raw bridge: it prefers this
-  // machine's disk (picker/clipboard/drop paths) and falls back to the
-  // gateway's /api/fs/read-data-url. The bare bridge call threw
-  // "readFileDataUrl is not a function" in the web build, where the member is
-  // deliberately omitted so the remote read stays in charge.
-  const dataUrl = await readDesktopFileDataUrlLocalFirst(filePath)
   const contentBase64 = dataUrl ? base64FromDataUrl(dataUrl) : ''
 
   return contentBase64 ? { contentBase64, filename: imageFilenameFromPath(filePath) } : null
@@ -454,28 +451,19 @@ export async function readImageForRemoteAttach(
 // when the desktop bridge can't read the file (e.g. it was moved/deleted).
 // Prefer the attach-specific IPC (256 MiB) so remote uploads are not stuck on
 // the preview/Settings default; fall back for older Electron shells.
-//
-// The web build has no local bridge reader at all (window.hermesDesktop never
-// defines readFileDataUrl there — see web-bridge-shim.ts) and a picker/drop
-// path is only ever the GATEWAY's own disk, so fall back to the remote
-// /api/fs/read-data-url facade exactly like image attach does via
-// readDesktopFileDataUrlLocalFirst. A local reader that throws (moved/deleted
-// file) still returns null rather than falling back, matching the previous
-// behavior for Electron.
 export async function readFileDataUrlForAttach(filePath: string): Promise<string | null> {
   const reader = window.hermesDesktop?.readFileDataUrlForAttach ?? window.hermesDesktop?.readFileDataUrl
 
-  if (reader) {
-    const dataUrl = await reader(filePath)
-
-    return dataUrl || null
+  if (!reader) {
+    // Web-served build: no bridge reader, and a picker/drop path is the gateway's own disk.
+    return isDesktopFsRemoteMode() ? (await readDesktopFileDataUrl(filePath)) || null : null
   }
 
-  if (!isDesktopFsRemoteMode()) {
+  const dataUrl = await reader(filePath)
+
+  if (isReadFileErrorResult(dataUrl)) {
     return null
   }
-
-  const dataUrl = await readDesktopFileDataUrl(filePath)
 
   return dataUrl || null
 }
@@ -498,117 +486,6 @@ export function friendlyRemoteAttachError(err: unknown, label: string): Error {
   const cap = Number.isFinite(limitBytes) && limitBytes > 0 ? ` (max ${Math.floor(limitBytes / (1024 * 1024))} MB)` : ''
 
   return new Error(`${label} is too large to upload to the remote gateway${cap}.`)
-}
-
-/**
- * Stage a non-image file attachment on the gateway.
- *
- * Prefers the chunked file.attach_open/_chunk/_commit transport: the
- * renderer drives repeated readFileChunkForAttach + file.attach_chunk calls
- * bounded to ATTACHMENT_CHUNK_BYTES each, so neither Electron main nor this
- * renderer nor the gateway ever holds a whole large file (or its base64
- * expansion) in one buffer/string — the freeze/OOM path t_275f8015 exists to
- * close. Falls back to the whole-file file.attach + data_url transport when
- * the desktop bridge predates readFileChunkForAttach (older Electron shells,
- * or the web-served build, which omits the whole readFileDataUrl/
- * readFileChunkForAttach IPC surface — see web-bridge-shim.ts) OR when the
- * gateway itself predates file.attach_open (backend contract < 7, detected
- * via isMissingRpcMethod on the open call).
- *
- * A session-not-found failure mid-stream re-runs the WHOLE upload against
- * the recovered session (a fresh upload_id — the old one belonged to the now
- * -dead session) rather than resuming from the last acked chunk: session
- * recovery is rare (post sleep/wake) and correctness beats the avoided
- * re-read, whereas the non-streamed path's "read once outside the retry"
- * optimization only ever amortized a single whole-file read to begin with.
- */
-export async function attachFileBytes(
-  filePath: string,
-  label: string,
-  requestGateway: GatewayRequest,
-  liveSessionId: string
-): Promise<FileAttachResponse> {
-  const chunkedReader = window.hermesDesktop?.readFileChunkForAttach
-
-  const wholeFileFallback = async (): Promise<FileAttachResponse> => {
-    const dataUrl = await readFileDataUrlForAttach(filePath)
-
-    if (!dataUrl) {
-      throw new Error(`Could not read ${label}`)
-    }
-
-    return requestGateway<FileAttachResponse>('file.attach', {
-      name: label,
-      path: filePath,
-      session_id: liveSessionId,
-      data_url: dataUrl
-    })
-  }
-
-  if (!chunkedReader) {
-    return wholeFileFallback()
-  }
-
-  let uploadId: string | undefined
-
-  try {
-    const opened = await requestGateway<{ upload_id?: string }>('file.attach_open', { session_id: liveSessionId })
-    uploadId = opened?.upload_id
-  } catch (err) {
-    // Backend predates file.attach_open (DESKTOP_BACKEND_CONTRACT < 7):
-    // fall back to the whole-file transport rather than failing the attach.
-    if (isMissingRpcMethod(err)) {
-      return wholeFileFallback()
-    }
-
-    throw err
-  }
-
-  if (!uploadId) {
-    throw new Error(`Could not start upload for ${label}`)
-  }
-
-  try {
-    let offset = 0
-    let totalBytes = Number.POSITIVE_INFINITY
-
-    while (offset < totalBytes) {
-      const chunk = await chunkedReader(filePath, offset)
-
-      if (!chunk) {
-        throw new Error(`Could not read ${label}`)
-      }
-
-      totalBytes = chunk.totalBytes
-
-      if (chunk.bytesRead > 0) {
-        await requestGateway('file.attach_chunk', {
-          session_id: liveSessionId,
-          upload_id: uploadId,
-          chunk_base64: chunk.base64
-        })
-        offset += chunk.bytesRead
-      } else if (offset < totalBytes) {
-        // Reader reported nothing new before reaching the file's known size —
-        // reading is stuck (shrunk/replaced on disk mid-upload). Bail rather
-        // than spin forever re-requesting the same offset.
-        throw new Error(`Could not read ${label}`)
-      }
-    }
-
-    return await requestGateway<FileAttachResponse>('file.attach_commit', {
-      session_id: liveSessionId,
-      upload_id: uploadId,
-      path: filePath,
-      name: label
-    })
-  } catch (err) {
-    // Best-effort: an abort failure must not mask the real upload error, and
-    // a dead/recovered session (the common trigger) makes the abort itself
-    // fail harmlessly — the gateway's stale-upload reaper cleans it up later.
-    await requestGateway('file.attach_abort', { session_id: liveSessionId, upload_id: uploadId }).catch(() => {})
-    throw err
-  }
 }
 
 export function renderCommandsCatalog(catalog: CommandsCatalogLike, copy: Translations['desktop']): string {
@@ -653,7 +530,7 @@ export function slashStatusText(command: string, output: string): string {
  *   because it needs transcript replacement)
  * - `session.status`:   { output: "<multi-line plain text>" }
  * - `session.save`:     { file: "<absolute path>" }
- * - `session.usage`:    { calls, input, output, total, credits_lines? }
+ * - `session.usage`:    { calls, input, output, total, account_lines?, credits_lines? }
  * - `session.steer`:    { status: 'queued' | 'rejected', text }
  * - `process.stop`:     { killed: boolean }
  * - `agents.list`:      { processes: [{ session_id, command, status, uptime }] }
@@ -712,7 +589,7 @@ export function renderRpcResult(response: unknown, name: string): string {
     return r.output
   }
 
-  // session.usage — { calls, input, output, total, credits_lines? }
+  // session.usage — { calls, input, output, total, account_lines?, credits_lines? }
   if ('total' in r || 'input' in r || 'output' in r || 'calls' in r) {
     const calls = Number(r.calls ?? 0)
     const input = Number(r.input ?? 0)
@@ -723,10 +600,13 @@ export function renderRpcResult(response: unknown, name: string): string {
       `Usage: ${calls.toLocaleString()} calls · ${input.toLocaleString()} in / ${output.toLocaleString()} out · ${total.toLocaleString()} total`
     ]
 
-    if (Array.isArray(r.credits_lines)) {
-      for (const credit of r.credits_lines) {
-        if (typeof credit === 'string' && credit.trim()) {
-          lines.push(credit.trim())
+    // Provider account limits (e.g. Codex quota windows) first, then Nous credits — same order as CLI /usage.
+    for (const extra of [r.account_lines, r.credits_lines]) {
+      if (Array.isArray(extra)) {
+        for (const line of extra) {
+          if (typeof line === 'string' && line.trim()) {
+            lines.push(line.trim())
+          }
         }
       }
     }
@@ -840,6 +720,8 @@ export interface SubmitTextOptions {
    *  (queue drain, steer, external submit requests): the check is a no-op
    *  without it. */
   composerScope?: string | null
+  /** This submit's fresh draft acquired a stored key. Never fired for navigation. */
+  onComposerScopeAssigned?: (scope: string) => void
   /** What the transcript shows for this send, when it differs from the text
    *  the agent receives. A `/skill` invocation expands into the whole skill
    *  body — model-facing scaffolding the UI must never render — so the slash
@@ -849,7 +731,21 @@ export interface SubmitTextOptions {
    *  renders anywhere — the off-screen path for widget intents. The agent
    *  still receives the text as a normal user turn. */
   displayKind?: 'hidden'
+  /** Per-turn client surface the gateway turns into a model-bound note. The
+   *  HUD sets `hud` from its own store; a GPT-Live delegation passes
+   *  `voice-live` (spoken transcript in, speakable prose out). */
+  surface?: 'voice-live'
+  /** With `surface: 'voice-live'`: the recent spoken exchange, appended to the
+   *  model-bound note by the gateway (never persisted, never rendered). */
+  voiceContext?: string
   fromQueue?: boolean
+  /** Called once with the EXACT session identity the backend accepted the
+   *  prompt into — the live runtime id after any stale-runtime recovery, plus
+   *  the durable stored id when the caller knows it. A caller that must prove
+   *  delivery to another surface (Quick Entry) uses this instead of guessing
+   *  from the foreground session. Never called for a rejected or aborted
+   *  submit, and never for slash commands, which never reach prompt.submit. */
+  onAccepted?: (identity: { runtimeSessionId: string; storedSessionId: null | string }) => void
   /** Runtime session id to submit into. Queue drains pass this so a
    *  backgrounded/source session cannot be replaced by the current foreground
    *  session between enqueue and drain. */

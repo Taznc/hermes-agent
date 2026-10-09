@@ -1,12 +1,7 @@
 import type { MutableRefObject } from 'react'
 
 import { pinNewChatProfile } from '@/store/profile'
-import {
-  followActiveSessionCwd,
-  projectProfile,
-  resolveNewSessionCwd,
-  type StartWorkSessionRequest
-} from '@/store/projects'
+import { followActiveSessionCwd, projectProfile, resolveNewSessionCwd } from '@/store/projects'
 import {
   $newChatWorkspaceTargetGeneration,
   type NewChatWorkspaceTarget,
@@ -22,39 +17,6 @@ interface WorkspaceSessionOptions {
   path: null | string
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
   startFreshSessionDraft: (options?: { workspaceTarget: NewChatWorkspaceTarget }) => void
-}
-
-interface ConsumeStartWorkSessionRequestOptions {
-  insertDraft: (draft: string, options: { target: 'active' | 'main' }) => void
-  isCurrent: () => boolean
-  mainChatIsOccupied: boolean
-  openFreshSurface: (path: null | string) => Promise<void>
-  request: StartWorkSessionRequest
-  startMainSurface: (path: null | string) => void
-}
-
-/** Consume the store request at the same boundary the renderer wiring uses.
- * Contextual requests carry `freshSurface`, so an unsent prior draft can never
- * receive the next request's text. */
-export async function consumeStartWorkSessionRequest({
-  insertDraft,
-  isCurrent,
-  mainChatIsOccupied,
-  openFreshSurface,
-  request,
-  startMainSurface
-}: ConsumeStartWorkSessionRequestOptions): Promise<void> {
-  const openedInTab = Boolean(request.freshSurface || (request.openTab && mainChatIsOccupied))
-
-  if (openedInTab) {
-    await openFreshSurface(request.path)
-  } else {
-    startMainSurface(request.path)
-  }
-
-  if (request.draft && isCurrent()) {
-    insertDraft(request.draft, { target: openedInTab ? 'active' : 'main' })
-  }
 }
 
 export function startWorkspaceSession({
@@ -99,7 +61,13 @@ export function startWorkspaceSession({
   const workspaceGeneration = $newChatWorkspaceTargetGeneration.get()
 
   setCurrentCwd(target)
-  void requestGateway<{ branch?: string; cwd?: string }>('config.get', { key: 'project', cwd: target })
+  void requestGateway<{ branch?: string; cwd?: string }>('config.get', {
+    key: 'project',
+    cwd: target,
+    // The project's profile decides its terminal backend: an ssh project dir is not on this host, and
+    // resolving it under the launch profile would normalize it away to the launch cwd.
+    ...(profile ? { profile } : {})
+  })
     .then(info => {
       if ($newChatWorkspaceTargetGeneration.get() !== workspaceGeneration || activeSessionIdRef.current) {
         return

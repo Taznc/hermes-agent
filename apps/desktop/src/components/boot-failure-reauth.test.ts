@@ -7,11 +7,8 @@ import {
   isRemoteConfig,
   isRemoteReauthError,
   isRemoteReauthFailure,
-  isWsAuthRejectedFailure,
   shouldApplyPostBootProgressError,
-  signInLabel,
-  sshFailureMessage,
-  wsAuthRejectedMessage
+  sshFailureMessage
 } from './boot-failure-reauth'
 
 function config(overrides: Partial<DesktopConnectionConfig> = {}): DesktopConnectionConfig {
@@ -109,6 +106,7 @@ describe('isRemoteReauthError', () => {
   it('recognizes auth-shaped boot errors', () => {
     expect(isRemoteReauthError('Your remote gateway session has expired.')).toBe(true)
     expect(isRemoteReauthError('OAuth: please sign in')).toBe(true)
+    expect(isRemoteReauthError('Reached the gateway over HTTP, but the app token is invalid.')).toBe(true)
   })
 
   it('ignores non-auth boot errors and nullish', () => {
@@ -173,38 +171,5 @@ describe('deriveProviderShape', () => {
     expect(deriveProviderShape([{ name: 'basic', displayName: '', supportsPassword: true }]).providerLabel).toBe(
       'basic'
     )
-  })
-})
-
-describe('signInLabel', () => {
-  it('password gateway gets the plain "Sign in to remote gateway" copy', () => {
-    expect(signInLabel({ url: 'x', isPassword: true, providerLabel: 'Username & Password' })).toBe(
-      'Sign in to remote gateway'
-    )
-  })
-
-  it('OAuth gateway names the provider', () => {
-    expect(signInLabel({ url: 'x', isPassword: false, providerLabel: 'Nous Research' })).toBe(
-      'Sign in with Nous Research'
-    )
-  })
-
-  it('null reauth falls back to the generic provider phrase', () => {
-    expect(signInLabel(null)).toBe('Sign in with your identity provider')
-  })
-})
-
-describe('wsAuthRejectedMessage / isWsAuthRejectedFailure', () => {
-  it('round-trips: a message built by wsAuthRejectedMessage is recognized as auth-rejected', () => {
-    const message = wsAuthRejectedMessage('No access token was found for this session.')
-    expect(isWsAuthRejectedFailure(message)).toBe(true)
-  })
-
-  it('does not misclassify the generic gateway-down or reauth-required errors', () => {
-    expect(isWsAuthRejectedFailure('Hermes background process exited during startup.')).toBe(false)
-    expect(isWsAuthRejectedFailure('Your remote gateway session has expired.')).toBe(false)
-    expect(isWsAuthRejectedFailure('Could not connect to Hermes gateway')).toBe(false)
-    expect(isWsAuthRejectedFailure(null)).toBe(false)
-    expect(isWsAuthRejectedFailure(undefined)).toBe(false)
   })
 })

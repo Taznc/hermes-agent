@@ -1,14 +1,11 @@
-import { Component, type ErrorInfo, type ReactNode, useState } from 'react'
+import { Component, type ErrorInfo, type ReactNode } from 'react'
 
 import { Button } from '@/components/ui/button'
-import { writeClipboardText } from '@/components/ui/copy-button'
 import { ErrorState } from '@/components/ui/error-state'
 import { useI18n } from '@/i18n'
-import { performWebReload } from '@/store/web-reload'
+import { requestSendDiagnostics } from '@/store/send-diagnostics'
 
 export interface ErrorBoundaryFallbackProps {
-  /** React component stack for the caught error, when the boundary captured one. */
-  componentStack?: string
   error: Error
   reset: () => void
 }
@@ -21,7 +18,6 @@ interface ErrorBoundaryProps {
 }
 
 interface ErrorBoundaryState {
-  componentStack?: string
   error: Error | null
 }
 
@@ -29,10 +25,18 @@ interface ErrorBoundaryState {
 // the root. Retry only that exact transient error class, never arbitrary render
 // failures, and cap retries so a persistent failure still exposes the fallback.
 const ASSISTANT_UI_LOOKUP_ERROR = /(useClientLookup|tapClient(Lookup|Resource)).*out of bounds/
+// Vendor React throws this when portal teardown races a host subtree swap
+// (Radix menus/dialogs unmounting mid-commit — #98654, also seen in #41693).
+// The fiber graph settles once the swap completes, so a scheduled re-render
+// self-heals. Unlike the assistant-ui class, the throw comes from React
+// itself inside whatever boundary hosts the portal, so every boundary — not
+// just the root — gets the same capped recovery.
+const PORTAL_UNMOUNT_ERROR = /^Tried to unmount a fiber (?:that is already|that was not) unmounted/u
 const MAX_AUTO_RECOVERIES = 3
 const AUTO_RECOVERY_WINDOW_MS = 5_000
 
 const isTransientAssistantUiLookupError = (error: Error): boolean => ASSISTANT_UI_LOOKUP_ERROR.test(error.message)
+const isTransientPortalUnmountError = (error: Error): boolean => PORTAL_UNMOUNT_ERROR.test(error.message)
 
 export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundaryState> {
   state: ErrorBoundaryState = { error: null }
@@ -59,10 +63,6 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     const tag = label ? `[error-boundary:${label}]` : '[error-boundary]'
     console.error(tag, error, info.componentStack)
 
-    // Kept in state so the fallback's Copy action can hand over the component
-    // stack too — the console copy is unreachable for a non-devtools user.
-    this.setState({ componentStack: info.componentStack ?? undefined })
-
     // Persist to desktop.log via Electron (#79428): console.error only reaches
     // the main process for windows with a console hook, is minified, and loses
     // the component stack. This survives the window and names the component.
@@ -79,8 +79,12 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
 
     this.props.onError?.(error, info)
 
-    if (this.props.label === 'root' && isTransientAssistantUiLookupError(error) && this.takeAutoRecoveryAttempt()) {
-      console.warn(`${tag} auto-recovering from assistant-ui lookup render race`, error.message)
+    const assistantUiLookupRace = this.props.label === 'root' && isTransientAssistantUiLookupError(error)
+    const portalTeardownRace = isTransientPortalUnmountError(error)
+
+    if ((assistantUiLookupRace || portalTeardownRace) && this.takeAutoRecoveryAttempt()) {
+      const race = portalTeardownRace ? 'portal teardown' : 'assistant-ui lookup'
+      console.warn(`${tag} auto-recovering from ${race} render race`, error.message)
       this.autoRecoveryPending = true
       this.scheduleAutoRecovery()
     }
@@ -95,7 +99,7 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
     this.autoRecoveryPending = false
     this.autoRecoveryCount = 0
     this.autoRecoveryWindowStart = 0
-    this.setState({ componentStack: undefined, error: null })
+    this.setState({ error: null })
   }
 
   private takeAutoRecoveryAttempt(): boolean {
@@ -126,21 +130,21 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   private autoRecover = () => {
     this.autoRecoveryTimer = null
     this.autoRecoveryPending = false
-    this.setState({ componentStack: undefined, error: null })
+    this.setState({ error: null })
   }
 
   render() {
-    const { componentStack, error } = this.state
+    const { error } = this.state
 
     if (!error) {
       return this.props.children
     }
 
     if (this.props.fallback) {
-      return this.props.fallback({ componentStack, error, reset: this.reset })
+      return this.props.fallback({ error, reset: this.reset })
     }
 
-    return <RootErrorFallback componentStack={componentStack} error={error} reset={this.reset} />
+    return <RootErrorFallback error={error} reset={this.reset} />
   }
 }
 
@@ -148,70 +152,12 @@ export function RootErrorBoundary({ children }: { children: ReactNode }) {
   return <ErrorBoundary label="root">{children}</ErrorBoundary>
 }
 
-function RootErrorFallback({ componentStack, error, reset }: ErrorBoundaryFallbackProps) {
+function RootErrorFallback({ error, reset }: ErrorBoundaryFallbackProps) {
   const { t } = useI18n()
-  // The toast host (NotificationStack) lives INSIDE <App/>, which this fallback
-  // has replaced — notifyError() here would push into a store nobody renders,
-  // so failures have to be reported inline or they are silently swallowed.
-  const [logStatus, setLogStatus] = useState<string | null>(null)
-  const [logLines, setLogLines] = useState<string[] | null>(null)
-  const [copyStatus, setCopyStatus] = useState<'copied' | 'error' | 'idle'>('idle')
-
-  const details = [error.message || t.errors.boundaryDesc, error.stack ?? '', componentStack ?? '']
-    .filter(Boolean)
-    .join('\n\n')
-
-  const copyDetails = () => {
-    void writeClipboardText(details)
-      .then(() => setCopyStatus('copied'))
-      .catch(() => setCopyStatus('error'))
-  }
-
-  // Electron reveals the folder; the web build has no host filesystem to open,
-  // so fall back to reading the tail of the log INTO the page. Either way the
-  // outcome is stated on screen instead of vanishing into a dead toast store.
-  const openLogs = () => {
-    setLogStatus(null)
-    setLogLines(null)
-
-    const bridge = window.hermesDesktop
-
-    if (!bridge?.revealLogs) {
-      setLogStatus(t.errors.openLogsFailed)
-
-      return
-    }
-
-    void bridge
-      .revealLogs()
-      .then(result => {
-        if (result?.ok) {
-          setLogStatus(result.path || null)
-
-          return
-        }
-
-        return Promise.resolve(bridge.getRecentLogs?.())
-          .then(recent => {
-            const lines = recent?.lines ?? []
-
-            if (lines.length > 0) {
-              setLogLines(lines.slice(-200))
-              setLogStatus(recent?.path ?? null)
-
-              return
-            }
-
-            setLogStatus(result?.error || t.errors.openLogsFailed)
-          })
-          .catch(() => setLogStatus(result?.error || t.errors.openLogsFailed))
-      })
-      .catch(err => setLogStatus(err instanceof Error ? err.message : t.errors.openLogsFailed))
-  }
 
   return (
     <div
-      className="fixed inset-0 z-(--z-crash) grid place-items-center overflow-auto bg-(--ui-chat-surface-background) p-6"
+      className="fixed inset-0 z-(--z-crash) grid place-items-center bg-(--ui-chat-surface-background) p-6"
       // Masks a crashed app — must stay filled under window glass. Contract:
       // `[data-glass-opaque]` in styles.css.
       data-glass-opaque=""
@@ -219,48 +165,32 @@ function RootErrorFallback({ componentStack, error, reset }: ErrorBoundaryFallba
       <ErrorState
         className="w-full max-w-[28rem]"
         description={
-          // body sets `user-select: none` app-wide; without this the user
-          // cannot select or copy the one string that identifies the crash.
-          <p
-            className="max-w-prose text-center text-sm leading-5 whitespace-pre-wrap text-muted-foreground"
-            data-selectable-text="true"
-          >
-            {error.message || t.errors.boundaryDesc}
-          </p>
+          <>
+            {t.errors.boundaryDesc}
+            {error.message ? (
+              <details className="mt-2 text-left text-xs text-muted-foreground">
+                <summary className="cursor-pointer select-none text-center">{t.errors.boundaryDetails}</summary>
+                <pre className="mt-1 max-h-32 overflow-auto whitespace-pre-wrap wrap-break-word font-mono text-[0.6875rem]">
+                  {error.message}
+                </pre>
+              </details>
+            ) : null}
+          </>
         }
         title={t.errors.boundaryTitle}
       >
         <Button className="font-semibold" onClick={reset} size="lg">
           {t.common.retry}
         </Button>
-        <Button onClick={copyDetails} variant="text">
-          {copyStatus === 'copied'
-            ? t.common.copied
-            : copyStatus === 'error'
-              ? t.common.copyFailed
-              : t.common.copy}
-        </Button>
-        <Button onClick={() => performWebReload()} variant="text">
+        <Button onClick={() => window.location.reload()} variant="text">
           {t.errors.reloadWindow}
         </Button>
-        <Button onClick={openLogs} variant="text">
+        <Button onClick={() => void window.hermesDesktop?.revealLogs()?.catch(() => undefined)} variant="text">
           {t.errors.openLogs}
         </Button>
-
-        {logStatus && (
-          <p className="text-center text-xs break-words text-muted-foreground" data-selectable-text="true">
-            {logStatus}
-          </p>
-        )}
-
-        {logLines && (
-          <pre
-            className="max-h-64 overflow-auto rounded-md bg-black/20 p-2 text-left text-xs whitespace-pre-wrap"
-            data-selectable-text="true"
-          >
-            {logLines.join('\n')}
-          </pre>
-        )}
+        <Button onClick={() => requestSendDiagnostics(error.stack || error.message)} variant="text">
+          {t.errors.sendDiagnostics}
+        </Button>
       </ErrorState>
     </div>
   )

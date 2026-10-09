@@ -41,64 +41,12 @@
  */
 
 import { getApiRequestProfile } from '@/api/client'
-import { markWebReloadPending, registerNativeWebReload } from '@/store/web-reload'
 
-import { type AgentOverview, createAgentOverviewReader } from '../electron/agent-overview'
-
-import type { DesktopMarketplaceThemeResult } from './global'
+// >>> FORK ANCHOR: web-desktop-plugin-removal <<<
+import { createWebDesktopPluginRemoval } from './fork/web-desktop-plugin-removal'
+// <<< FORK ANCHOR >>>
+import type { DesktopBootstrapState, DesktopMarketplaceThemeResult } from './global'
 import { extractVsixThemes } from './lib/vsix-archive'
-
-// ── HMR full-reload trap (DEV only) ─────────────────────────────────────────
-// Vite's built-in HMR client calls window.location.reload() directly whenever
-// an edited module can't Fast Refresh (any file that also exports a
-// non-component value — a store, an i18n locale file, a helper) and again on
-// dev-server WebSocket reconnect. `vite:beforeFullReload` listeners cannot
-// cancel that call — Vite notifies them and proceeds regardless — so the only
-// real interception point is the browser API itself. Capture the native
-// reload first (the "Refresh" statusbar item calls it back), then replace
-// `location.reload` with a flag flip. Gated on DEV so this never ships in a
-// production web build. See docs/web-ui-hard-refresh-diagnosis.md.
-//
-// This module itself gets RE-EVALUATED by Vite's own HMR (it's imported by
-// index-web.html, and an edit anywhere upstream of it can trigger a fresh
-// module graph load without a real page navigation). A second evaluation
-// must not repeat the install:
-//   1. `Object.defineProperty(window.location, 'reload', ...)` can throw
-//      `TypeError: Cannot redefine property: reload` — some environments
-//      expose `reload` as a non-configurable own property, and even a
-//      `configurable: true` redefinition attempt on top of an existing
-//      non-configurable descriptor is rejected. That throw happens BEFORE
-//      `window.hermesDesktop = shim` runs at the bottom of this file, so an
-//      unguarded throw here takes down the entire shim — every
-//      `window.hermesDesktop?.xxx()` call site then reads `undefined` and
-//      the app renders as fully crashed, which is strictly worse than the
-//      individual reload call sites this trap is meant to fix.
-//   2. Even when it doesn't throw, re-running `registerNativeWebReload`
-//      would capture our OWN flag-flip function as "native" (since the
-//      first pass already replaced `window.location.reload`), permanently
-//      losing the real native reload the "Refresh" button depends on.
-// A `window`-level flag (surviving across a fresh module instance, unlike a
-// module-scoped variable) plus a try/catch guards both failure modes: if
-// installation ever fails, native `reload()` is left alone for this session
-// — HMR full-reloads act as they did before this whole feature (immediate,
-// ungated hard refresh) rather than crashing the app.
-const RELOAD_TRAP_FLAG = '__hermesWebReloadTrapInstalled'
-
-if (import.meta.env.DEV && !(window as unknown as Record<string, unknown>)[RELOAD_TRAP_FLAG]) {
-  try {
-    registerNativeWebReload(window.location.reload.bind(window.location))
-    Object.defineProperty(window.location, 'reload', {
-      configurable: true,
-      value: () => markWebReloadPending()
-    })
-    ;(window as unknown as Record<string, unknown>)[RELOAD_TRAP_FLAG] = true
-  } catch (err) {
-    console.warn(
-      '[web-bridge-shim] could not trap window.location.reload; HMR full-reloads will navigate directly this session',
-      err
-    )
-  }
-}
 
 // Self-contained minimal types (structural subsets of src/global.d.ts shapes;
 // kept local so the shim never affects the app's module graph).
@@ -132,8 +80,8 @@ interface SpikeReadFileTextResult {
   truncated?: boolean
 }
 
-// Wire shapes of /api/dashboard/plugins/probe and
-// /api/dashboard/desktop-plugins/install. Deliberately identical to
+// Wire shapes of the fork-web-desktop-bridge plugin's probe and desktop-install
+// routes. Deliberately identical to
 // PluginProbeResult / DesktopPluginInstallResult in global.d.ts (and to what
 // electron/desktop-plugin-install.ts returns) so the backend response is
 // handed to the renderer verbatim with no translation layer to drift.
@@ -330,47 +278,6 @@ function pickBrowserFiles(options?: { multiple?: boolean; filters?: Array<{ exte
     document.body.appendChild(input)
     input.click()
   })
-}
-
-// One backend: the same-origin `hermes serve` this shim's api() helper talks
-// to. `pooled` is pre-populated with a single non-empty descriptor array so
-// collectAgentOverview() short-circuits both the `connect()` round-trip and
-// the on-demand `discoverParked` branch — there's nothing to discover, this
-// IS the backend. The reader instance (and its internal 60s history cache)
-// is created once per module evaluation, mirroring Electron's module-scoped
-// `readAgentOverview` singleton in electron/main.ts.
-const AGENT_OVERVIEW_SOURCE = { id: 'web', label: 'This backend', kind: 'local' } as const
-const AGENT_OVERVIEW_POOLED = new Map<string, string[]>([[AGENT_OVERVIEW_SOURCE.id, ['web']]])
-const readAgentOverview = createAgentOverviewReader<string>()
-
-async function getAgentOverview(options?: { force?: boolean }): Promise<AgentOverview> {
-  const overview = await readAgentOverview(
-    {
-      sources: [AGENT_OVERVIEW_SOURCE],
-      pooled: AGENT_OVERVIEW_POOLED,
-      connect: async () => [],
-      fetch: (_descriptor, path) => api({ path })
-    },
-    { force: options?.force }
-  )
-
-  const [source] = overview.sources
-
-  // collectAgentOverview() folds every per-descriptor failure into a
-  // resolved, degraded source (state/errors) instead of rejecting — correct
-  // for Electron, where a multi-source overview must keep painting sources
-  // that DID answer. This shim has exactly one source, so when that source
-  // is 'offline' (never obtained any history: non-2xx, a rejected fetch, or
-  // the collector's own per-source budget expiring) there is nothing else to
-  // show. Reject so store/agent-overview.ts's existing ErrorState path
-  // fires, instead of the renderer painting a false "All quiet". Genuine
-  // partial/compatibility states ('partial', 'unsupported', 'on-demand')
-  // keep resolving, matching Electron's degraded-but-nonempty behavior.
-  if (source?.state === 'offline') {
-    throw new Error(source.error ?? source.errors[0]?.error ?? 'Agent overview backend unavailable.')
-  }
-
-  return overview
 }
 
 function connection(profile?: string | null) {
@@ -788,6 +695,23 @@ async function saveGatewayFile(
   return { saved: true }
 }
 
+// A non-2xx answer from api(). Same message as the plain Error it replaces
+// (callers and toasts see identical text); `status` lets bridge members tell
+// "route not mounted" (404) apart from a real failure without parsing it.
+class HermesApiStatusError extends Error {
+  readonly status: number
+
+  constructor(path: string, status: number) {
+    super(`Hermes API ${path} failed: ${status}`)
+    this.name = 'HermesApiStatusError'
+    this.status = status
+  }
+}
+
+function isApiStatus(error: unknown, status: number): boolean {
+  return error instanceof HermesApiStatusError && error.status === status
+}
+
 async function api<T>(request: SpikeApiRequest, responseType: 'json' | 'response' = 'json'): Promise<T> {
   const url = new URL(request.path, BASE_URL)
 
@@ -835,7 +759,7 @@ async function api<T>(request: SpikeApiRequest, responseType: 'json' | 'response
       credentials: 'include'
     })
 
-    if (!res.ok) {throw new Error(`Hermes API ${request.path} failed: ${res.status}`)}
+    if (!res.ok) {throw new HermesApiStatusError(request.path, res.status)}
 
     if (responseType === 'response') {
       return res as T
@@ -848,6 +772,141 @@ async function api<T>(request: SpikeApiRequest, responseType: 'json' | 'response
     clearTimeout(timer)
   }
 }
+
+// ── Desktop-plugin door ─────────────────────────────────────────────────────
+// Electron answers these five members from its main process (electron/fs-ipc.ts
+// + electron/desktop-plugin-install.ts). A browser tab has no main process, so
+// they proxy to the opt-in `fork-web-desktop-bridge` backend plugin:
+//   GET  desktop-plugins-root / agent-plugins-root  -> { path }
+//   GET  read-plugin-source?path=                    -> HermesReadFileTextResult
+//   POST probe { identifier }                        -> PluginProbeResult
+//   POST desktop-install { identifier, force }       -> DesktopPluginInstallResult
+// all under /api/plugins/fork-web-desktop-bridge/, token-gated like every /api route
+// (api() carries the session token and the 30s timeout ceiling).
+//
+// The plugin is opt-in, so every member must survive a backend that does not
+// mount these routes (plugin disabled, or an older backend) — a 404 — without
+// throwing into a caller that has no catch and without a request storm:
+//  - desktopPluginsRoot/agentPluginsRoot resolve to '' — the "no root" value
+//    contrib/runtime-loader.ts's diskRoots() and the onboarding runbook already
+//    treat as absent. They never reject (onboarding/setup-profile.ts awaits
+//    desktopPluginsRoot() with no catch). A 404 latches `bridgeAbsent` for the
+//    page's lifetime so the loader's 5s poll stops re-requesting a route that
+//    is not there; any later successful bridge call (e.g. a probe after the
+//    user enabled the plugin) clears it.
+//  - probePluginRepo/installDesktopPlugin resolve to `{ ok: false, error }`,
+//    matching the IPC handlers: plugin-install-modal.tsx calls both with no
+//    catch, so a rejection would strand the dialog in its probing state.
+//  - readPluginSource DOES reject on any non-2xx (403 outside the plugin
+//    roots, 404 missing, 413 over 16 MiB): the loader must see a real failure,
+//    never a partial or empty source to evaluate.
+//
+// Profile: desktopPluginsRoot and installDesktopPlugin deliberately send NO
+// profile. Electron's desktop-plugin root is app-level ("a desktop plugin
+// extends this app, not an agent" — fs-ipc.ts), and the install target must
+// be the very root the scan reads. agentPluginsRoot IS profile-scoped in
+// Electron (<HERMES_HOME>/profiles/<p>/plugins), so it carries the active
+// request profile like the shim's other profile-scoped calls.
+const BRIDGE_API = '/api/plugins/fork-web-desktop-bridge'
+const BRIDGE_NOT_ENABLED = 'The fork-web-desktop-bridge plugin is not enabled on this backend.'
+
+// Git clone + validation server-side budgets ~60s; the 30s api() default would
+// abort a legitimate slow clone first.
+const BRIDGE_GIT_TIMEOUT_MS = 90_000
+
+let bridgeAbsent = false
+let bridgeRootWarned = false
+
+interface SpikePathResult {
+  path?: unknown
+}
+
+async function bridgePluginsRoot(route: string, scope: { profile?: string }): Promise<string> {
+  if (bridgeAbsent) {
+    return ''
+  }
+
+  try {
+    const result = await api<SpikePathResult | undefined>({ path: `${BRIDGE_API}/${route}`, ...scope })
+    bridgeAbsent = false
+
+    return typeof result?.path === 'string' ? result.path : ''
+  } catch (error) {
+    if (isApiStatus(error, 404)) {
+      bridgeAbsent = true
+    } else if (!bridgeRootWarned) {
+      // Transient (5xx, timeout, offline): '' this pass, the next poll retries.
+      // Warn once, not on every 5s tick.
+      bridgeRootWarned = true
+      console.warn(`[web-bridge-shim] ${route} unavailable; on-disk desktop plugins skipped`, error)
+    }
+
+    return ''
+  }
+}
+
+const desktopPluginsRoot = (): Promise<string> => bridgePluginsRoot('desktop-plugins-root', {})
+
+const agentPluginsRoot = (): Promise<string> => bridgePluginsRoot('agent-plugins-root', activeProfileScope())
+
+// Rejects on every non-2xx (see above): api() throws HermesApiStatusError, so
+// a 413/403/404 reaches the loader as a real failure with `status` attached.
+const readPluginSource = (filePath: string): Promise<SpikeReadFileTextResult> =>
+  api<SpikeReadFileTextResult>({ path: `${BRIDGE_API}/read-plugin-source?path=${encodeURIComponent(filePath)}` })
+
+function bridgeFailureMessage(error: unknown): string {
+  if (isApiStatus(error, 404)) {
+    return BRIDGE_NOT_ENABLED
+  }
+
+  return error instanceof Error ? error.message : String(error)
+}
+
+function pluginIdentifier(payload: { identifier?: string; repo?: string } | undefined): string {
+  return String(payload?.identifier || payload?.repo || '').trim()
+}
+
+const probePluginRepo = async (payload: { identifier?: string; repo?: string }): Promise<SpikePluginProbeResult> => {
+  try {
+    const result = await api<SpikePluginProbeResult>({
+      path: `${BRIDGE_API}/probe`,
+      method: 'POST',
+      body: { identifier: pluginIdentifier(payload) },
+      timeoutMs: BRIDGE_GIT_TIMEOUT_MS
+    })
+
+    bridgeAbsent = false
+
+    return { ...result, warnings: result.warnings ?? [] }
+  } catch (error) {
+    return { ok: false, agent: false, desktop: false, warnings: [], error: bridgeFailureMessage(error) }
+  }
+}
+
+const installDesktopPlugin = async (payload: {
+  identifier?: string
+  repo?: string
+  force?: boolean
+}): Promise<SpikeDesktopPluginInstallResult> => {
+  try {
+    const result = await api<SpikeDesktopPluginInstallResult>({
+      path: `${BRIDGE_API}/desktop-install`,
+      method: 'POST',
+      body: { identifier: pluginIdentifier(payload), force: Boolean(payload?.force) },
+      timeoutMs: BRIDGE_GIT_TIMEOUT_MS
+    })
+
+    bridgeAbsent = false
+
+    return result
+  } catch (error) {
+    return { ok: false, error: bridgeFailureMessage(error) }
+  }
+}
+
+// >>> FORK ANCHOR: web-desktop-plugin-removal <<<
+const removeDesktopPlugin = createWebDesktopPluginRemoval(api, BRIDGE_API, bridgeFailureMessage)
+// <<< FORK ANCHOR >>>
 
 // ── OS/browser notifications ────────────────────────────────────────────────
 // Electron's real bridge shows notifications via `new Notification()` in the
@@ -1106,108 +1165,31 @@ const shim = {
     set: async (name: string | null) => ({ profile: name })
   },
 
-  // Sessions/agents overview (Agents → Sessions tab). Single-backend web
-  // build: one source (`AGENT_OVERVIEW_SOURCE`), the same-origin server
-  // this shim already talks to via api(). Reuses the pure collector from
-  // electron/agent-overview.ts — same pagination, 60s history cache, and
-  // missingCapability() 404/405/501 fallback Electron's IPC handler uses.
-  getAgentOverview,
-
   // ── data layer ───────────────────────────────────────────────────────────
   api,
 
   // ── gateway file download (file-tree "Download" context-menu item) ──────
   saveGatewayFile,
 
-  // ── disk-plugin door (proxied over /api/fs/*) ───────────────────────────
-  // contrib/runtime-loader.ts's diskRoots() calls desktopPluginsRoot()/
-  // agentPluginsRoot() to discover the two on-disk plugin scan roots
-  // (<hermes home>/desktop-plugins/*, <hermes home>/plugins/*/desktop/) and
-  // then readDir()/readPluginSource() (readFileText() on older shells) to
-  // walk and load them. Without these members diskRoots() short-circuits to
-  // [] and NO on-disk plugin — including account-limits — ever loads in this
-  // build. There's no Electron main process here to resolve <hermes home> or
-  // touch the filesystem directly, so every member proxies through the
-  // backend's /api/fs/* gateway REST routes, the same seam desktop-fs.ts's
-  // remote-mode branch already uses for the editor/preview file surfaces.
-  desktopPluginsRoot: async () =>
-    (await api<{ path: string }>({ path: '/api/fs/desktop-plugins-root', ...activeProfileScope() })).path,
-  agentPluginsRoot: async () =>
-    (await api<{ path: string }>({ path: '/api/fs/agent-plugins-root', ...activeProfileScope() })).path,
+  // ── on-disk file reads (proxied over /api/fs/*) ─────────────────────────
   readDir: async (dirPath: string) =>
     api<SpikeReadDirResult>({ path: `/api/fs/list?path=${encodeURIComponent(dirPath)}` }),
   readFileText: async (filePath: string) =>
     api<SpikeReadFileTextResult>({ path: `/api/fs/read-text?path=${encodeURIComponent(filePath)}` }),
-  // Full-source, non-truncating read — runtime-loader.ts prefers this over
-  // readFileText for evaluating plugin.js (readFileText silently truncates at
-  // 512 KiB, which would evaluate half a module).
-  readPluginSource: async (filePath: string) =>
-    api<SpikeReadFileTextResult>({ path: `/api/fs/read-plugin-source?path=${encodeURIComponent(filePath)}` }),
 
-  // ── plugin install door (proxied over /api/dashboard/*) ─────────────────
-  // Electron resolves these in its main process (electron/fs-ipc.ts ->
-  // electron/desktop-plugin-install.ts): clone a repo to a temp dir, report
-  // which halves it carries, and copy the desktop half into
-  // <hermes home>/desktop-plugins/<name>. There is no main process here, so
-  // both proxy to backend routes that do the same work server-side and
-  // return the same camelCase shapes global.d.ts declares.
-  //
-  // Without them PluginInstallModal degrades to its probeUnavailable /
-  // desktopUnavailable copy — honest, but the desktop half of a plugin
-  // cannot be installed from this build at all.
-  //
-  // Failures resolve to `{ok: false, error}` instead of rejecting, matching
-  // the IPC handlers: the modal calls both members without a catch, so a
-  // rejection would strand the dialog in its probing state and surface as an
-  // unhandled rejection rather than as visible copy.
-  //
-  // 90s budget: the backend's own git clone budgets 60s, so the shim's 30s
-  // default ceiling would abort a legitimate slow clone before it finished.
-  // The probe only clones to a temp dir and reads its shape — it touches no
-  // HERMES_HOME, so it is deliberately NOT profile-scoped. The install below
-  // is.
-  probePluginRepo: async (payload: { identifier?: string; repo?: string }) => {
-    const identifier = payload.identifier ?? payload.repo ?? ''
-
-    try {
-      return await api<SpikePluginProbeResult>({
-        path: '/api/dashboard/plugins/probe',
-        method: 'POST',
-        body: { identifier },
-        timeoutMs: 90_000
-      })
-    } catch (error) {
-      return {
-        ok: false,
-        agent: false,
-        desktop: false,
-        warnings: [] as string[],
-        insecure: false,
-        error: error instanceof Error ? error.message : String(error)
-      }
-    }
-  },
-  installDesktopPlugin: async (payload: { identifier?: string; repo?: string; force?: boolean }) => {
-    const identifier = payload.identifier ?? payload.repo ?? ''
-
-    try {
-      return await api<SpikeDesktopPluginInstallResult>({
-        path: '/api/dashboard/desktop-plugins/install',
-        method: 'POST',
-        body: { identifier, force: Boolean(payload.force) },
-        // The install writes into <HERMES_HOME>/desktop-plugins, and the scan
-        // that runs straight after it (discoverRuntimePlugins ->
-        // desktopPluginsRoot above) is profile-scoped too. Omitting the
-        // profile here would install into the serving process's own home
-        // while the scan looked in profiles/<name>/ — the plugin would appear
-        // to install and then never load.
-        ...activeProfileScope(),
-        timeoutMs: 90_000
-      })
-    } catch (error) {
-      return { ok: false, error: error instanceof Error ? error.message : String(error) }
-    }
-  },
+  // ── desktop-plugin door (fork-web-desktop-bridge backend plugin) ─────────────
+  // desktopPluginsRoot / agentPluginsRoot / readPluginSource and the
+  // probePluginRepo / installDesktopPlugin install door. See the
+  // "Desktop-plugin door" block above for the routes and how each member
+  // degrades when the opt-in backend plugin is not enabled.
+  desktopPluginsRoot,
+  agentPluginsRoot,
+  readPluginSource,
+  probePluginRepo,
+  installDesktopPlugin,
+  // >>> FORK ANCHOR: web-desktop-plugin-removal <<<
+  removeDesktopPlugin,
+  // <<< FORK ANCHOR >>>
 
   // ── first-render adjacents ───────────────────────────────────────────────
   onPreviewFileChanged: unsub,
@@ -1228,6 +1210,27 @@ const shim = {
   getRecentLogs: async () => ({ path: '(web spike: no desktop.log)', lines: [] as string[] }),
   revealLogs: async () => ({ ok: false, path: '', error: 'not available in the web spike' }),
   reportRendererError: (_report: unknown) => {},
+  // Same shape of bug, two more members: boot-failure-overlay's bundled-install
+  // probe (`?.getBootstrapState()`) and its Retry/sign-in paths
+  // (`?.resetBootstrap()`). Both are OBJECT-chained, so once boot fails —
+  // e.g. the WebSocket is refused because the tab has no session token yet —
+  // the overlay meant to SHOW the failure threw "getBootstrapState is not a
+  // function" into the error boundary instead. The install overlay stays
+  // gated by `onBootstrapEvent`, which must remain omitted; these two do not
+  // reopen it. An inert snapshot: no bootstrap ever ran in the web build.
+  getBootstrapState: async (): Promise<DesktopBootstrapState> => ({
+    active: false,
+    manifest: null,
+    stages: {},
+    error: null,
+    log: [],
+    startedAt: null,
+    completedAt: null,
+    setupChoice: null,
+    unsupportedPlatform: null,
+    bundled: false
+  }),
+  resetBootstrap: async () => ({ ok: true }),
 
   // ── updates namespace ────────────────────────────────────────────────────
   // Present so startUpdatePoller() (store/updates.ts) runs: it's the only
@@ -1369,6 +1372,27 @@ const shim = {
   oauthLoginConnectionConfig: async (_remoteUrl: string): Promise<never> => {
     throw new Error('OAuth sign-in is not available in the web build')
   },
+  oauthLogoutConnectionConfig: async (_remoteUrl: string): Promise<never> => {
+    throw new Error('OAuth sign-out is not available in the web build')
+  },
+  // The remote-setup form (use-remote-probe / use-remote-connection-test)
+  // calls these on the object. Answer with the documented "not reachable"
+  // shapes so the form shows an honest inline error instead of throwing
+  // "... is not a function": a browser tab cannot dial or register a second
+  // gateway — the one it talks to is fixed by the server that served it.
+  probeConnectionConfig: async (remoteUrl: string) => ({
+    baseUrl: remoteUrl,
+    reachable: false,
+    authMode: 'unknown' as const,
+    providers: [] as never[],
+    version: null,
+    error: 'Connecting to another gateway is not available in the web build'
+  }),
+  testConnectionConfig: async (_payload: unknown) => ({
+    ok: false,
+    reachable: false,
+    error: 'Connecting to another gateway is not available in the web build'
+  }),
 
   getVersion: async () => {
     // Injected by vite.config.web.ts `define` (real git provenance of the
@@ -1413,12 +1437,14 @@ const shim = {
   localModelsEnabled: false
 
   // OMITTED ON PURPOSE (consumers optional-chained/feature-gated): terminal,
-  // git, petOverlay, hud, quickEntry, wakeIndicator, zoom, updates, uninstall,
-  // installDesktopPlugin, probePluginRepo,
+  // git, petOverlay, hud, quickEntry, wakeIndicator, zoom, uninstall,
+  // introReveal, minimizeToTray, getConnectionFor,
   // mcpOauth (browser popup fallback lives in lib/mcp-dashboard-oauth.ts
   // instead — no loopback listener possible from a tab), cloud, connections,
-  // settings, findInPage*, getBootstrapState/onBootstrapEvent (must stay
-  // omitted TOGETHER), readFileDataUrl, openSessionWindow/openWindow,
+  // settings, findInPage*, onBootstrapEvent (the install overlay's sentinel —
+  // getBootstrapState/resetBootstrap are present as inert stubs above because
+  // the boot-FAILURE overlay object-chains them; the install overlay itself
+  // still bails on the missing onBootstrapEvent), readFileDataUrl, openSessionWindow/openWindow,
   // writeClipboard, setActiveWork, setTranslucency, battery,
   // watchPreviewFile/watchDirectory/stopPreviewFileWatch, contextMenu*, and
   // the REMAINING oauth*/ssh*/connection-config surfaces (getConnectionConfig
@@ -1437,7 +1463,12 @@ const shim = {
   // and hands folder-churn detection to runtime-loader.ts's 5s poll fallback
   // instead of a push notification; disk plugins (account-limits included)
   // still discover and load correctly on the initial scan/poll via
-  // desktopPluginsRoot/agentPluginsRoot + readDir/readPluginSource above.
+  // desktopPluginsRoot/agentPluginsRoot + readDir/readPluginSource above —
+  // when the fork-web-desktop-bridge backend plugin is enabled. Without it those
+  // members answer '' / { ok: false } (see the "Desktop-plugin door" block)
+  // and the disk door stays empty, as before. reconcileDesktopPlugins and
+  // openDir remain omitted: the bridge plugin serves no route for them and
+  // every caller optional-chains the method.
 }
 
 ;(window as unknown as { hermesDesktop: unknown }).hermesDesktop = shim

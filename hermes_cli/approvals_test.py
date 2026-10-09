@@ -66,6 +66,11 @@ def evaluate_command(command: str, env_type: str = "local") -> dict:
                     "the runtime skips all command guards for it except approvals.deny"),
         )
 
+    # >>> FORK ANCHOR: lifecycle-consent <<<
+    from hermes_fork.lifecycle_consent import dry_run_verdict as _fork_lifecycle_verdict
+    if (_fork_lifecycle := _fork_lifecycle_verdict(command)) is not None:
+        return result(*_fork_lifecycle)
+    # <<< FORK ANCHOR >>>
     # 2. Hardline blocklist — never bypassable, even under yolo.
     is_hardline, hardline_desc = approval_detection.detect_hardline_command(command)
     if is_hardline:

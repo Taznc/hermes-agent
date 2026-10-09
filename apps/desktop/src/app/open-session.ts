@@ -19,7 +19,9 @@ import { $activeSessionId, $selectedStoredSessionId, markSessionRead } from '@/s
 import type { SessionProfileRoute } from '@/store/session-request-router'
 import {
   focusedSessionNeedsRoute,
+  focusedSessionWorkspaceScope,
   focusOpenSession,
+  frontMainIfSelected,
   openSessionTile,
   reuseBlankDraftTile,
   setSessionTileWorkspaceScope
@@ -30,10 +32,7 @@ import { $workspaceIsPage, sessionRoute } from './routes'
 
 export type OpenSessionIntent = 'in-place' | 'main' | 'stack' | 'tab' | 'window'
 
-export type OpenSessionNavigate = (
-  to: string,
-  options?: { replace?: boolean; state?: { preserveSessionTile?: boolean } }
-) => void
+export type OpenSessionNavigate = (to: string, options?: { replace?: boolean }) => void
 
 export interface OpenSessionWorkspaceScope {
   ownerRoute?: SessionProfileRoute
@@ -76,6 +75,23 @@ export function openSessionIntentFromModifiers(
   }
 
   return base
+}
+
+/** Every door that opens a saved chat from a picker-like surface (the /resume
+ * overlay, ⌘K session search, an artifact's "open chat") preserves the
+ * workspace of the tab the user acted from. `intent` is the caller's unmodified
+ * meaning (`in-place` for the overlay and artifacts, `stack` for ⌘K, or the
+ * ⌘/⇧⌘ modifier result); a Bot-scoped `in-place` becomes `stack` so the chat
+ * lands in the Bot tab instead of the Sessions main. */
+export function openSessionFromPicker(
+  storedSessionId: string,
+  navigate: OpenSessionNavigate,
+  intent: OpenSessionIntent = 'in-place'
+): void {
+  const workspaceScope = focusedSessionWorkspaceScope()
+  const resolved = workspaceScope.workspaceMode === 'bots' && intent === 'in-place' ? 'stack' : intent
+
+  openSession(storedSessionId, navigate, resolved, workspaceScope)
 }
 
 /**
@@ -129,7 +145,14 @@ export function openSession(
   let spendBlankDraft = false
 
   if (resolved === 'stack') {
-    spendBlankDraft = mainChatOccupied($activeSessionId.get(), $selectedStoredSessionId.get())
+    // A Bot-scoped picker is already inside a session tab, so its blank draft
+    // is the surface the user expects `/resume` to replace. Main may be empty
+    // or hidden behind the Bots workspace; treating that as an in-place open
+    // routes the saved chat elsewhere while leaving the visible blank tab
+    // active. Force the tab path so it first focuses an existing target, then
+    // spends the scoped blank draft before stacking a new tab.
+    spendBlankDraft =
+      Boolean(botWorkspaceScope) || mainChatOccupied($activeSessionId.get(), $selectedStoredSessionId.get())
     resolved = spendBlankDraft ? 'tab' : 'in-place'
   }
 
@@ -140,6 +163,10 @@ export function openSession(
     const focused = focusOpenSession(storedSessionId, workspaceScope)
 
     if (focused) {
+      if (focusedSessionNeedsRoute(focused, $workspaceIsPage.get())) {
+        navigate(sessionRoute(storedSessionId))
+      }
+
       return
     }
 
@@ -161,6 +188,8 @@ export function openSession(
       openSessionTile(storedSessionId, 'center')
     }
 
+    focusOpenSession(storedSessionId, workspaceScope)
+
     return
   }
 
@@ -171,15 +200,17 @@ export function openSession(
   const focused = focusOpenSession(storedSessionId, workspaceScope)
 
   if (focusedSessionNeedsRoute(focused, $workspaceIsPage.get())) {
-    // A session route normally means "make this the primary chat", which is
-    // why useRouteResume intentionally removes a duplicate tile. This route is
-    // different: the tile is already foreground; changing location only clears
-    // a full workspace page left behind it. Carry that narrow intent through
-    // history so route resume keeps the existing tile in place.
-    if (focused === 'tile') {
-      navigate(sessionRoute(storedSessionId), { state: { preserveSessionTile: true } })
-    } else {
-      navigate(sessionRoute(storedSessionId))
-    }
+    navigate(sessionRoute(storedSessionId))
+  }
+
+  // The target may also be the chat MAIN already holds — a Bot Mode roster
+  // click whose owner lost its tile (closing main promoted a neighbour tile
+  // into the workspace pane). focusOpenSession declined the 'main' hit for the
+  // Bot scope because a Bot tab for the same stored id must stay mintable, and
+  // the navigate above changed nothing (the route already points there), so
+  // front the pane here — or a zone parked on another bot's tile leaves the
+  // click looking dead (#125899).
+  if (!focused) {
+    frontMainIfSelected(storedSessionId)
   }
 }

@@ -1,84 +1,77 @@
-// ssh-binary.ts
+// Which ssh client the desktop spawns (#103288).
 //
-// One resolver for "where is ssh.exe" on Windows, shared by every embedded-
-// terminal/SSH-config code path. Before this module the four call sites each
-// hardcoded `%SystemRoot%\System32\OpenSSH\ssh.exe` with no existence check —
-// that path only exists when the Windows OpenSSH Client optional feature is
-// installed, which is NOT the default on Windows 10/11 LTSC/IoT SKUs and can
-// be removed on any SKU. A box with a perfectly working `ssh` on PATH (e.g.
-// via Git for Windows, or a manually-installed OpenSSH) would still see the
-// embedded terminal and SSH-config resolution silently fail because the
-// hardcoded path didn't exist. `ssh-connection.ts` had the opposite bug:
-// it always spawned bare `ssh`, which only works when something is on PATH.
+// Windows used to hard-code %SystemRoot%\System32\OpenSSH\ssh.exe for the
+// `ssh -G` probes and the SSH terminal, while SshConnection spawned a bare
+// `ssh` off PATH. When the in-box OpenSSH component is missing or broken
+// (component-store corruption after an update makes every native ssh.exe exit
+// 255 with no output), no config could point the desktop at a working client
+// such as Git for Windows' bundled `usr\bin\ssh.exe`.
 //
-// Resolution order (first match wins), Windows only:
-//   1. The built-in Windows OpenSSH Client feature, if actually installed
-//      (`%SystemRoot%\System32\OpenSSH\ssh.exe`, existence-checked).
-//   2. `ssh.exe` on PATH.
-//   3. Git for Windows' bundled `usr\bin\ssh.exe`, resolved relative to
-//      wherever `find-git-bash.ts` located Git Bash (same install, so if
-//      bash.exe is there ssh.exe almost certainly is too). bash.exe can sit
-//      at either `<gitRoot>\bin\bash.exe` (top-level shim) or
-//      `<gitRoot>\usr\bin\bash.exe` (the real MSYS2 layout) depending on
-//      which candidate matched in findGitBash(); ssh.exe always lives at
-//      `<gitRoot>\usr\bin\ssh.exe` in both layouts, so normalize up to
-//      gitRoot first rather than assuming ssh sits next to bash.
-// Off Windows, `ssh` is expected on PATH and spawn's own PATH search handles
-// it — this resolver returns the literal string `'ssh'` unchanged.
-//
-// Returns null when no candidate exists; callers surface a clear "OpenSSH
-// client not installed" error instead of spawning a path that doesn't exist.
+// Every ssh spawn now resolves through resolveSshBinary. It is pure: platform,
+// env slice and filesystem probe are injected so vitest can drive each branch.
+// Non-Windows always gets bare `ssh`, exactly as before.
 
 import path from 'node:path'
 
-export interface ResolveSshBinaryOptions {
-  isWindows: boolean
-  env: Record<string, string | undefined>
-  fileExists: (filePath: string) => boolean
-  findOnPath?: (command: string) => string | null
-  /** Result of find-git-bash.ts's findGitBash() — reused, not re-derived. */
-  gitBashPath?: null | string
+import { type GitCandidateFs, windowsGitCandidates } from './git-binary-candidates'
+
+/** Windows env slice the resolver reads (injectable for tests). */
+export interface WindowsSshEnv {
+  localAppData: string
+  programFiles: string
+  programFilesX86: string
+  systemRoot: string
 }
 
-export function resolveSshBinary(opts: ResolveSshBinaryOptions): null | string {
-  const { isWindows, env, fileExists, findOnPath, gitBashPath } = opts
+export interface SshBinaryInputs {
+  platform: string
+  /** `desktop.ssh_path` from config.yaml; empty when unset. Windows only. */
+  override?: string
+  env: WindowsSshEnv
+  fs: GitCandidateFs
+}
 
-  if (!isWindows) {
+/** The in-box Windows OpenSSH client under a Windows root. */
+export function system32OpenSsh(systemRoot: string): string {
+  return path.win32.join(systemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
+}
+
+/**
+ * Git-for-Windows ssh.exe candidates, derived from the same install list
+ * resolveGitBinary uses (Hermes PortableGit, UGit, Program Files, per-user).
+ * Git ships its MSYS OpenSSH at `<git root>\usr\bin\ssh.exe`, and every git
+ * candidate is `<git root>\{cmd,bin}\git.exe`.
+ */
+export function gitForWindowsSshCandidates(env: WindowsSshEnv, fs: GitCandidateFs): string[] {
+  const roots = windowsGitCandidates(env, fs).map(gitExe => path.win32.dirname(path.win32.dirname(gitExe)))
+
+  return [...new Set(roots)].map(root => path.win32.join(root, 'usr', 'bin', 'ssh.exe'))
+}
+
+/**
+ * The ssh executable to spawn.
+ *
+ * Windows, in order: an explicit `desktop.ssh_path` (returned as-is so a typo
+ * fails loudly with its own path instead of silently using another client),
+ * then the in-box System32 OpenSSH, then Git for Windows' bundled ssh.exe,
+ * then bare `ssh` for PATH lookup. Every other platform: bare `ssh`.
+ */
+export function resolveSshBinary({ platform, override, env, fs }: SshBinaryInputs): string {
+  if (platform !== 'win32') {
     return 'ssh'
   }
 
-  const systemRoot = env.SystemRoot || env.windir || 'C:\\Windows'
-  const builtin = path.win32.join(systemRoot, 'System32', 'OpenSSH', 'ssh.exe')
+  const explicit = String(override ?? '').trim()
 
-  if (fileExists(builtin)) {
-    return builtin
+  if (explicit) {
+    return explicit
   }
 
-  const onPath = findOnPath ? findOnPath('ssh.exe') : null
+  const inbox = system32OpenSsh(env.systemRoot)
 
-  if (onPath) {
-    return onPath
+  if (fs.existsSync(inbox)) {
+    return inbox
   }
 
-  if (gitBashPath) {
-    const bashDir = path.win32.dirname(gitBashPath)
-    // Both `...\Git\bin\bash.exe` and `...\Git\usr\bin\bash.exe` reduce to
-    // `...\Git`: the `usr\bin` shape needs two levels stripped off bashDir,
-    // the plain `bin` shape needs one.
-    const usrBinSuffix = `${path.win32.sep}usr${path.win32.sep}bin`
-    const gitRoot = bashDir.toLowerCase().endsWith(usrBinSuffix.toLowerCase())
-      ? path.win32.dirname(path.win32.dirname(bashDir))
-      : path.win32.dirname(bashDir)
-    const candidate = path.win32.join(gitRoot, 'usr', 'bin', 'ssh.exe')
-
-    if (fileExists(candidate)) {
-      return candidate
-    }
-  }
-
-  return null
+  return gitForWindowsSshCandidates(env, fs).find(candidate => fs.existsSync(candidate)) || 'ssh'
 }
-
-/** User-facing error for every call site when no ssh binary resolves. */
-export const SSH_BINARY_MISSING_MESSAGE =
-  'OpenSSH client not installed. Install the Windows OpenSSH Client optional feature, or install Git for Windows (which bundles ssh.exe).'

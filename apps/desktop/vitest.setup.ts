@@ -1,5 +1,11 @@
 import { configure } from '@testing-library/react'
-import { afterEach } from 'vitest'
+
+import { InertResizeObserver } from './src/test/jsdom'
+
+// Shared tooltips measure their arrow through Radix's useSize hook.
+// Geometry assertions still belong in a real browser, not this inert observer. Assigned,
+// not `vi.stubGlobal`, so a test's `vi.unstubAllGlobals()` cannot strip it.
+globalThis.ResizeObserver ??= InertResizeObserver as unknown as typeof ResizeObserver
 
 // Node 26 defines its own `localStorage` accessor on the global object, which
 // returns `undefined` unless the process was started with --localstorage-file
@@ -10,6 +16,7 @@ import { afterEach } from 'vitest'
 // Storage when the global resolves to nothing, before any test module reads it.
 if (typeof (globalThis as any).localStorage === 'undefined') {
   const store = new Map<string, string>()
+
   const storage: Storage = {
     get length() {
       return store.size
@@ -18,20 +25,46 @@ if (typeof (globalThis as any).localStorage === 'undefined') {
     getItem: (k: string) => store.get(String(k)) ?? null,
     setItem: (k: string, v: string) => void store.set(String(k), String(v)),
     removeItem: (k: string) => void store.delete(String(k)),
-    clear: () => store.clear(),
+    clear: () => store.clear()
   }
+
   for (const target of [globalThis, (globalThis as any).window].filter(Boolean)) {
     Object.defineProperty(target, 'localStorage', {
       value: storage,
       configurable: true,
-      writable: true,
+      writable: true
     })
   }
 }
 
-// React 19 + Testing Library 16: opt into the act environment so render(),
-// fireEvent(), and findBy* queries automatically flush state updates without
-// spurious "not wrapped in act(...)" warnings.
+// jsdom has no layout or intersection delivery. Tests of observer behavior
+// supply their own callbacks; ordinary component tests only need the lifecycle.
+globalThis.IntersectionObserver = class {
+  readonly root = null
+  readonly rootMargin = '0px'
+  readonly thresholds = [0]
+  observe() {}
+  unobserve() {}
+  disconnect() {}
+  takeRecords(): IntersectionObserverEntry[] {
+    return []
+  }
+} as typeof IntersectionObserver
+
+// Idle prefetches and feature queries (`CSS.supports`) run on mount.
+// jsdom has neither API; idle work never fires and every feature reads as absent.
+globalThis.requestIdleCallback ??= () => 0
+globalThis.cancelIdleCallback ??= () => undefined
+globalThis.CSS ??= { escape: (value: string) => value, supports: () => false } as unknown as typeof CSS
+
+if ('Element' in globalThis) {
+  Element.prototype.scrollTo ??= () => undefined
+
+  // React 19 + Testing Library 16: opt into the act environment so render(),
+  // fireEvent(), and findBy* queries automatically flush state updates without
+  // spurious "not wrapped in act(...)" warnings.
+}
+
 ;(globalThis as any).IS_REACT_ACT_ENVIRONMENT = true
 
 // findBy*/waitFor default to a 1000ms deadline — too tight for async-heavy
@@ -45,20 +78,3 @@ if (typeof (globalThis as any).localStorage === 'undefined') {
 // as the 15s testTimeout above it while still finishing below it, so a
 // genuinely hung await still surfaces as this assertion, not a test timeout.
 configure({ asyncUtilTimeout: 12_000 })
-
-// A component's poll loop (store/local-runtime-jobs.ts's watchLocalRuntimeJobs)
-// is deliberately designed to outlive its mounting component — that's what lets
-// a download survive the settings pane unmounting. In this suite the loop must
-// still die with the FILE that started it: vitest's pool workers reuse one
-// process across many test files, and a timer left running past its owning
-// file's teardown fires while an unrelated file executes, throwing
-// `ReferenceError: window is not defined` on whatever test happens to be
-// running (#t_fc026713 — moved between files/worker counts, which was the
-// signature that the fault wasn't in the file the error surfaced in). One
-// global afterEach here — rather than a per-file afterEach every caller has to
-// remember — guarantees no run's poll survives past its test.
-afterEach(async () => {
-  const { resetLocalRuntimeJobsForTests } = await import('@/store/local-runtime-jobs')
-
-  resetLocalRuntimeJobsForTests()
-})

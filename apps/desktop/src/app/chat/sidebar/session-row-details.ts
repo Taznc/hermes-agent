@@ -1,4 +1,3 @@
-import { providerFamilyLabel } from '@/lib/model-status-label'
 import type { SessionListDensity } from '@/store/session-list-density'
 import type { SessionInfo } from '@/types/hermes'
 
@@ -18,27 +17,15 @@ const oneLine = (value: null | string) => value?.replace(/\s+/g, ' ').trim() || 
 export const sessionRowEstimate = (density: SessionListDensity) =>
   ({ compact: 28, comfortable: 45, detailed: 63 })[density]
 
-/** Configured-vs-served provider identity for a session row (Phase 2.13).
- *  `configured` is the primary, always-shown family label (or `null` for a
- *  legacy/unresolved session — never guessed). `served` is the secondary
- *  "via <provider>" family, populated ONLY when it differs from `configured`
- *  (case-insensitive) — the common case (they match) carries `served: null`
- *  so callers render nothing extra. */
-export interface SessionRowIdentity {
-  configured: string | null
-  served: string | null
-}
-
-export function sessionRowIdentity(session: SessionInfo): SessionRowIdentity {
-  const configured = providerFamilyLabel(session.configured_provider)
-  const served = providerFamilyLabel(session.served_provider)
-
-  if (!configured || !served) {return { configured, served: null }}
-
-  if (configured.toLowerCase() === served.toLowerCase()) {return { configured, served: null }}
-
-  return { configured, served }
-}
+/** Virtual-list placement estimate for the Inbox-style card. A full card
+ *  stacks four text lines (header, title, preview, model/size) where the
+ *  tallest inline density stacks three, plus the card's own padding — and a
+ *  title that wraps to two lines on a narrow sidebar adds one more title
+ *  line (#88473). Deliberately at or ABOVE that worst case: an oversized
+ *  estimate paints a brief gap that self-measurement closes, while an
+ *  undersized one paints rows over their neighbours (and the divider below)
+ *  on a cold start, before any measurement can correct it. */
+export const SESSION_CARD_ROW_ESTIMATE_PX = 96
 
 export function sessionRowDetails(session: SessionInfo, fmt: SessionRowFormatters): SessionRowDetails {
   const preview = oneLine(session.preview)

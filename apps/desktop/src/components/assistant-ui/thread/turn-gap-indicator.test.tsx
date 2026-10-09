@@ -2,12 +2,14 @@
 // is armed, but the tail bubble has settled — a sealed interim row, or a turn
 // whose last message completed while the agent kept going. The transcript used
 // to show nothing there, and the seconds went uncounted.
-import { type ThreadMessage } from '@assistant-ui/react'
+import { AssistantRuntimeProvider, type ThreadMessage } from '@assistant-ui/react'
 import { act, cleanup, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
+import { useRuntimeMessageRepository } from '@/app/chat/runtime-repository'
 import { __resetElapsedTimerRegistryForTests } from '@/components/chat/activity-timer'
-import { I18nProvider } from '@/i18n'
+import type { ChatMessage } from '@/lib/chat-messages'
+import { useIncrementalExternalStoreRuntime } from '@/lib/incremental-external-store-runtime'
 import { $activeSessionId, $busy, $messages, $turnStartedAt } from '@/store/session'
 
 import { stubThreadEnvironment, ThreadRuntime, userMessage } from '../test-utils'
@@ -37,13 +39,24 @@ const toolCall = (toolName: string, settled: boolean) => ({
   ...(settled ? { result: 'ok' } : {})
 })
 
-const Harness = ({ locale = 'en', messages }: { locale?: 'en' | 'ja'; messages: ThreadMessage[] }) => (
-  <I18nProvider configClient={null} initialLocale={locale}>
-    <ThreadRuntime messages={messages}>
-      <Thread />
-    </ThreadRuntime>
-  </I18nProvider>
+const Harness = ({ messages }: { messages: ThreadMessage[] }) => (
+  <ThreadRuntime messages={messages}>
+    <Thread />
+  </ThreadRuntime>
 )
+
+// Exercise the production conversion/adapter: reconnect may retire busy
+// before a pending transcript row receives its terminal message.complete.
+const RuntimeHarness = ({ messages }: { messages: ChatMessage[] }) => {
+  const messageRepository = useRuntimeMessageRepository(messages)
+  const runtime = useIncrementalExternalStoreRuntime({ messageRepository, isRunning: false, onNew: async () => {} })
+
+  return (
+    <AssistantRuntimeProvider runtime={runtime}>
+      <Thread />
+    </AssistantRuntimeProvider>
+  )
+}
 
 const timerText = (value: string) => screen.getAllByText((_, node) => node?.textContent === value)
 
@@ -106,7 +119,9 @@ describe('the turn timer covers the gaps, not just the streaming', () => {
     expect(container.querySelector('[data-slot="aui_turn-activity"]')).toBeNull()
   })
 
-  it('keeps a completed operation visible briefly before settling the row away', () => {
+  it('stops when the session stops working', () => {
+    $busy.set(false)
+
     const { container } = render(
       <Harness
         messages={[userMessage('u1', 'do the thing'), assistant('a1', [{ type: 'text', text: 'Done.' }], false)]}
@@ -114,95 +129,71 @@ describe('the turn timer covers the gaps, not just the streaming', () => {
     )
 
     act(() => vi.advanceTimersByTime(7_000))
-    expect(container.querySelector('[data-slot="aui_turn-activity"]')).not.toBeNull()
 
-    act(() => $busy.set(false))
-
-    expect(container.querySelector('[data-terminal-activity="success"]')).not.toBeNull()
-    expect(container.querySelector('[data-activity-mark="success"]')).not.toBeNull()
-    expect(container.querySelector('[data-terminal-activity="success"]')?.getAttribute('aria-label')).toBe('Work complete')
-
-    act(() => vi.advanceTimersByTime(1_999))
-    expect(container.querySelector('[data-terminal-activity="success"]')).not.toBeNull()
-
-    act(() => vi.advanceTimersByTime(1))
     expect(container.querySelector('[data-slot="aui_turn-activity"]')).toBeNull()
   })
 
-  it('does not let an earlier completion truncate a later completion', () => {
-    const messages = [userMessage('u1', 'do the thing'), assistant('a1', [{ type: 'text', text: 'Done.' }], false)]
-    const { container } = render(<Harness messages={messages} />)
+  it('keeps one live region across working/idle flips so screen readers do not re-announce it', () => {
+    const { container } = render(
+      <Harness
+        messages={[userMessage('u1', 'do the thing'), assistant('a1', [{ type: 'text', text: 'On it.' }], false)]}
+      />
+    )
 
     act(() => vi.advanceTimersByTime(7_000))
-    act(() => $busy.set(false))
-    expect(container.querySelector('[data-terminal-activity="success"]')).not.toBeNull()
+    const row = container.querySelector<HTMLElement>('[data-slot="aui_turn-activity"]')
+    expect(row?.dataset.state).toBe('active')
+    // The ticking timer must not feed the live region.
+    const hidden = [...(row?.querySelectorAll('[aria-hidden="true"]') ?? [])].map(n => n.textContent)
+    expect(hidden.some(text => /\d+s/.test(text ?? ''))).toBe(true)
 
-    act(() => vi.advanceTimersByTime(1_000))
+    act(() => $busy.set(false))
+    // Idle: same node, still an exposed live region — visually hidden via
+    // sr-only, never display:none / [hidden], which would drop it from the
+    // accessibility tree and re-announce on the next flip.
+    expect(container.querySelector('[data-slot="aui_turn-activity"]')).toBe(row)
+    expect(row?.dataset.state).toBe('idle')
+    expect(row?.hidden).toBe(false)
+    expect(row?.classList.contains('hidden')).toBe(false)
+    expect(row?.getAttribute('aria-live')).toBe('polite')
+    expect(row?.textContent).toBe('')
+    expect(row?.getAttribute('aria-label')).toBeFalsy()
+
     act(() => $busy.set(true))
     act(() => vi.advanceTimersByTime(7_000))
-    act(() => $busy.set(false))
-    expect(container.querySelector('[data-terminal-activity="success"]')).not.toBeNull()
+    expect(container.querySelector('[data-slot="aui_turn-activity"][data-state="active"]')).toBe(row)
+  })
 
-    act(() => vi.advanceTimersByTime(1_001))
-    expect(container.querySelector('[data-terminal-activity="success"]')).not.toBeNull()
+  it('does not revive a tail timer from a pending row after the session retires its busy claim', () => {
+    $busy.set(false)
+    $turnStartedAt.set(null)
 
-    act(() => vi.advanceTimersByTime(999))
+    const messages: ChatMessage[] = [
+      { id: 'u1', role: 'user', parts: [{ type: 'text', text: 'do the thing' }] },
+      { id: 'a1', role: 'assistant', parts: [{ type: 'text', text: 'Done.' }], pending: true }
+    ]
+
+    const { container } = render(<RuntimeHarness messages={messages} />)
+
+    act(() => vi.advanceTimersByTime(7_000))
+
     expect(container.querySelector('[data-slot="aui_turn-activity"]')).toBeNull()
   })
 
-  it('does not duplicate a fatal error with a terminal failure activity row', () => {
-    const fatalMessages = [
-      userMessage('u1', 'do the thing'),
-      {
-        ...assistant('a1', [{ type: 'text', text: 'The operation failed.' }], false),
-        status: { type: 'error', error: new Error('fatal') }
-      } as unknown as ThreadMessage
+  it('still narrates a pending first bubble before the session busy flush arrives', () => {
+    $busy.set(false)
+    // Submit has armed the turn clock; the non-critical busy=true view flush
+    // can trail the first streamed message by a frame.
+
+    const messages: ChatMessage[] = [
+      { id: 'u1', role: 'user', parts: [{ type: 'text', text: 'do the thing' }] },
+      { id: 'a1', role: 'assistant', parts: [{ type: 'text', text: 'Working.' }], pending: true }
     ]
 
-    const { container } = render(<Harness messages={fatalMessages} />)
+    const { container } = render(<RuntimeHarness messages={messages} />)
 
     act(() => vi.advanceTimersByTime(7_000))
-    act(() => $busy.set(false))
 
-    expect(container.querySelector('[data-terminal-activity="failure"]')).toBeNull()
-  })
-
-  it('localizes the terminal activity status label', () => {
-    const messages = [userMessage('u1', 'do the thing'), assistant('a1', [{ type: 'text', text: 'Done.' }], false)]
-    const { container } = render(<Harness locale="ja" messages={messages} />)
-
-    act(() => vi.advanceTimersByTime(7_000))
-    act(() => $busy.set(false))
-
-    expect(container.querySelector('[data-terminal-activity="success"]')?.getAttribute('aria-label')).toBe(
-      '作業が完了しました'
-    )
-  })
-
-  it('retains a recoverable failure briefly before settling the row away', () => {
-    const failedMessages = [
-      userMessage('u1', 'do the thing'),
-      {
-        ...assistant('a1', [{ type: 'text', text: 'Could not finish.' }], false),
-        status: { type: 'incomplete' }
-      } as ThreadMessage
-    ]
-
-    const { container } = render(<Harness messages={failedMessages} />)
-
-    act(() => vi.advanceTimersByTime(7_000))
-    act(() => $busy.set(false))
-
-    expect(container.querySelector('[data-terminal-activity="failure"]')).not.toBeNull()
-    expect(container.querySelector('[data-activity-mark="failure"]')).not.toBeNull()
-    expect(container.querySelector('[data-terminal-activity="failure"]')?.getAttribute('aria-label')).toBe(
-      'Work needs attention'
-    )
-
-    act(() => vi.advanceTimersByTime(1_999))
-    expect(container.querySelector('[data-terminal-activity="failure"]')).not.toBeNull()
-
-    act(() => vi.advanceTimersByTime(1))
-    expect(container.querySelector('[data-slot="aui_turn-activity"]')).toBeNull()
+    expect(container.querySelector('[data-slot="aui_turn-activity"]')).not.toBeNull()
   })
 })

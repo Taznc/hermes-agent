@@ -1,47 +1,23 @@
 import { atom, computed } from 'nanostores'
 
-import { $gateway } from './gateway'
+import { hasOpenServerRequest, respondToServerRequest } from './server-requests'
 import { $activeSessionId } from './session'
 
 export interface ClarifyQuestion {
-  /** Server-generated wire id (q0..qN) — clarify.respond keys answers by it. */
   qid: string
   question: string
   choices: string[] | null
   multiSelect: boolean
 }
 
-export interface ClarifyHelp {
-  choice?: string
-  content?: string
-  error?: string
-  explanationId: string
-  followUp: string
-  questionId?: string
-  status: 'complete' | 'error' | 'loading'
-}
-
 export interface ClarifyRequest {
-  help?: Record<string, ClarifyHelp>
   requestId: string
-  question: string
-  choices: string[] | null
-  multiSelect: boolean
-  /** Local receipt time (Unix seconds), used for lifecycle guards. */
+  /** Local receipt time (Unix seconds), used to reject stale resume cleanup. */
   receivedAt?: number
   sessionId: string | null
-  /** Batch (multi-question) clarify: present instead of question/choices. */
-  questions?: ClarifyQuestion[]
-  /** Answers already locked server-side (reconnect replay): qid → answer. */
-  lockedAnswers?: Record<string, string>
-  /**
-   * How long the server-side bridge stays blocked waiting for an answer.
-   * null/undefined means the renderer has no finite deadline and must wait
-   * for an explicit answer, cancel, or expire event.
-   */
-  timeoutSeconds?: number | null
-  /** Notes already locked server-side (reconnect replay): qid → note. */
-  lockedNotes?: Record<string, string>
+  questions: ClarifyQuestion[]
+  /** Answers already locked server-side (reconnect replay): qid → answer, null = skipped. */
+  lockedAnswers?: Record<string, null | string>
 }
 
 /**
@@ -56,11 +32,22 @@ export const bareChoice = (choice: string): string =>
   choice.endsWith(RECOMMENDED_LABEL) ? choice.slice(0, -RECOMMENDED_LABEL.length).trim() : choice
 
 /**
+ * Per-choice display cap. The clarify tool enforces the same limit at the
+ * source (`tools/clarify_tool.py::MAX_CHOICE_CHARS`) and declares it in the
+ * schema, so an over-limit choice is rejected before any surface renders;
+ * this filter is the last line of defence against a stale/other producer.
+ * Not a one-line label limit — long option text wraps (`wrap-anywhere`),
+ * newlines are kept so option reasons can read as multiple lines.
+ */
+export const MAX_CHOICE_CHARS = 8000
+
+/**
  * Validate and normalize a choices array.
  *
- * Keeps non-blank, newline-free strings of length ≤ 200; drops everything else
- * and returns an empty array when nothing usable survives — the caller then
- * falls back to a free-text answer instead of dead buttons.
+ * Keeps non-blank strings (newlines allowed) whose bare text is within
+ * MAX_CHOICE_CHARS; drops everything else and returns an empty array when
+ * nothing usable survives — the caller then falls back to a free-text
+ * answer instead of dead buttons.
  */
 export function normalizeChoices(choices: unknown): string[] {
   if (!Array.isArray(choices)) {
@@ -68,21 +55,8 @@ export function normalizeChoices(choices: unknown): string[] {
   }
 
   return choices.filter(
-    (c): c is string => typeof c === 'string' && c.trim().length > 0 && bareChoice(c).length <= 200 && !c.includes('\n')
+    (c): c is string => typeof c === 'string' && c.trim().length > 0 && bareChoice(c).length <= MAX_CHOICE_CHARS
   )
-}
-
-/**
- * Structured warning for a clarify payload that arrived with choices but had
- * them all normalized away — keeps the remaining #69122 "no selectable choices"
- * triggers diagnosable in the field without dead constant fields.
- */
-export function warnDroppedChoices(source: 'gateway' | 'tool_args', question: string, rawChoices: unknown): void {
-  console.warn('[clarify] choices dropped after normalization', {
-    choices_count: Array.isArray(rawChoices) ? rawChoices.length : 0,
-    question_length: question.length,
-    source
-  })
 }
 
 /**
@@ -136,79 +110,6 @@ const keyFor = (sessionId: string | null | undefined): string => sessionId ?? ''
 
 export const $clarifyRequests = atom<Record<string, ClarifyRequest>>({})
 
-/** Help is renderer-owned presentation state, retained after its pending request
- * settles so the original tool card can expose it without making a transcript turn. */
-export const $settledClarifyHelp = atom<Record<string, Record<string, ClarifyHelp>>>({})
-
-/** Associates a renderer transcript tool row with the request it rendered.
- * The gateway's explain event intentionally exposes only request correlation;
- * retaining this local association lets a remounted settled row find its help. */
-export const $clarifyToolRequestIds = atom<Record<string, string>>({})
-
-export function associateClarifyToolRequest(toolCallId: string, requestId: string): void {
-  if ($clarifyToolRequestIds.get()[toolCallId] === requestId) {
-    return
-  }
-
-  $clarifyToolRequestIds.set({ ...$clarifyToolRequestIds.get(), [toolCallId]: requestId })
-}
-
-export function updateClarifyHelp(
-  requestId: string,
-  sessionId: string | null | undefined,
-  explanationId: string,
-  update: Omit<ClarifyHelp, 'explanationId'>
-): void {
-  const key = keyFor(sessionId)
-  const current = $clarifyRequests.get()[key]
-
-  if (!current || current.requestId !== requestId) {
-    return
-  }
-
-  const help = { ...(current.help ?? {}), [explanationId]: { explanationId, ...update } }
-  $clarifyRequests.set({ ...$clarifyRequests.get(), [key]: { ...current, help } })
-}
-
-export function reconcileClarifyHelp(
-  requestId: string,
-  sessionId: string | null | undefined,
-  localExplanationId: string,
-  explanationId: string
-): void {
-  const key = keyFor(sessionId)
-  const current = $clarifyRequests.get()[key]
-
-  if (!current || current.requestId !== requestId || localExplanationId === explanationId) {
-    return
-  }
-
-  const local = current.help?.[localExplanationId]
-  const received = current.help?.[explanationId]
-
-  if (!local && !received) {
-    return
-  }
-
-  const help = { ...(current.help ?? {}) }
-  delete help[localExplanationId]
-  help[explanationId] = {
-    ...(local ?? { explanationId, followUp: '', status: 'loading' as const }),
-    ...(received ?? {}),
-    explanationId,
-    followUp: local?.followUp ?? received?.followUp ?? ''
-  }
-  $clarifyRequests.set({ ...$clarifyRequests.get(), [key]: { ...current, help } })
-}
-
-export function settledClarifyHelp(requestId: string | null): Record<string, ClarifyHelp> {
-  return requestId ? ($settledClarifyHelp.get()[requestId] ?? {}) : {}
-}
-
-export function settledClarifyHelpForToolCall(toolCallId: string): Record<string, ClarifyHelp> {
-  return settledClarifyHelp($clarifyToolRequestIds.get()[toolCallId] ?? null)
-}
-
 // The clarify request for the currently-viewed session. The inline ClarifyTool
 // only ever mounts inside the active session's transcript, so it reads this
 // focus-scoped view rather than reaching into the whole map.
@@ -224,37 +125,6 @@ export const sessionClarifyRequest = (sessionId: string | null) =>
 
 export function setClarifyRequest(request: ClarifyRequest): void {
   $clarifyRequests.set({ ...$clarifyRequests.get(), [keyFor(request.sessionId)]: request })
-}
-
-// `_block()` starts its Event wait immediately after emitting the request. The
-// renderer can therefore start its wall-clock estimate a fraction earlier than
-// the server starts waiting. Keep a small conservative margin so a turn-end at
-// that boundary cannot remove the only UI capable of releasing the bridge.
-const CLARIFY_TIMEOUT_GRACE_SECONDS = 2
-
-/**
- * True when the server-side bridge may STILL be blocked on this request.
- *
- * The desktop clears parked clarify dialogs when a turn ends or errors, but
- * the Python side stays blocked on clarify.respond until the user answers OR
- * its own clarify timeout expires. A turn-end event that arrives while the
- * bridge is still blocked (stream reconnect, HUD overlay focus churn —
- * #83319) must not wipe the dialog, or the user loses the only thing that
- * can unblock the agent. A finite timeout means the server gives up on its
- * own after timeoutSeconds — past that point the dialog is stale and safe
- * to drop. A null timeout means the server waits forever, so the dialog
- * must survive turn-end events and only an explicit answer/skip clears it.
- */
-export const clarifyStillBlocking = (request: ClarifyRequest | null, now: number = Date.now() / 1000): boolean => {
-  if (!request) {
-    return false
-  }
-
-  if (request.timeoutSeconds == null || request.receivedAt == null) {
-    return true
-  }
-
-  return now - request.receivedAt < request.timeoutSeconds + CLARIFY_TIMEOUT_GRACE_SECONDS
 }
 
 export function clearClarifyRequest(requestId?: string, sessionId?: string | null): void {
@@ -273,10 +143,6 @@ export function clearClarifyRequest(requestId?: string, sessionId?: string | nul
     const next = { ...requests }
     delete next[key]
     $clarifyRequests.set(next)
-
-    if (current.help && Object.keys(current.help).length > 0) {
-      $settledClarifyHelp.set({ ...$settledClarifyHelp.get(), [current.requestId]: current.help })
-    }
 
     return
   }
@@ -304,18 +170,21 @@ export function clearClarifyRequest(requestId?: string, sessionId?: string | nul
 export const hasClarifyRequest = (sessionId: string | null | undefined): boolean =>
   Boolean($clarifyRequests.get()[keyFor(sessionId)])
 
+/** Clear a stale card at a turn boundary, but keep it while its backend request is still waiting. */
+export function clearSettledClarifyRequest(sessionId: string | null): void {
+  const request = $clarifyRequests.get()[keyFor(sessionId)]
+
+  if (request && !hasOpenServerRequest(request.requestId)) {
+    clearClarifyRequest(request.requestId, sessionId)
+  }
+}
+
 /**
- * Answer `sessionId`'s pending clarify with an empty answer (a skip) and drop it
- * locally, resolving to whether there was one to skip.
- *
  * The composer uses this when the user types a real message instead of picking
  * an option: a clarify blocks the agent inside its tool batch, so leaving it
  * unanswered would park the follow-up until the server-side clarify timeout
- * (default 5 min) — the message looks sent and nothing happens. Skipping lets
+ * — the message looks sent and nothing happens. Skipping lets
  * the tool return and the turn carry on with the user's actual words.
- *
- * An empty answer is the same thing the card's own Skip button sends, and
- * `clarify.respond` is `allow_expired`, so racing the timeout is harmless.
  */
 export async function skipClarifyRequest(sessionId: string | null | undefined): Promise<boolean> {
   const request = $clarifyRequests.get()[keyFor(sessionId)]
@@ -328,12 +197,7 @@ export async function skipClarifyRequest(sessionId: string | null | undefined): 
   // leave a live card the user can answer a second time.
   clearClarifyRequest(request.requestId, request.sessionId)
 
-  try {
-    await $gateway.get()?.request('clarify.respond', { request_id: request.requestId, answer: '' })
-  } catch {
-    // The tool times out on its own; a failed skip must never swallow the
-    // message the user is actually sending.
-  }
+  respondToServerRequest(request.requestId, {})
 
   return true
 }

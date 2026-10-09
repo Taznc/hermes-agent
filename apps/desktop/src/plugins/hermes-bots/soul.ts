@@ -15,14 +15,9 @@ import type { RosterRow } from './types'
 
 /** The agent-to-agent messaging protocol, reusable so a CUSTOM SOUL keeps
  *  the handoff protocol too — a custom SOUL used to silently drop it,
- *  breaking @mentions for customized bots (@wesleysimplicio, #16).
- *
- *  The protocol names no teammates. SOUL.md is written once and never
- *  revisited, so any roster baked in here is a point-in-time snapshot the
- *  agent keeps reading as authoritative long after profiles are added,
- *  removed, or renamed — it routed handoffs to profiles that no longer
- *  existed. `hermes profile list` is the live source; it cannot drift. */
-function messagingProtocolSection(name: string): string {
+ *  breaking @mentions for customized bots (@wesleysimplicio, #16). */
+function messagingProtocolSection(name: string, roster: RosterRow[] | null | undefined): string {
+  const teammates = (roster || []).filter(b => b.name !== name)
   const handle = botHandle(name)
 
   return [
@@ -63,7 +58,10 @@ function messagingProtocolSection(name: string): string {
     'reply, and report back.',
     '',
     'The roster grows over time — run `hermes profile list` for the LIVE',
-    'teammate list before a handoff.'
+    'teammate list before a handoff. Teammates when you were created:',
+    ...(teammates.length
+      ? teammates.map(b => `- \`${b.name}\`${b.description ? ` — ${b.description}` : ''}`)
+      : ['- (none yet)'])
   ].join('\n')
 }
 
@@ -78,14 +76,18 @@ function hasMessagingProtocol(soul: null | string | undefined): boolean {
  *  that already has it (clone-from-default after a backfill, Edit save).
  *  No-op when the backend injects the protocol into the system prompt
  *  itself (bot_mode_protocol) — SOUL.md stays the user's identity text. */
-export function ensureMessagingProtocol(soul: null | string | undefined, name: string) {
+export function ensureMessagingProtocol(
+  soul: null | string | undefined,
+  name: string,
+  roster: RosterRow[] | null | undefined
+) {
   const text = (soul || '').trim()
 
   if (serverInjectsProtocol || hasMessagingProtocol(text)) {
     return text
   }
 
-  const section = messagingProtocolSection(name)
+  const section = messagingProtocolSection(name, roster)
 
   return text ? text + '\n\n' + section : section
 }
@@ -127,7 +129,7 @@ export function backfillMessagingProtocol(roster: RosterRow[] | null | undefined
         return host
           .request('profiles.configure', {
             name,
-            soul: ensureMessagingProtocol(soul, name)
+            soul: ensureMessagingProtocol(soul, name, roster)
           })
           .then(() => {
             soulProtocolChecked.add(name)
@@ -151,12 +153,13 @@ interface ComposeSoulOptions {
   customSoul?: null | string
   description?: null | string
   name: string
+  roster?: RosterRow[] | null
   title?: null | string
 }
 
-export function composeSoul({ name, title, description, customSoul }: ComposeSoulOptions): string {
+export function composeSoul({ name, title, description, roster, customSoul }: ComposeSoulOptions): string {
   if (customSoul && customSoul.trim()) {
-    return ensureMessagingProtocol(customSoul, name)
+    return ensureMessagingProtocol(customSoul, name, roster)
   }
 
   const lines = [
@@ -177,5 +180,5 @@ export function composeSoul({ name, title, description, customSoul }: ComposeSou
 
   const identity = lines.filter(line => line !== null).join('\n')
 
-  return serverInjectsProtocol ? identity : identity + '\n\n' + messagingProtocolSection(name)
+  return serverInjectsProtocol ? identity : identity + '\n\n' + messagingProtocolSection(name, roster)
 }

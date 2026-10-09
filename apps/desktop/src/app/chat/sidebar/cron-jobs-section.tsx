@@ -14,13 +14,14 @@ import { useI18n } from '@/i18n'
 import { fmtDayTime, relativeTime } from '@/lib/time'
 import { cn } from '@/lib/utils'
 import { confirm } from '@/store/confirm'
-import { $cronJobs, updateCronJobs } from '@/store/cron'
+import { updateCronJobs } from '@/store/cron'
 import { $changeEventsAvailable, $cronChangeTick } from '@/store/live-sync'
 import { notify, notifyError } from '@/store/notifications'
 import { $selectedStoredSessionId } from '@/store/session'
 import type { CronJob } from '@/types/hermes'
 
-import { jobState, jobTitle, STATE_DOT } from '../../cron/job-state'
+import { jobState, jobTitle, nextRunOverdueMs, STATE_DOT } from '../../cron/job-state'
+import { openCronRun, reconcileCronRunVerdicts } from '../../cron/open-cron-run'
 import { SidebarPanelLabel } from '../../shell/sidebar-label'
 
 import { SidebarRowBody, SidebarRowLabel, SidebarRowLead, SidebarRowShell } from './chrome'
@@ -66,46 +67,45 @@ function formatRunTime(seconds?: null | number): string {
   return Number.isNaN(date.valueOf()) ? '—' : fmtDayTime.format(date)
 }
 
+// Script-only (no_agent) jobs have no agent sessions; the runs endpoint
+// surfaces their per-fire output docs as rows with source='cron_output'
+// (see _list_cron_output_runs in hermes_cli/web_routers/cron.py).
+function isSyntheticCronOutputRun(run: SessionInfo): boolean {
+  return run.source === 'cron_output'
+}
+
 interface SidebarCronJobsSectionProps {
+  jobs: CronJob[]
   label: string
   max?: number
-  // Open a run session's chat (1 click to output).
-  onOpenRun: (sessionId: string) => void
+  // Open a run session's chat (1 click to output). The run ROW rides along so
+  // the open can pin its owning (connection, profile) — the same owner-aware
+  // door every other session-list row uses. A run the scheduler never closed
+  // opens view-only — see `openCronRun` (#88443).
+  onOpenRun: (sessionId: string, session?: SessionInfo) => void
   // Open the full Cron page focused on this job (manage / full history).
   onManageJob: (jobId: string) => void
   // Fire the job now.
   onTriggerJob: (jobId: string) => Promise<void>
   onToggle: () => void
   open: boolean
-  /** False in the grouped-by-workspace (Projects) view, which has no room for
-   *  this section. Kept as a prop (not an internal store read) so the
-   *  parent's own `$sidebarWorktreeGroupingActive` subscription is the single
-   *  place that gate lives — this component still owns its own `$cronJobs`
-   *  subscription and empty-list gating below. */
-  visible?: boolean
 }
 
 export function SidebarCronJobsSection({
+  jobs,
   label,
   max = 50,
   onManageJob,
   onOpenRun,
   onTriggerJob,
   onToggle,
-  open,
-  visible: sectionVisible = true
+  open
 }: SidebarCronJobsSectionProps) {
-  // Owns its own subscription: the parent used to pass `jobs` down from a
-  // useStore($cronJobs) at the sidebar root, which meant a cron tick
-  // re-rendered the ENTIRE sidebar tree. Subscribing here confines that
-  // churn to this section.
-  const jobs = useStore($cronJobs)
   const [nowMs, setNowMs] = useState(() => Date.now())
   // Single-open inline peek so the section stays scannable.
   const [peekJobId, setPeekJobId] = useState<null | string>(null)
   // Rows revealed so far; starts compact, grows in steps via "load more".
   const [visibleCount, setVisibleCount] = useState(INITIAL_VISIBLE_JOBS)
-
   const [triggeringJobIds, setTriggeringJobIds] = useState<ReadonlySet<string>>(() => new Set())
   const triggerControllerRef = useRef<CronTriggerController | null>(null)
 
@@ -187,13 +187,6 @@ export function SidebarCronJobsSection({
   const shown = sorted.slice(0, cap)
   const hiddenCount = Math.min(sorted.length, max) - shown.length
 
-  // The section owns its own visibility now that it owns its own $cronJobs
-  // subscription — the parent used to gate rendering on `cronJobs.length > 0`
-  // before ever mounting this component.
-  if (!sectionVisible || jobs.length === 0) {
-    return null
-  }
-
   return (
     <SidebarGroup className="shrink-0 p-0 pb-1">
       <div className="group/section flex shrink-0 items-center justify-between pb-1 pt-1.5">
@@ -251,7 +244,7 @@ function CronJobSidebarRow({
   job: CronJob
   nowMs: number
   onManage: () => void
-  onOpenRun: (sessionId: string) => void
+  onOpenRun: (sessionId: string, session?: SessionInfo) => void
   onTogglePeek: () => void
   onTrigger: () => void
 }) {
@@ -262,7 +255,13 @@ function CronJobSidebarRow({
   const label = jobTitle(job)
   const isPaused = state === 'paused'
 
-  const meta = INACTIVE_STATES.has(state) ? (c.states[state] ?? state) : next !== null ? relativeTime(next, nowMs) : '—'
+  const overdue = nextRunOverdueMs(job, nowMs) !== null
+
+  const meta = INACTIVE_STATES.has(state)
+    ? (c.states[state] ?? state)
+    : next !== null
+      ? `${overdue ? `${c.overdueSince.replace(/:$/, '')} ` : ''}${relativeTime(next, nowMs)}`
+      : '—'
 
   // Pause/resume and delete aren't threaded through the sidebar's prop chain, so
   // drive them against the shared $cronJobs atom directly (same path the cron
@@ -400,7 +399,13 @@ function CronJobSidebarRow({
   )
 }
 
-function CronJobSidebarRuns({ jobId, onOpenRun }: { jobId: string; onOpenRun: (sessionId: string) => void }) {
+function CronJobSidebarRuns({
+  jobId,
+  onOpenRun
+}: {
+  jobId: string
+  onOpenRun: (sessionId: string, session?: SessionInfo) => void
+}) {
   const { t } = useI18n()
   const c = t.cron
   const selectedSessionId = useStore($selectedStoredSessionId)
@@ -415,6 +420,9 @@ function CronJobSidebarRuns({ jobId, onOpenRun }: { jobId: string; onOpenRun: (s
     const load = () =>
       getCronJobRuns(jobId, PEEK_RUN_LIMIT)
         .then(result => {
+          // A fresh poll re-evaluates every run already opened (#88443).
+          reconcileCronRunVerdicts(result)
+
           if (!cancelled) {
             setRuns(result)
           }
@@ -462,21 +470,33 @@ function CronJobSidebarRuns({ jobId, onOpenRun }: { jobId: string; onOpenRun: (s
         <div className="py-1 pl-1 text-[0.6875rem] text-(--ui-text-tertiary)">{c.noRuns}</div>
       ) : (
         <>
-          {runs.map(run => (
-            <button
-              className={cn(
-                'truncate rounded-md px-1.5 py-0.5 text-left text-[0.6875rem] tabular-nums focus-visible:bg-(--chrome-action-hover) focus-visible:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40',
-                run.id === selectedSessionId
-                  ? 'bg-(--ui-row-active-background) text-foreground'
-                  : 'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-foreground'
-              )}
-              key={run.id}
-              onClick={() => onOpenRun(run.id)}
-              type="button"
-            >
-              {formatRunTime(run.last_active || run.started_at)}
-            </button>
-          ))}
+          {runs.map(run =>
+            isSyntheticCronOutputRun(run) ? (
+              // Output-doc rows have no backing session to open.
+              <div
+                className="truncate rounded-md px-1.5 py-0.5 text-[0.6875rem] text-(--ui-text-secondary) tabular-nums"
+                key={run.id}
+              >
+                {formatRunTime(run.last_active || run.started_at)}
+              </div>
+            ) : (
+              // One click to the run's transcript; a run the scheduler never
+              // closed (watchdog kill / crash) opens view-only (#88443).
+              <button
+                className={cn(
+                  'truncate rounded-md px-1.5 py-0.5 text-left text-[0.6875rem] tabular-nums focus-visible:bg-(--chrome-action-hover) focus-visible:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/40',
+                  run.id === selectedSessionId
+                    ? 'bg-(--ui-row-active-background) text-foreground'
+                    : 'text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-foreground'
+                )}
+                key={run.id}
+                onClick={() => openCronRun(run, onOpenRun)}
+                type="button"
+              >
+                {formatRunTime(run.last_active || run.started_at)}
+              </button>
+            )
+          )}
         </>
       )}
     </div>

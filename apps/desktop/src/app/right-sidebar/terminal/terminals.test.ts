@@ -1,8 +1,7 @@
 import { atom } from 'nanostores'
-import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
 
 const STORAGE_KEY = 'hermes.desktop.terminals.v1'
-const bufferKey = (id: string) => `hermes.desktop.terminal-buffer.v1.${id}`
 
 async function loadTerminalStore() {
   const $currentCwd = atom('/workspace')
@@ -13,36 +12,6 @@ async function loadTerminalStore() {
 
   return { ...(await import('./terminals')), $currentCwd }
 }
-
-afterEach(() => {
-  vi.unstubAllGlobals()
-})
-
-describe('terminal capability', () => {
-  beforeEach(() => {
-    window.localStorage.clear()
-    vi.resetModules()
-  })
-
-  it('does not auto-create a user terminal when the PTY bridge is absent', async () => {
-    vi.stubGlobal('hermesDesktop', undefined)
-    const { $terminals, ensureTerminal } = await loadTerminalStore()
-
-    ensureTerminal()
-
-    expect($terminals.get()).toEqual([])
-  })
-
-  it('keeps auto-creation available when the PTY bridge is present', async () => {
-    vi.stubGlobal('hermesDesktop', { terminal: {} })
-    const { $terminals, ensureTerminal } = await loadTerminalStore()
-
-    ensureTerminal()
-
-    expect($terminals.get()).toHaveLength(1)
-    expect($terminals.get()[0]?.kind).toBe('user')
-  })
-})
 
 describe('terminal store persistence', () => {
   beforeEach(() => {
@@ -56,41 +25,22 @@ describe('terminal store persistence', () => {
       JSON.stringify({
         activeTerminalId: 'term-two',
         terminals: [
-          { auto: false, cwd: '/repo/one', id: 'term-one', title: 'zsh' },
+          { auto: false, cwd: '/repo/one', id: 'term-one', reviveBuffer: 'last output', title: 'zsh' },
           { auto: true, cwd: '/repo/two', id: 'term-two', title: 'Terminal' }
         ]
       })
     )
-    window.localStorage.setItem(bufferKey('term-one'), JSON.stringify({ reviveBuffer: 'last output' }))
 
-    const { $activeTerminalId, $terminals, getTerminalBuffer } = await loadTerminalStore()
+    const { $activeTerminalId, $terminals } = await loadTerminalStore()
 
     expect($activeTerminalId.get()).toBe('term-two')
     expect($terminals.get()).toEqual([
-      { auto: false, cwd: '/repo/one', id: 'term-one', kind: 'user', title: 'zsh' },
+      { auto: false, cwd: '/repo/one', id: 'term-one', kind: 'user', reviveBuffer: 'last output', title: 'zsh' },
       { auto: true, cwd: '/repo/two', id: 'term-two', kind: 'user', title: 'Terminal' }
     ])
-    expect(getTerminalBuffer('term-one')).toEqual({ reviveBuffer: 'last output' })
   })
 
-  it('migrates a legacy inline reviveBuffer/restoreCwd into the per-tab buffer store', async () => {
-    window.localStorage.setItem(
-      STORAGE_KEY,
-      JSON.stringify({
-        activeTerminalId: 'term-one',
-        terminals: [
-          { auto: false, cwd: '/repo', id: 'term-one', restoreCwd: '/repo/api', reviveBuffer: 'hist', title: 'zsh' }
-        ]
-      })
-    )
-
-    const { $terminals, getTerminalBuffer } = await loadTerminalStore()
-
-    expect($terminals.get()[0]).toEqual({ auto: false, cwd: '/repo', id: 'term-one', kind: 'user', title: 'zsh' })
-    expect(getTerminalBuffer('term-one')).toEqual({ restoreCwd: '/repo/api', reviveBuffer: 'hist' })
-  })
-
-  it('persists user tabs as pure metadata, skipping agent mirrors and buffer bytes', async () => {
+  it('persists user tabs and history synchronously, skipping agent mirrors', async () => {
     const { createTerminal, ensureAgentTerminal, renameTerminal, selectTerminal, updateTerminalReviveBuffer } =
       await loadTerminalStore()
 
@@ -100,34 +50,35 @@ describe('terminal store persistence', () => {
     ensureAgentTerminal('proc-1', 'background task')
     selectTerminal(userId)
 
-    // No flush/tick: the metadata list persists synchronously (this is what
-    // makes app-quit restore reliable). The buffer write is throttled
-    // separately and is asserted via getTerminalBuffer, not this key.
+    // No flush/tick: persistence is synchronous, so the snapshot is already on
+    // disk (this is what makes app-quit restore reliable).
     expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}')).toEqual({
       activeTerminalId: userId,
-      terminals: [{ auto: false, cwd: '/repo', id: userId, title: 'server' }]
+      terminals: [{ auto: false, cwd: '/repo', id: userId, reviveBuffer: 'recent scrollback', title: 'server' }]
     })
   })
 
   it('never attaches a revive buffer to an agent tab', async () => {
-    const { ensureAgentTerminal, getTerminalBuffer, updateTerminalReviveBuffer } = await loadTerminalStore()
+    const { $terminals, ensureAgentTerminal, updateTerminalReviveBuffer } = await loadTerminalStore()
 
     const agentId = ensureAgentTerminal('proc-1', 'background task')!
     updateTerminalReviveBuffer(agentId, 'should be ignored')
 
-    expect(getTerminalBuffer(agentId)).toBeUndefined()
+    expect($terminals.get().find(term => term.id === agentId)?.reviveBuffer).toBeUndefined()
+    expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
   })
 
   it('tail-trims an oversized revive buffer to stay under the storage budget', async () => {
-    const { createTerminal, getTerminalBuffer, updateTerminalReviveBuffer } = await loadTerminalStore()
+    const { $terminals, createTerminal, updateTerminalReviveBuffer } = await loadTerminalStore()
 
     const userId = createTerminal('/repo')
     const huge = 'x'.repeat(60_000)
     updateTerminalReviveBuffer(userId, huge)
 
-    const stored = getTerminalBuffer(userId)?.reviveBuffer ?? ''
-    expect(stored.length).toBe(48_000)
-    expect(stored).toBe(huge.slice(-48_000))
+    const stored = $terminals.get().find(term => term.id === userId)?.reviveBuffer ?? ''
+    expect(stored.length).toBeGreaterThan(0)
+    expect(stored.length).toBeLessThan(huge.length)
+    expect(stored).toBe(huge.slice(-stored.length))
   })
 
   it('clears remembered tabs when all terminals close', async () => {
@@ -140,54 +91,28 @@ describe('terminal store persistence', () => {
     expect(window.localStorage.getItem(STORAGE_KEY)).toBeNull()
   })
 
-  it('frees a closed tab buffer entry from the map and its own storage key', async () => {
-    vi.useFakeTimers()
-
-    const { closeTerminal, createTerminal, getTerminalBuffer, updateTerminalReviveBuffer } = await loadTerminalStore()
-
-    const userId = createTerminal('/repo')
-    updateTerminalReviveBuffer(userId, 'scrollback')
-    await vi.runAllTimersAsync()
-    expect(window.localStorage.getItem(bufferKey(userId))).not.toBeNull()
-
-    closeTerminal(userId)
-
-    expect(getTerminalBuffer(userId)).toBeUndefined()
-    expect(window.localStorage.getItem(bufferKey(userId))).toBeNull()
-
-    vi.useRealTimers()
-  })
-
   it('restores and persists the last observed cwd so a reopened tab lands where the user cd-d', async () => {
     window.localStorage.setItem(
       STORAGE_KEY,
       JSON.stringify({
         activeTerminalId: 'term-one',
-        terminals: [{ auto: false, cwd: '/repo', id: 'term-one', title: 'zsh' }]
+        terminals: [{ auto: false, cwd: '/repo', id: 'term-one', restoreCwd: '/repo/packages/api', title: 'zsh' }]
       })
     )
-    window.localStorage.setItem(bufferKey('term-one'), JSON.stringify({ restoreCwd: '/repo/packages/api' }))
 
-    vi.useFakeTimers()
+    const { $terminals, updateTerminalRestoreCwd } = await loadTerminalStore()
 
-    const { getTerminalBuffer, updateTerminalRestoreCwd } = await loadTerminalStore()
-
-    expect(getTerminalBuffer('term-one')?.restoreCwd).toBe('/repo/packages/api')
+    expect($terminals.get()[0]?.restoreCwd).toBe('/repo/packages/api')
 
     updateTerminalRestoreCwd('term-one', '/repo/packages/web')
-    expect(getTerminalBuffer('term-one')?.restoreCwd).toBe('/repo/packages/web')
-
-    await vi.runAllTimersAsync()
-    expect(JSON.parse(window.localStorage.getItem(bufferKey('term-one')) ?? '{}').restoreCwd).toBe(
+    expect($terminals.get()[0]?.restoreCwd).toBe('/repo/packages/web')
+    expect(JSON.parse(window.localStorage.getItem(STORAGE_KEY) ?? '{}').terminals[0].restoreCwd).toBe(
       '/repo/packages/web'
     )
-
-    vi.useRealTimers()
   })
 
   it('never attaches a restore cwd to an agent tab and ignores empty values', async () => {
-    const { createTerminal, ensureAgentTerminal, getTerminalBuffer, updateTerminalRestoreCwd } =
-      await loadTerminalStore()
+    const { $terminals, createTerminal, ensureAgentTerminal, updateTerminalRestoreCwd } = await loadTerminalStore()
 
     const userId = createTerminal('/repo')
     const agentId = ensureAgentTerminal('proc-1', 'background task')!
@@ -195,8 +120,8 @@ describe('terminal store persistence', () => {
     updateTerminalRestoreCwd(agentId, '/somewhere')
     updateTerminalRestoreCwd(userId, '   ')
 
-    expect(getTerminalBuffer(agentId)).toBeUndefined()
-    expect(getTerminalBuffer(userId)?.restoreCwd).toBeUndefined()
+    expect($terminals.get().find(term => term.id === agentId)?.restoreCwd).toBeUndefined()
+    expect($terminals.get().find(term => term.id === userId)?.restoreCwd).toBeUndefined()
   })
 })
 
@@ -262,5 +187,189 @@ describe('session cwd → terminal tab linking', () => {
     selectTerminal(first)
     $currentCwd.set('/repo')
     expect($activeTerminalId.get()).toBe(first)
+  })
+})
+
+describe('shared WebGL atlas refresh fan-out', () => {
+  beforeEach(() => {
+    window.localStorage.clear()
+    vi.resetModules()
+  })
+
+  it('coalesces multiple requests into one frame and drops unregistered terminals', async () => {
+    const { redrawAllTerminals, registerWebglRefresh } = await loadTerminalStore()
+
+    const termA = { refresh: vi.fn(), rows: 24 }
+    const termB = { refresh: vi.fn(), rows: 24 }
+    const getWebgl = () => ({ clearTextureAtlas: vi.fn() }) as never
+    const unregister = registerWebglRefresh(termA as never, getWebgl)
+    registerWebglRefresh(termB as never, getWebgl)
+
+    // A theme switch fires one redraw request per mounted terminal; they must
+    // coalesce into a single atlas clear/refresh pass.
+    redrawAllTerminals()
+    redrawAllTerminals()
+    expect(termA.refresh).not.toHaveBeenCalled()
+    expect(termB.refresh).not.toHaveBeenCalled()
+
+    await new Promise<void>(resolve => {
+      requestAnimationFrame(() => resolve())
+    })
+
+    expect(termA.refresh).toHaveBeenCalledTimes(1)
+    expect(termB.refresh).toHaveBeenCalledTimes(1)
+
+    // A terminal that disposes (tab close) must stop being refreshed.
+    unregister()
+    redrawAllTerminals()
+    await new Promise<void>(resolve => {
+      requestAnimationFrame(() => resolve())
+    })
+
+    expect(termA.refresh).toHaveBeenCalledTimes(1)
+    expect(termB.refresh).toHaveBeenCalledTimes(2)
+  })
+
+  it('drops a terminal unregistered while a refresh frame is pending', async () => {
+    const { redrawAllTerminals, registerWebglRefresh } = await loadTerminalStore()
+
+    const termA = { refresh: vi.fn(), rows: 24 }
+    const termB = { refresh: vi.fn(), rows: 24 }
+    const getWebgl = () => ({ clearTextureAtlas: vi.fn() }) as never
+    registerWebglRefresh(termA as never, getWebgl)
+    const unregister = registerWebglRefresh(termB as never, getWebgl)
+
+    // Both are pending in the same frame; second disposes before it flushes.
+    redrawAllTerminals()
+    unregister()
+    await new Promise<void>(resolve => {
+      requestAnimationFrame(() => resolve())
+    })
+
+    expect(termA.refresh).toHaveBeenCalledTimes(1)
+    expect(termB.refresh).not.toHaveBeenCalled()
+  })
+
+  it('skips the caller terminal so it is not force-cleared through the fan-out', async () => {
+    const { redrawAllTerminals, registerWebglRefresh } = await loadTerminalStore()
+
+    const caller = { refresh: vi.fn(), rows: 24 }
+    const sibling = { refresh: vi.fn(), rows: 24 }
+    const getWebgl = () => ({ clearTextureAtlas: vi.fn() }) as never
+    registerWebglRefresh(caller as never, getWebgl)
+    registerWebglRefresh(sibling as never, getWebgl)
+
+    // A font change clears the caller inline (applyTerminalFontFamily), so the
+    // fan-out must not re-clear it — only the siblings sharing the atlas.
+    redrawAllTerminals(caller as never)
+    await new Promise<void>(resolve => {
+      requestAnimationFrame(() => resolve())
+    })
+
+    expect(caller.refresh).not.toHaveBeenCalled()
+    expect(sibling.refresh).toHaveBeenCalledTimes(1)
+  })
+
+  it('clears all atlases before refreshing any terminal (two-phase ordering)', async () => {
+    const { redrawAllTerminals, registerWebglRefresh } = await loadTerminalStore()
+
+    // Track operation order across terminals sharing one atlas.
+    const ops: string[] = []
+    const sharedAtlas = { clearTextureAtlas: () => ops.push('clear') }
+    const getWebgl = () => sharedAtlas as never
+
+    const termA = {
+      refresh: () => ops.push('refresh-A'),
+      rows: 24
+    }
+
+    const termB = {
+      refresh: () => ops.push('refresh-B'),
+      rows: 24
+    }
+
+    registerWebglRefresh(termA as never, getWebgl)
+    registerWebglRefresh(termB as never, getWebgl)
+
+    redrawAllTerminals()
+    await new Promise<void>(resolve => {
+      requestAnimationFrame(() => resolve())
+    })
+
+    // Both clears must precede both refreshes. If a clear ran after a refresh,
+    // that terminal's rebuilt model would reference freed atlas rows.
+    const clearIndices = ops.map((op, i) => (op === 'clear' ? i : -1)).filter(i => i >= 0)
+    const refreshIndices = ops.map((op, i) => (op.startsWith('refresh-') ? i : -1)).filter(i => i >= 0)
+
+    expect(clearIndices).toHaveLength(2)
+    expect(refreshIndices).toHaveLength(2)
+    expect(Math.max(...clearIndices)).toBeLessThan(Math.min(...refreshIndices))
+  })
+
+  it('keeps refreshing siblings when one terminal atlas clear throws', async () => {
+    const { redrawAllTerminals, registerWebglRefresh } = await loadTerminalStore()
+
+    const broken = { refresh: vi.fn(), rows: 24 }
+    const healthy = { refresh: vi.fn(), rows: 24 }
+    const getWebgl = () => ({ clearTextureAtlas: vi.fn() }) as never
+
+    const getDeadWebgl = () =>
+      ({
+        clearTextureAtlas: () => {
+          throw new Error('webgl context lost')
+        }
+      }) as never
+
+    registerWebglRefresh(broken as never, getDeadWebgl)
+    registerWebglRefresh(healthy as never, getWebgl)
+
+    // A post-context-loss clear must not abort the fan-out: the sibling still
+    // needs its rebuild, and the thrower still needs its own repaint.
+    redrawAllTerminals()
+    await new Promise<void>(resolve => {
+      requestAnimationFrame(() => resolve())
+    })
+
+    expect(broken.refresh).toHaveBeenCalledTimes(1)
+    expect(healthy.refresh).toHaveBeenCalledTimes(1)
+  })
+
+  it('rebuilds every registered terminal after a system resume', async () => {
+    let powerResumed: (() => void) | undefined
+
+    // The store subscribes to the main process's powerMonitor broadcast at
+    // import time (same pattern as store/power.ts), so the mock must exist
+    // before the module loads.
+    window.hermesDesktop = {
+      onPowerResume: vi.fn((callback: () => void) => {
+        powerResumed = callback
+
+        return () => {}
+      })
+    } as never
+
+    try {
+      await loadTerminalStore()
+
+      const termA = { refresh: vi.fn(), rows: 24 }
+      const termB = { refresh: vi.fn(), rows: 24 }
+      const getWebgl = () => ({ clearTextureAtlas: vi.fn() }) as never
+      const { registerWebglRefresh } = await import('./terminals')
+
+      registerWebglRefresh(termA as never, getWebgl)
+      registerWebglRefresh(termB as never, getWebgl)
+
+      // macOS can evict the glyph textures on wake WITHOUT firing
+      // webglcontextlost; the resume broadcast must trigger a full rebuild.
+      powerResumed!()
+      await new Promise<void>(resolve => {
+        requestAnimationFrame(() => resolve())
+      })
+
+      expect(termA.refresh).toHaveBeenCalledTimes(1)
+      expect(termB.refresh).toHaveBeenCalledTimes(1)
+    } finally {
+      Reflect.deleteProperty(window, 'hermesDesktop')
+    }
   })
 })

@@ -87,7 +87,6 @@ const NAMESPACED = new Set([
  */
 const SENTINEL_GATED: Record<string, string> = {
   'app/settings/gateway-settings.tsx': 'getConnectionConfig',
-  'components/boot-failure-overlay.tsx': 'getConnectionConfig',
   'components/desktop-install-overlay.tsx': 'onBootstrapEvent',
   // Rendered ONLY by desktop-install-overlay (its remote-setup step), which
   // bails before mount unless onBootstrapEvent exists — so this form never
@@ -99,12 +98,17 @@ const SENTINEL_GATED: Record<string, string> = {
   // it, a local gateway hosts its own loopback listener and a remote one
   // throws an explicit "Update Hermes Desktop" message — neither reaches
   // bridge.listen()/cancel(). Self-disables if the shim ever adds mcpOauth.
-  'lib/mcp-dashboard-oauth.ts': 'mcpOauth'
+  'lib/mcp-dashboard-oauth.ts': 'mcpOauth',
+  // Only caller is gateway-settings.tsx's GatewayConnectionSettings, which
+  // renders its "unavailable" EmptyState before any handler that reaches
+  // reconnectMovedCloudAgent() can mount when getConnectionConfig is absent.
+  'app/settings/cloud-team-change.ts': 'getConnectionConfig'
 }
 
 /** Files exempted by a gate that lives in ANOTHER file (the renderer). */
 const GATE_OWNER: Record<string, string> = {
-  'components/first-run-remote-form.tsx': 'components/desktop-install-overlay.tsx'
+  'components/first-run-remote-form.tsx': 'components/desktop-install-overlay.tsx',
+  'app/settings/cloud-team-change.ts': 'app/settings/gateway-settings.tsx'
 }
 
 /**
@@ -116,7 +120,30 @@ const VERIFIED_SAFE: Record<string, string> = {
   'contrib/plugin.ts:writeClipboard': 'wrapped in attempt() try/catch',
   // Ternary: the web shim is always mode:'remote', so the bridge branch is
   // dead and gatewayMediaDataUrl() serves the image over the API instead.
-  'components/assistant-ui/directive-text.tsx:readFileDataUrl': 'remote branch bypasses the bridge'
+  'components/assistant-ui/directive-text.tsx:readFileDataUrl': 'remote branch bypasses the bridge',
+  // Reached only when readDesktopFileText() threw Electron's "No handler
+  // registered for 'hermes:readFileText'" IPC error; in the web build the
+  // remote-mode read goes over /api/fs/read-text and never produces it.
+  'app/chat/right-rail/preview-file.tsx:readFileDataUrl': 'stale-preload IPC fallback, unreachable on web',
+  // `route?.connectionId && desktop.getConnectionFor` short-circuits: the
+  // shim has neither profile.getDefault nor getConnectionFor.
+  'app/gateway/hooks/use-gateway-boot.ts:getConnectionFor': 'guarded by `&& desktop.getConnectionFor`',
+  // `bridge` is the optional `minimizeToTray` namespace; the effect returns
+  // early on `if (!bridge)` and the shim omits the namespace.
+  'app/settings/minimize-to-tray-setting.tsx:onChanged': 'namespace alias guarded by if (!bridge)',
+  // `bridge` is the optional `introReveal` namespace (absent in the shim), so
+  // `bridge?.onSkip(...)` short-circuits on the namespace.
+  'store/intro-reveal.ts:onSkip': 'optional introReveal namespace short-circuits',
+  'store/intro-reveal.ts:onClosed': 'optional introReveal namespace short-circuits',
+  // The shim now defines desktopPluginsRoot (fork-web-desktop-bridge plugin), so
+  // the disk door is reachable once that plugin is enabled. The shim still
+  // omits the preview-file watch pair: watchDiskPluginFile() calls
+  // watchPreviewFile inside try/catch, so the "not a function" TypeError is
+  // swallowed and record.watchId stays null — which makes both
+  // stopPreviewFileWatch calls (each behind `if (record.watchId)`) dead code.
+  // Hot-reload falls back to the loader's 5s poll.
+  'contrib/runtime-loader.ts:watchPreviewFile': 'inside try/catch in watchDiskPluginFile',
+  'contrib/runtime-loader.ts:stopPreviewFileWatch': 'behind if (record.watchId), never set without watchPreviewFile'
 }
 
 interface Site {

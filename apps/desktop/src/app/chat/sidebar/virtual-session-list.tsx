@@ -5,6 +5,7 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import type * as React from 'react'
 import { type FC, useEffect, useRef } from 'react'
 
+import { forkListDividerAction } from '@/fork/sidebar-group-actions'
 import type { SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { type SidebarListRow } from '@/lib/session-date-groups'
@@ -15,7 +16,7 @@ import { $sessionListDensity } from '@/store/session-list-density'
 
 import { SidebarDateDivider } from './chrome'
 import { SidebarSessionRow } from './session-row'
-import { sessionRowEstimate } from './session-row-details'
+import { SESSION_CARD_ROW_ESTIMATE_PX, sessionRowEstimate } from './session-row-details'
 
 interface SessionRowCommonProps {
   branchStem?: string
@@ -38,8 +39,8 @@ export interface VirtualSessionListProps {
   /** Render every session row as the three-line inbox card. */
   card?: boolean
   className?: string
-  /** Hover-revealed controls for each date divider (group-level actions). */
-  dividerAction?: (key: string, label: string) => React.ReactNode
+  /** Hover-revealed control for date dividers (the group-level "+"). */
+  dividerAction?: React.ReactNode
   /** Collapse/expand the sessions under a date or status divider. */
   dividerToggle?: {
     ariaLabel: (label: string, open: boolean) => string
@@ -51,10 +52,6 @@ export interface VirtualSessionListProps {
   onBranchSession?: (sessionId: string, profile?: string) => void
   onDeleteSession: (sessionId: string) => void
   onResumeSession: (sessionId: string, session?: SessionInfo) => void
-  /** Restore an archived row. Optional: only Recents ever renders archived
-   *  rows — Pinned/Search never do. Mirrors `sessions-section.tsx`'s
-   *  `renderRow` inverse-action wiring. */
-  onUnarchiveSession?: (sessionId: string) => void
   onTogglePin: (sessionId: string) => void
   onToggleUnread: (sessionId: string) => void
   pinned: boolean
@@ -64,8 +61,8 @@ export interface VirtualSessionListProps {
 
 // Matches the card's typical rendered height (four lines when a preview
 // exists) so long card lists don't jump under the scroll thumb before
-// self-measurement catches up.
-const CARD_ROW_ESTIMATE_PX = 74
+// self-measurement catches up. Kept at/above the wrapped-title worst case —
+// see SESSION_CARD_ROW_ESTIMATE_PX (#88473).
 const DIVIDER_ESTIMATE_PX = 28
 const OVERSCAN_ROWS = 12
 
@@ -80,7 +77,6 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
   onBranchSession,
   onDeleteSession,
   onResumeSession,
-  onUnarchiveSession,
   onTogglePin,
   onToggleUnread,
   pinned,
@@ -101,7 +97,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
         return DIVIDER_ESTIMATE_PX
       }
 
-      return card ? CARD_ROW_ESTIMATE_PX : sessionRowEstimate(density)
+      return card ? SESSION_CARD_ROW_ESTIMATE_PX : sessionRowEstimate(density)
     },
     getItemKey: index => {
       const row = listRows[index]
@@ -114,9 +110,10 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
     overscan: OVERSCAN_ROWS
   })
 
-  // Rows are measured after paint, so changing density must invalidate cached
-  // measurements from the previous mode before off-screen rows re-enter.
-  useEffect(() => virtualizer.measure(), [density, virtualizer])
+  // Rows are measured after paint, so changing density OR toggling Inbox
+  // cards must invalidate cached measurements from the previous mode before
+  // off-screen rows re-enter (#88473).
+  useEffect(() => virtualizer.measure(), [card, density, virtualizer])
 
   const virtualItems = virtualizer.getVirtualItems()
   const totalSize = virtualizer.getTotalSize()
@@ -144,7 +141,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       return (
         <div data-index={virtualItem.index} key={row.key} ref={virtualizer.measureElement} style={itemStyle}>
           <SidebarDateDivider
-            action={dividerAction?.(row.key, label)}
+            action={forkListDividerAction(row, dividerAction) /* FORK ANCHOR: sidebar-group-action */}
             label={label}
             toggle={
               dividerToggle
@@ -168,19 +165,7 @@ export const VirtualSessionList: FC<VirtualSessionListProps> = ({
       card,
       isPinned: pinned,
       isSelected: session.id === activeSessionId,
-      // Archived filter rows are the session's OWN inverse action: the
-      // "Archive session" verb is a no-op on an already-archived row, so
-      // swap to Unarchive whenever this row IS archived (never on a live
-      // row even if `showArchived` is somehow stale — `session.archived`
-      // is the row's own ground truth). Sections that never render archived
-      // rows (Pinned, Search) don't wire `onUnarchiveSession` — falls back
-      // to a no-op rather than mis-firing the archive RPC on an archived
-      // row. Mirrors `sessions-section.tsx`'s `renderRow`.
-      onArchive: session.archived
-        ? onUnarchiveSession
-          ? () => onUnarchiveSession(session.id)
-          : () => {}
-        : () => onArchiveSession(session.id),
+      onArchive: () => onArchiveSession(session.id),
       onBranch: onBranchSession ? () => onBranchSession(session.id, session.profile) : undefined,
       onDelete: () => onDeleteSession(session.id),
       onPin: () => onTogglePin(sessionPinId(session)),

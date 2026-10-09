@@ -5,6 +5,10 @@
  *  case. Compare through these rather than `===` / `startsWith`.
  */
 
+/** Windows drive (`C:\\`, `C:/`) or UNC (`\\\\server\\share`) absolute path.
+ *  Such a path never gets joined onto a cwd. */
+export const isWindowsAbsolutePath = (path: string): boolean => /^(?:[A-Za-z]:[\\/]|\\\\)/.test(path)
+
 /** POSIX-style spelling: one separator, no trailing slash. */
 export const cleanPath = (path: string): string => path.trim().replace(/\\/g, '/').replace(/\/+$/, '') || '/'
 
@@ -20,19 +24,4 @@ export const isUnderPath = (parent: string, child: string): boolean => {
   const c = comparisonPath(cleanPath(child))
 
   return c === p || c.startsWith(`${p}/`)
-}
-
-/** Join a base path with one or more relative segments using the same
- *  forward-slash spelling `cleanPath` produces, regardless of whether `base`
- *  itself is POSIX- or Windows-spelled (a local Windows backend reports
- *  backslash cwds). Segments are trimmed of leading/trailing slashes before
- *  joining so a caller never has to reason about double slashes.
- *  Replacement for hardcoded template-literal joins (interpolating a raw
- *  path variable followed by a literal slash), which break when that
- *  variable turns out to be backslash-separated. */
-export const joinPath = (base: string, ...segments: string[]): string => {
-  const cleanedBase = cleanPath(base)
-  const cleanedSegments = segments.map(segment => segment.trim().replace(/^\/+|\/+$/g, '')).filter(Boolean)
-
-  return [cleanedBase, ...cleanedSegments].join('/')
 }

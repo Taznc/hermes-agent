@@ -57,6 +57,7 @@ def test_initial_connect_failure_is_registry_owned_and_reaped(monkeypatch, tmp_p
     monkeypatch.setattr(mcp_tool, "MCPServerTask", _FailingServerTask)
     monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
     monkeypatch.setattr(mcp_tool, "_MAX_INITIAL_CONNECT_RETRIES", 0)
+    monkeypatch.setattr(mcp_tool, "_PARKED_RETRY_INTERVAL", 3600)
 
     real_stop = _mcp_loop._stop_mcp_loop
     pending_at_stop = []
@@ -107,8 +108,8 @@ def test_initial_connect_failure_is_registry_owned_and_reaped(monkeypatch, tmp_p
         _cleanup_mcp_state(mcp_tool, created)
 
 
-def test_initial_connect_failure_revives_same_registered_server_after_config_change(monkeypatch, tmp_path):
-    """A cached parked failure revives through an intentional config change."""
+def test_initial_connect_failure_revives_same_registered_server(monkeypatch, tmp_path):
+    """A cached parked failure must revive through register_mcp_servers()."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from tools import mcp_tool
@@ -119,12 +120,7 @@ def test_initial_connect_failure_revives_same_registered_server_after_config_cha
     created = []
     backend_up = threading.Event()
     revived = threading.Event()
-    state = {
-        "transport_calls": 0,
-        "tool_calls": 0,
-        "connect_timeouts": [],
-        "bound_settings": [],
-    }
+    state = {"transport_calls": 0, "tool_calls": 0}
     mock_registry = ToolRegistry()
 
     class _Session:
@@ -144,8 +140,6 @@ def test_initial_connect_failure_revives_same_registered_server_after_config_cha
         async def _run_stdio(self, config):
             assert mcp_tool._connect_server_claim.get() is None
             state["transport_calls"] += 1
-            state["connect_timeouts"].append(config["connect_timeout"])
-            state["bound_settings"].append((self._auth_type, self._idle_timeout_seconds))
             if not backend_up.is_set():
                 raise ConnectionError("backend still booting")
 
@@ -168,14 +162,11 @@ def test_initial_connect_failure_revives_same_registered_server_after_config_cha
     monkeypatch.setattr(mcp_tool, "MCPServerTask", _RecoveringServerTask)
     monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
     monkeypatch.setattr(mcp_tool, "_MAX_INITIAL_CONNECT_RETRIES", 0)
+    monkeypatch.setattr(mcp_tool, "_PARKED_RETRY_INTERVAL", 3600)
     monkeypatch.setattr(registry_module, "registry", mock_registry)
 
     config = {
-        "recovering": {
-            "command": "unused",
-            "connect_timeout": 5,
-            "idle_timeout_seconds": 10,
-        }
+        "recovering": {"command": "unused", "connect_timeout": 5}
     }
 
     try:
@@ -190,23 +181,14 @@ def test_initial_connect_failure_revives_same_registered_server_after_config_cha
         assert not server._task.done()
 
         backend_up.set()
-        _mcp_discovery.register_mcp_servers({
-            "recovering": {
-                "command": "unused",
-                "connect_timeout": 6,
-                "auth": "oauth",
-                "idle_timeout_seconds": 23,
-            }
-        })
+        _mcp_discovery.register_mcp_servers(config)
 
-        assert revived.wait(timeout=5), "cached parked server did not revive after config change"
+        assert revived.wait(timeout=5), "cached parked server did not revive"
         assert len(created) == 1, "revival created a duplicate server task"
         with mcp_tool._lock:
             assert mcp_tool._servers["recovering"] is server
             assert "recovering" not in mcp_tool._server_connect_errors
         assert state["transport_calls"] == 2
-        assert state["connect_timeouts"] == [5, 6]
-        assert state["bound_settings"] == [("", 10.0), ("oauth", 23.0)]
         assert server.session is not None
         assert server._error is None
 
@@ -248,6 +230,7 @@ def test_initial_auth_failure_is_retained_and_reaped(monkeypatch, tmp_path):
 
     monkeypatch.setattr(mcp_tool, "MCPServerTask", _AuthFailingServerTask)
     monkeypatch.setattr(mcp_tool, "_MCP_AVAILABLE", True)
+    monkeypatch.setattr(mcp_tool, "_PARKED_RETRY_INTERVAL", 3600)
     monkeypatch.setattr(_mcp_errors, "_is_auth_error", lambda exc: True)
 
     try:
@@ -292,6 +275,7 @@ def test_standalone_failed_connect_is_reaped_without_global_owner(monkeypatch, t
 
     monkeypatch.setattr(mcp_tool, "MCPServerTask", _ProbeServerTask)
     monkeypatch.setattr(mcp_tool, "_MAX_INITIAL_CONNECT_RETRIES", 0)
+    monkeypatch.setattr(mcp_tool, "_PARKED_RETRY_INTERVAL", 3600)
     _mcp_loop._ensure_mcp_loop()
 
     try:

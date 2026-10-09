@@ -2,9 +2,11 @@ import { hermesApi } from '@/api/client'
 import type {
   HermesConnection,
   HermesReadDirResult,
+  HermesReadFileErrorResult,
   HermesReadFileTextResult,
   HermesSelectPathsOptions
 } from '@/global'
+import { translateNow } from '@/i18n'
 import { $connection } from '@/store/session'
 
 export interface DesktopFsRemotePicker {
@@ -45,13 +47,6 @@ export function isDesktopFsRemoteMode() {
   return $connection.get()?.mode === 'remote'
 }
 
-/** Native file verbs require both a local backend and Electron's file-manager bridge.
- * The web desktop can preview and copy gateway paths, but cannot reveal a path or
- * hand it to the OS default application on the user's machine. */
-export function canUseNativeFileActions() {
-  return !isDesktopFsRemoteMode() && typeof window.hermesDesktop?.revealPath === 'function'
-}
-
 // Active profile for FS/git REST calls. Without it the Electron api bridge
 // hits the primary (local) backend even when the user switched to a remote profile.
 export function desktopFsProfile(): string | undefined {
@@ -78,6 +73,34 @@ function remoteFsApi<T>(path: string, body?: Record<string, unknown>): Promise<T
   )
 }
 
+/** True when a bridge read returned the main process's structured "file is not
+ *  on disk" answer (the main process returns this instead of rejecting, so a
+ *  restored preview tab or transcript reference to a deleted/moved file does
+ *  not spam Electron's console with a stack trace per probe). Callers that
+ *  already try/catch their read get the same behavior as a rejection: throw
+ *  with the original message. */
+export function isReadFileErrorResult(value: unknown): value is HermesReadFileErrorResult {
+  return !!value && typeof value === 'object' && (value as { ok?: unknown }).ok === false
+}
+
+function throwForReadErrorResult(result: HermesReadFileErrorResult): never {
+  throw new DesktopFileMissingError(result)
+}
+
+/** Thrown by the facade when the main process answered that the file is simply
+ *  not on disk (the structured `{ ok:false }` result). Callers that need to
+ *  tell expected absence apart from real failures check `instanceof`; everyone
+ *  else sees an ordinary error whose message matches the old rejection. */
+export class DesktopFileMissingError extends Error {
+  readonly code: string
+
+  constructor(result: HermesReadFileErrorResult) {
+    super(result.message || `File read failed: ${result.error}`)
+    this.name = 'DesktopFileMissingError'
+    this.code = result.error
+  }
+}
+
 export async function readDesktopDir(path: string): Promise<HermesReadDirResult> {
   if (!isDesktopFsRemoteMode()) {
     return bridge().readDir(path)
@@ -88,7 +111,13 @@ export async function readDesktopDir(path: string): Promise<HermesReadDirResult>
 
 export async function readDesktopFileText(path: string): Promise<HermesReadFileTextResult> {
   if (!isDesktopFsRemoteMode()) {
-    return bridge().readFileText(path)
+    const result = await bridge().readFileText(path)
+
+    if (isReadFileErrorResult(result)) {
+      throwForReadErrorResult(result)
+    }
+
+    return result
   }
 
   return remoteFsApi<HermesReadFileTextResult>(fsPath('read-text', path))
@@ -114,9 +143,23 @@ export async function writeDesktopFileText(path: string, content: string): Promi
   return { path: result.path || path }
 }
 
+// Create a folder on the connected backend (POST /api/files/mkdir). Remote-only:
+// in local mode the picker is the native dialog, which creates folders itself.
+export async function createRemoteDir(path: string): Promise<string> {
+  const result = await remoteFsApi<{ path?: string }>('/api/files/mkdir', { path })
+
+  return result.path || path
+}
+
 export async function readDesktopFileDataUrl(path: string): Promise<string> {
   if (!isDesktopFsRemoteMode()) {
-    return bridge().readFileDataUrl(path)
+    const result = await bridge().readFileDataUrl(path)
+
+    if (isReadFileErrorResult(result)) {
+      throwForReadErrorResult(result)
+    }
+
+    return result
   }
 
   const result = await remoteFsApi<string | { dataUrl?: string }>(fsPath('read-data-url', path))
@@ -133,9 +176,13 @@ export async function readDesktopFileDataUrlLocalFirst(path: string): Promise<st
   try {
     const local = await window.hermesDesktop?.readFileDataUrl?.(path)
 
-    if (local) {
+    if (local && !isReadFileErrorResult(local)) {
       return local
     }
+
+    // A structured missing-file result from local is the same outcome as a
+    // rejection: fall through to the remote fallback below (or throw in local
+    // mode via readDesktopFileDataUrl's own guard).
   } catch (error) {
     if (!isDesktopFsRemoteMode()) {
       throw error
@@ -166,8 +213,14 @@ export async function desktopDefaultCwd(): Promise<{ branch: string; cwd: string
 }
 
 // Reveal a path in the OS file manager (Finder / Explorer / Files). Local only.
+// The bridge answers `false` when the path is not on this computer (a remote
+// backend's workspace) — surface it instead of a silent no-op.
 export async function revealDesktopPath(path: string): Promise<void> {
-  await bridge().revealPath?.(path)
+  const revealed = await bridge().revealPath?.(path)
+
+  if (revealed === false) {
+    throw new Error(translateNow('fileMenu.revealMissing'))
+  }
 }
 
 // Rename a file/folder in place; returns the new absolute path. Local only.
@@ -197,25 +250,17 @@ export async function trashDesktopPath(path: string): Promise<void> {
 export async function copyTextToClipboard(text: string): Promise<void> {
   // Ladder, not a hard dependency: the Electron bridge is preferred (its main
   // process write survives focus loss, which navigator.clipboard does not),
-  // but it is absent in the browser build and in older preloads. Falling back
-  // to the DOM API keeps "Copy path" working instead of throwing
-  // "writeClipboard is not a function". Mirrors writeClipboardText in
+  // but it is absent in the web-served build. Mirrors writeClipboardText in
   // components/ui/copy-button.tsx — the two must stay in agreement.
-  const ipc = bridge().writeClipboard
+  const desktop = window.hermesDesktop
 
-  if (ipc) {
-    await ipc(text)
-
-    return
-  }
-
-  if (navigator.clipboard?.writeText) {
-    await navigator.clipboard.writeText(text)
+  if (desktop?.writeClipboard) {
+    await desktop.writeClipboard(text)
 
     return
   }
 
-  throw new Error('Clipboard is not available')
+  await navigator.clipboard.writeText(text)
 }
 
 // Working-tree-vs-HEAD diff for one file. Empty when unchanged / not a repo.

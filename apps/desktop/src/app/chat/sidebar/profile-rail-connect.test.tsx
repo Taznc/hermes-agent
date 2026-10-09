@@ -43,25 +43,22 @@ vi.mock('@/i18n', () => ({
 }))
 
 vi.mock('@/store/profile', () => ({
-  // The rail keys its refresh on the active backend (connection + profile) so
-  // switching sources re-enumerates that machine's profiles (#85731), so this
-  // mock must publish the connection atom the component subscribes to.
-  $activeGatewayConnection: atom<null | string>(null),
   $activeGatewayProfile: atom('default'),
   $profileColors: atom({}),
   $profileCreateRequest: atom(0),
   $profileOrder: atom([]),
   $profiles: atom([{ is_default: true, name: 'default' }]),
   $profileScope: atom('default'),
+  // The rail's status summary (profile-dot-state) rides the real session
+  // stores, whose import graph reaches $showAllProfiles through layout state.
+  $showAllProfiles: atom(false),
   ALL_PROFILES: '*',
   normalizeProfileKey: (name: string) => name,
+  prewarmProfilePick: vi.fn(),
   profileLabel: (profile: { display_name?: string; name: string }) =>
     (profile.display_name ?? '').trim() || profile.name,
   refreshActiveProfile: vi.fn().mockResolvedValue(undefined),
   selectProfile: vi.fn(),
-  // The rail dials profiles on whichever source is live, not just the local
-  // pool — same #85731 seam as the connection atom above.
-  selectProfileOnActiveConnection: vi.fn(),
   setProfileColor: vi.fn(),
   setProfileOrder: vi.fn(),
   setShowAllProfiles: vi.fn(),
@@ -81,7 +78,7 @@ vi.mock('@/store/profile-share', () => ({
 }))
 
 vi.mock('./use-profile-prewarm', () => ({
-  useProfilePrewarm: () => ({ cancelPrewarm: vi.fn(), startPrewarm: vi.fn() })
+  useProfilePrewarm: () => ({ cancelPrewarm: vi.fn(), notePointerMove: vi.fn(), startPrewarm: vi.fn() })
 }))
 
 vi.mock('@/hermes', () => ({
@@ -131,37 +128,5 @@ describe('ProfileRail multi-gateway entry point', () => {
     expect(screen.getByRole('button', { name: 'default' })).toBeTruthy()
     expect(screen.queryByRole('button', { name: 'Manage gateways…' })).toBeNull()
     expect(screen.getByRole('button', { name: 'Manage profiles…' })).toBeTruthy()
-  })
-
-  it('keeps thirteen profiles direct and condenses the fourteenth', () => {
-    profiles.set([
-      { is_default: true, name: 'default' },
-      ...Array.from({ length: 12 }, (_, index) => ({ is_default: false, name: `Profile ${index + 1}` }))
-    ])
-    const { unmount } = render(<ProfileRail />)
-
-    expect(screen.queryByRole('button', { name: 'Profiles' })).toBeNull()
-    expect(screen.getByRole('button', { name: 'Profile 12' })).toBeTruthy()
-    unmount()
-
-    profiles.set([
-      { is_default: true, name: 'default' },
-      ...Array.from({ length: 13 }, (_, index) => ({ is_default: false, name: `Profile ${index + 1}` }))
-    ])
-    render(<ProfileRail />)
-
-    expect(screen.getByRole('button', { name: 'Profiles' })).toBeTruthy()
-  })
-
-  it('stays shrinkable with many profiles and multiple gateways', () => {
-    hasMultipleConnections.set(true)
-    profiles.set([
-      { is_default: true, name: 'default' },
-      ...Array.from({ length: 13 }, (_, index) => ({ is_default: false, name: `Profile ${index + 1}` }))
-    ])
-    render(<ProfileRail />)
-
-    expect(screen.getByRole('group', { name: 'Profiles' }).className).toContain('min-w-0')
-    expect(screen.getByRole('button', { name: 'Profiles' })).toBeTruthy()
   })
 })

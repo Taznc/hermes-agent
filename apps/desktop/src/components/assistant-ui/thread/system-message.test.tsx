@@ -1,10 +1,12 @@
+import { readFileSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
 import { AssistantRuntimeProvider, type ThreadMessage, useExternalStoreRuntime } from '@assistant-ui/react'
-import { cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { cleanup, fireEvent, render } from '@testing-library/react'
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { I18nProvider } from '@/i18n'
 import { $displayTimestamps } from '@/store/display-timestamps'
-import type { ReviewActionRecord } from '@/types/hermes'
 
 import { stubThreadEnvironment } from '../test-utils'
 
@@ -16,13 +18,13 @@ $displayTimestamps.set(true)
 const timestamp = new Date('2026-05-01T00:00:00.000Z')
 stubThreadEnvironment()
 
-function Harness({ text }: { text: string }) {
+function Harness({ text, asyncResult }: { text: string; asyncResult?: string }) {
   const message = {
     id: 'system-1',
     role: 'system',
     content: [{ type: 'text', text }],
     createdAt: timestamp,
-    metadata: { custom: { timelineTimestamp: timestamp.getTime() / 1000 } }
+    metadata: { custom: { timelineTimestamp: timestamp.getTime() / 1000, asyncResult } }
   } as unknown as ThreadMessage
 
   const runtime = useExternalStoreRuntime<ThreadMessage>({
@@ -48,6 +50,51 @@ function expectTimestampSeparated(container: HTMLElement, precedingText: string)
 
 afterEach(cleanup)
 
+describe('background report inline code', () => {
+  // The report body is the same `aui-md prose` markdown renderer the
+  // assistant turn uses, rendered with no assistant/room slot ancestor. The
+  // real stylesheet's cascade must still reach its `<code>`, or Tailwind
+  // Typography's fixed near-black ink wins on every dark theme (#107486).
+  const stylesheet = readFileSync(resolve(dirname(fileURLToPath(import.meta.url)), '../../../styles.css'), 'utf8')
+
+  it('themes inline code in an opened report with the chat inline-code tokens', () => {
+    const { container, getByRole } = render(
+      <>
+        <style>{stylesheet}</style>
+        <Harness asyncResult="run `discover_models` first" text="1 background agent finished" />
+      </>
+    )
+
+    fireEvent.click(getByRole('button', { name: '1 background agent finished' }))
+    const code = container.querySelector('[data-role="system"] :not(pre) > code')
+    expect(code).toBeTruthy()
+    const style = getComputedStyle(code as Element)
+
+    expect(style.color).toBe('var(--ui-inline-code-foreground)')
+    expect(style.background).toBe('var(--ui-inline-code-background)')
+  })
+})
+
+describe('background report disclosure', () => {
+  it('keeps result bodies out of the transcript until opened and removes them when collapsed', () => {
+    const report = '{"blockers":[{"title":"Local-model readiness uses the wrong endpoint"}]}'
+    const { container, getByRole } = render(<Harness asyncResult={report} text="2 background agents finished" />)
+
+    expect(container.textContent).not.toContain('blockers')
+    expectTimestampSeparated(container, '2 background agents finished')
+    const toggle = getByRole('button', { name: '2 background agents finished' })
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-expanded')).toBe('true')
+    expect(container.textContent).toContain(report)
+
+    fireEvent.click(toggle)
+    expect(toggle.getAttribute('aria-expanded')).toBe('false')
+    expect(container.textContent).not.toContain('blockers')
+  })
+})
+
 describe('system message timestamp text separation', () => {
   it('separates an ordinary system row timestamp in accessible and copied text', () => {
     const { container } = render(<Harness text="Review saved." />)
@@ -65,180 +112,5 @@ describe('system message timestamp text separation', () => {
     const { container } = render(<Harness text="steer:rerun tests" />)
 
     expectTimestampSeparated(container, 'rerun tests')
-  })
-})
-
-// ---------------------------------------------------------------------------
-// Expandable self-improvement review detail (ROADMAP.md Phase 1: Desktop
-// transcript auditability). Structured per-action records ride
-// metadata.custom.reviewActions the same way reactions ride
-// metadata.custom.reactions — see chat-runtime.ts's toRuntimeMessage.
-// ---------------------------------------------------------------------------
-
-function ReviewHarness({
-  reviewActions,
-  text,
-  locale = 'en'
-}: {
-  reviewActions: ReviewActionRecord[]
-  text: string
-  locale?: 'en' | 'ja' | 'zh' | 'zh-hant'
-}) {
-  const message = {
-    id: 'system-review-1',
-    role: 'system',
-    content: [{ type: 'text', text: `review:${text}` }],
-    createdAt: timestamp,
-    metadata: { custom: { reviewActions, timelineTimestamp: timestamp.getTime() / 1000 } }
-  } as unknown as ThreadMessage
-
-  const runtime = useExternalStoreRuntime<ThreadMessage>({
-    messages: [message],
-    isRunning: false,
-    onNew: async () => {}
-  })
-
-  return (
-    <I18nProvider configClient={null} initialLocale={locale}>
-      <AssistantRuntimeProvider runtime={runtime}>
-        <Thread />
-      </AssistantRuntimeProvider>
-    </I18nProvider>
-  )
-}
-
-const reviewActions: ReviewActionRecord[] = [
-  {
-    target: 'memory',
-    label: 'Memory',
-    operation: 'add',
-    success: true,
-    message: 'Entry added.',
-    state: 'completed',
-    reason: 'Memory add completed.',
-    change_summary: 'Before: no new record. After: record added.'
-  },
-  {
-    target: 'user',
-    label: 'User profile',
-    operation: 'replace',
-    success: false,
-    message: 'No profile update needed.',
-    state: 'no_op',
-    reason: 'No user profile change was needed.',
-    change_summary: 'No stored content was changed.'
-  },
-  {
-    target: 'skill',
-    label: 'Skill',
-    operation: 'patch',
-    success: false,
-    message: 'Skipped.',
-    state: 'skipped',
-    skill_name: 'demo',
-    reason: 'Skill review action was skipped.',
-    change_summary: 'No stored content was changed.'
-  },
-  {
-    target: 'memory',
-    label: 'Memory',
-    operation: 'remove',
-    success: false,
-    message: 'Declined.',
-    state: 'declined',
-    reason: 'Memory review action was declined.',
-    change_summary: 'No stored content was changed.'
-  },
-  {
-    target: 'memory',
-    label: 'Memory',
-    operation: 'add',
-    success: false,
-    message: 'Internal detail must remain private.',
-    state: 'failed',
-    reason: 'Memory add did not complete.',
-    change_summary: 'No stored content was changed.'
-  }
-]
-
-describe('self-improvement review expandable detail', () => {
-  it('renders collapsed by default with an accessible summary disclosure', () => {
-    render(<ReviewHarness reviewActions={reviewActions} text="💾 Self-improvement review: Memory updated" />)
-
-    expect(screen.getByRole('button', { name: /show details \(1 failed\)/i })).toBeTruthy()
-    expect(screen.queryByText(/Memory · add · Completed/)).toBeFalsy()
-  })
-
-  it('shows a compact target, operation, and terminal state for every reviewed target and outcome', () => {
-    render(<ReviewHarness reviewActions={reviewActions} text="💾 Self-improvement review: updates reviewed" />)
-
-    fireEvent.click(screen.getByRole('button', { name: /show details/i }))
-
-    expect(screen.getByText('Memory · Add · Completed')).toBeTruthy()
-    expect(screen.getByText('User profile · Replace · No change')).toBeTruthy()
-    expect(screen.getByText('Skill “demo” · Update · Skipped')).toBeTruthy()
-    expect(screen.getByText('Memory · Remove · Declined')).toBeTruthy()
-    expect(screen.getByText('Memory · Add · Failed')).toBeTruthy()
-  })
-
-  it.each([
-    ['ja', 'メモリ · 追加 · 完了'],
-    ['zh', '记忆 · 添加 · 已完成'],
-    ['zh-hant', '記憶 · 新增 · 已完成']
-  ] as const)('localizes trusted target and operation vocabulary for %s', (locale, expected) => {
-    render(
-      <ReviewHarness locale={locale} reviewActions={[reviewActions[0]]} text="💾 Self-improvement review: updated" />
-    )
-
-    fireEvent.click(screen.getByRole('button', { name: /詳細|显示|顯示/i }))
-    expect(screen.getByText(expected)).toBeTruthy()
-  })
-
-  it('expands one record with only the producer-provided redacted detail', () => {
-    render(<ReviewHarness reviewActions={reviewActions} text="💾 Self-improvement review: updates reviewed" />)
-
-    fireEvent.click(screen.getByRole('button', { name: /show details/i }))
-    fireEvent.click(screen.getAllByRole('button', { name: /show memory review details/i })[0])
-
-    expect(screen.getByText('Before: no new record. After: record added.')).toBeTruthy()
-    expect(screen.getByText('Memory add completed.')).toBeTruthy()
-    expect(screen.getByRole('button', { name: /hide record details/i })).toBeTruthy()
-    expect(screen.queryByText('Internal detail must remain private.')).toBeFalsy()
-  })
-
-  it('keeps legacy previews and messages out of the transcript', () => {
-    const legacyAction: ReviewActionRecord = {
-      target: 'memory',
-      label: 'Memory',
-      operation: 'add',
-      success: true,
-      message: 'raw saved content',
-      content_preview: 'raw saved content'
-    }
-
-    render(<ReviewHarness reviewActions={[legacyAction]} text="💾 Self-improvement review: Memory updated" />)
-
-    fireEvent.click(screen.getByRole('button', { name: /show details/i }))
-    fireEvent.click(screen.getAllByRole('button', { name: /show memory review details/i })[0])
-
-    expect(screen.getByText(/Details are unavailable from this older Hermes version/)).toBeTruthy()
-    expect(screen.queryByText('raw saved content')).toBeFalsy()
-    expect(screen.queryByRole('button', { name: /inspect/i })).toBeFalsy()
-  })
-
-  it('collapses the review disclosure again', () => {
-    render(<ReviewHarness reviewActions={[reviewActions[0]]} text="💾 Self-improvement review: Memory updated" />)
-
-    fireEvent.click(screen.getByRole('button', { name: /show details/i }))
-    expect(screen.getByText('Memory · Add · Completed')).toBeTruthy()
-
-    fireEvent.click(screen.getByRole('button', { name: /hide details/i }))
-    expect(screen.queryByText('Memory · Add · Completed')).toBeFalsy()
-  })
-
-  it('renders no expand toggle when a review row has no structured actions', () => {
-    render(<ReviewHarness reviewActions={[]} text="💾 Self-improvement review: Memory updated" />)
-
-    expect(screen.queryByRole('button', { name: /show details/i })).toBeFalsy()
   })
 })

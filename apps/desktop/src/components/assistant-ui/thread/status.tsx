@@ -3,18 +3,18 @@ import { useStore } from '@nanostores/react'
 import { type FC, type ReactNode, useEffect, useMemo, useState } from 'react'
 
 import { useSessionView } from '@/app/chat/session-view'
-import { ThreadActivityMark } from '@/components/assistant-ui/thread/activity-mark'
 import { activitySignature, toolNarratesWait, TURN_QUIET_S } from '@/components/assistant-ui/thread/turn-activity'
 import { toolPresentVerb } from '@/components/assistant-ui/tool/run-summary'
 import { useElapsedSeconds } from '@/components/chat/activity-timer'
 import { ActivityTimerText } from '@/components/chat/activity-timer-text'
+import { SCAFFOLD_LABEL_CLASS } from '@/components/chat/scaffold-row'
 import { Codicon } from '@/components/ui/codicon'
 import { Loader } from '@/components/ui/loader'
+import { StatusPulse } from '@/components/ui/status-pulse'
 import { getLocalModelsStatus } from '@/hermes'
 import { useI18n } from '@/i18n'
-import type { ThreadActivityPhase } from '@/lib/thread-activity'
 import { cn } from '@/lib/utils'
-import { $backgroundResume } from '@/store/background-delegation'
+import { sessionBackgroundResume } from '@/store/background-delegation'
 import { sessionCompacting } from '@/store/compaction'
 import { $localModelsEnabled } from '@/store/local-models-flag'
 import { sessionAwaitingInput } from '@/store/prompts'
@@ -23,18 +23,9 @@ import { $currentModel } from '@/store/session'
 import { type DraftingTool, sessionDraftingTool } from '@/store/tool-drafting'
 import type { LocalModelLoadProgress } from '@/types/hermes'
 
-// The live activity row is NOT settled scaffolding, and treating it as such is
-// what made it unreadable. A finished tool row is a record: quiet is correct,
-// and `data-conversation-scaffold` dims it to 0.67 so the reply stays primary.
-// This row is the opposite — it exists only while the user is waiting on it,
-// and it is the only thing on screen that says the app is alive. It used to
-// carry the scaffold mark anyway, so its 64%-alpha text was multiplied to ~0.43
-// and its 9px clock to ~0.37, on the one line a waiting user goes looking for.
-//
-// So it opts out of the fade and lights itself: prose-sized text, an accent
-// edge and a faint surface tint marking it as live rather than logged. No
-// continuous animation — `StatusPulse` beats on a shared timer so the renderer
-// can still sleep between frames (see status-pulse.tsx).
+// A status line is scaffolding like any other — "Editing" while the model
+// drafts a call is the same kind of line as "Explored 3 files" once it has run,
+// and reads as one continuous column only if it shares their type and colour.
 const StatusRow: FC<{ children: ReactNode; label: string } & React.ComponentPropsWithoutRef<'div'>> = ({
   children,
   label,
@@ -45,13 +36,11 @@ const StatusRow: FC<{ children: ReactNode; label: string } & React.ComponentProp
     aria-label={label}
     aria-live="polite"
     className={cn(
-      'flex min-w-0 max-w-full items-center gap-2 self-start',
-      'rounded-md border-l-2 border-(--activity-strip-edge) bg-(--activity-strip-surface)',
-      'py-1 pr-2.5 pl-2',
-      'text-[length:var(--activity-strip-font-size)] leading-5 text-(--activity-strip-text)',
+      'flex min-w-0 max-w-full items-center gap-1.5 self-start leading-(--conversation-line-height)',
+      'text-(--conversation-scaffold-text)',
       className
     )}
-    data-activity-strip=""
+    data-conversation-scaffold=""
     role="status"
     {...rest}
   >
@@ -62,11 +51,8 @@ const StatusRow: FC<{ children: ReactNode; label: string } & React.ComponentProp
 // Fixed label while auto-compaction runs — decoupled from backend status text.
 const COMPACTION_LABEL = 'Summarizing thread'
 
-// The named wait, at the strip's own size rather than the settled-tool size the
-// scaffold label class carries. Medium weight so it reads as the strip's title
-// against the lighter clock trailing it.
 const HintText: FC<{ children: ReactNode }> = ({ children }) => (
-  <span className="shimmer min-w-0 flex-1 truncate font-medium">{children}</span>
+  <span className={cn(SCAFFOLD_LABEL_CLASS, 'shimmer min-w-0 flex-1 truncate')}>{children}</span>
 )
 
 /** Renderer-side load synthesis: poll the local-models status while a turn
@@ -148,7 +134,7 @@ const WaitHint: FC<{ hint: string }> = ({ hint }) => {
 
 const ProgressHint: FC<{ label: string; percent: null | number }> = ({ label, percent }) => (
   <span className="flex min-w-0 flex-1 items-center gap-2">
-    <span className="shimmer min-w-0 shrink truncate font-medium">{label}</span>
+    <span className={cn(SCAFFOLD_LABEL_CLASS, 'shimmer min-w-0 shrink truncate')}>{label}</span>
     {percent !== null && (
       <>
         <span className="h-1 w-24 shrink-0 overflow-hidden rounded-full bg-(--ui-bg-tertiary)">
@@ -157,7 +143,7 @@ const ProgressHint: FC<{ label: string; percent: null | number }> = ({ label, pe
             style={{ width: `${Math.max(2, percent)}%` }}
           />
         </span>
-        <span className="shrink-0 tabular-nums">{percent}%</span>
+        <span className={cn(SCAFFOLD_LABEL_CLASS, 'shrink-0 tabular-nums')}>{percent}%</span>
       </>
     )}
   </span>
@@ -201,46 +187,6 @@ function useThreadSessionStatus() {
 // Long enough that a tool whose arguments arrive in a few frames never gets to
 // strobe a label, short enough that a real wait is named almost immediately.
 const DRAFTING_REVEAL_MS = 200
-const TERMINAL_ACTIVITY_MS = 2_000
-
-/** Keep a resolved activity visible long enough to be read. The row owns this
- * purely presentational state: backend errors retain their existing rendering.
- * Hidden/minimized windows do not wake for a terminal animation; the static
- * success/failure glyph remains when the renderer is visible again. */
-function useTerminalActivity(working: boolean, failed: boolean): ThreadActivityPhase | null {
-  const [wasWorking, setWasWorking] = useState(working)
-  const [terminal, setTerminal] = useState<ThreadActivityPhase | null>(null)
-
-  useEffect(() => {
-    if (working) {
-      setWasWorking(true)
-      setTerminal(null)
-
-      return
-    }
-
-    if (!wasWorking) {
-      return
-    }
-
-    setWasWorking(false)
-    setTerminal(failed ? 'failure' : 'success')
-  }, [failed, wasWorking, working])
-
-  useEffect(() => {
-    if (!terminal) {
-      return
-    }
-
-    const id = window.setTimeout(() => setTerminal(null), TERMINAL_ACTIVITY_MS)
-
-    // A new operation clears `terminal`, which cleans up its old deadline;
-    // the later operation then receives its own full terminal interval.
-    return () => window.clearTimeout(id)
-  }, [terminal])
-
-  return terminal
-}
 
 /**
  * What to call the wait, if it deserves a name. Compaction outranks a draft —
@@ -306,49 +252,41 @@ export const ResponseLoadingIndicator: FC = () => {
 
   return (
     <StatusRow data-slot="aui_response-loading" label={hint || t.assistant.thread.loadingResponse}>
-      <ThreadActivityMark
-        elapsedSeconds={elapsed}
-        hint={hint}
-        phase={compacting ? 'compacting' : hint ? 'working' : 'thinking'}
-        slot="response"
+      <StatusPulse
+        aria-hidden="true"
+        className="dither inline-block size-3 rounded-[2px] text-midground/80"
+        kind="opacity"
       />
       {hint ? (
         <WaitHint hint={hint} />
       ) : localLoad ? (
         <ProgressHint label={t.assistant.thread.loadingLocalModel(localLoad.model)} percent={localLoad.percent} />
       ) : null}
-      <ActivityTimerText seconds={elapsed} />
+      <ActivityTimerText aria-hidden={true} seconds={elapsed} />
     </StatusRow>
   )
 }
 
-// Parked-background affordance: a top-level delegate_task runs in the
-// background, so the parent turn ends and the app goes idle while the subagent
-// keeps working and its result re-enters as a fresh turn later. Instead of a
-// spinner (reads as "stuck"), reuse the same compact, centered system-note
-// chrome as the steer / slash-status lines (SystemMessage above) so it sits in
-// the thread like every other meta line. Idle-only (gated upstream). Null when
-// nothing is parked.
+// The parent is idle while its delegated children work. Name that wait rather
+// than echoing the child's CLI thinking spinner as if this thread were running.
 export const BackgroundResumeNotice: FC = () => {
   const { t } = useI18n()
-  const resume = useStore($backgroundResume)
+  const view = useSessionView()
+  const sessionId = useStore(view.$runtimeId)
+  const busy = useStore(view.$busy)
+  const resume = useStore(useMemo(() => sessionBackgroundResume(sessionId), [sessionId]))
 
-  if (!resume) {
+  if (busy || !resume) {
     return null
   }
 
-  const label = resume.activity ?? t.assistant.thread.resumeWhenBackgroundDone(resume.count)
+  const label = t.assistant.thread.resumeWhenBackgroundDone(resume.count)
 
   return (
-    <div
-      aria-live="polite"
-      className="flex max-w-[min(86%,44rem)] items-center gap-1.5 self-center px-2 py-0.5 text-[0.6875rem] leading-5 text-muted-foreground/55"
-      data-slot="aui_background-resume"
-      role="status"
-    >
-      <Codicon className="text-muted-foreground/55" name="sync" size="0.75rem" />
-      <span className="shimmer min-w-0 truncate">{label}</span>
-    </div>
+    <StatusRow className="pl-(--message-text-indent)" data-slot="aui_background-resume" label={label}>
+      <Codicon name="sync" size="0.875rem" />
+      <span className={cn(SCAFFOLD_LABEL_CLASS, 'min-w-0 truncate')}>{label}</span>
+    </StatusRow>
   )
 }
 
@@ -385,19 +323,14 @@ export const TurnActivityIndicator: FC = () => {
   // (`todo`, reactions) render nothing, so they narrate nothing.
   const toolNarrating = useAuiState(s => toolNarratesWait(s.message.content))
 
-  // Streaming counts as working too, and it leads busy by a flush on the first
-  // turn of a fresh chat — so the row can't wait for the store to catch up.
+  // Streaming can lead busy by one view flush on the first turn of a fresh
+  // chat. Honor that lead only while this session still has an armed turn
+  // clock: a pending bubble can outlive the backend's busy=false settle and
+  // must not keep its tail timer running after the turn ends.
   const messageRunning = useAuiState(s => s.message.status?.type === 'running')
-
-  const recoverablyFailed = useAuiState(s => {
-    const type = (s.message.status as { type?: string } | undefined)?.type
-
-    return type === 'incomplete'
-  })
+  const working = busy || (messageRunning && turnStartedAt !== undefined)
 
   // Renderer-synthesized load bar (see ResponseLoadingIndicator).
-  const working = busy || messageRunning
-  const terminal = useTerminalActivity(working, recoverablyFailed)
   const localLoad = useLocalModelLoad(working && !hint && !toolNarrating)
 
   useEffect(() => {
@@ -427,33 +360,44 @@ export const TurnActivityIndicator: FC = () => {
     compacting ? turnStartedAt : (quietSince ?? drafting?.since ?? turnStartedAt)
   )
 
-  if (!active && !terminal) {
+  // Once the row has been shown, keep its live region mounted across
+  // quiet/working flips: remounting a role="status" node makes screen readers
+  // re-announce it on every gap (#46225). While idle it is visually hidden
+  // (sr-only, not display:none, so it stays in the accessibility tree) and
+  // empty and unlabelled — the pulse and timer only mount while active, so an idle window
+  // holds no pulse beat.
+  const [everActive, setEverActive] = useState(false)
+
+  if (active && !everActive) {
+    setEverActive(true)
+  }
+
+  if (!active && !everActive) {
     return null
   }
 
-  const phase: ThreadActivityPhase = terminal ?? (compacting ? 'compacting' : hint ? 'working' : 'quiet')
-
-  const label =
-    terminal === 'failure'
-      ? t.assistant.thread.workNeedsAttention
-      : terminal === 'success'
-        ? t.assistant.thread.workComplete
-        : hint || 'Hermes is working'
-
   return (
-    <StatusRow data-slot="aui_turn-activity" data-terminal-activity={terminal ?? undefined} label={label}>
-      <ThreadActivityMark
-        elapsedSeconds={elapsed}
-        hint={hint}
-        phase={phase}
-        slot="turn"
-      />
-      {!terminal && hint ? (
-        <WaitHint hint={hint} />
-      ) : !terminal && localLoad ? (
-        <ProgressHint label={t.assistant.thread.loadingLocalModel(localLoad.model)} percent={localLoad.percent} />
-      ) : null}
-      <ActivityTimerText seconds={elapsed} />
+    <StatusRow
+      className={cn(!active && 'sr-only')}
+      data-slot="aui_turn-activity"
+      data-state={active ? 'active' : 'idle'}
+      label={active ? hint || 'Hermes is working' : ''}
+    >
+      {active && (
+        <>
+          <StatusPulse
+            aria-hidden="true"
+            className="dither inline-block size-3 rounded-[2px] text-midground/80"
+            kind="opacity"
+          />
+          {hint ? (
+            <WaitHint hint={hint} />
+          ) : localLoad ? (
+            <ProgressHint label={t.assistant.thread.loadingLocalModel(localLoad.model)} percent={localLoad.percent} />
+          ) : null}
+          <ActivityTimerText aria-hidden={true} seconds={elapsed} />
+        </>
+      )}
     </StatusRow>
   )
 }

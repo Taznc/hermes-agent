@@ -2,16 +2,13 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type * as HermesModule from '@/hermes'
 import { getSession } from '@/hermes'
-import { __resetMissingProfiles } from '@/lib/profile-liveness'
-import { $pinnedSessionIds } from '@/store/layout'
 import { $activeGatewayProfile, $profiles } from '@/store/profile'
 import { $projectTree } from '@/store/projects'
-import { $prBranchBySession, $prScannedSessions } from '@/store/pull-requests'
-import { $cronSessions, $messagingSessions, $sessions } from '@/store/session'
-import { $sessionSeenCounts, $unreadFinishedMarkers } from '@/store/session-unread'
+import { $cronSessions, $messagingSessions, $sessions, $unlistedSessionOwnerRows } from '@/store/session'
+import { $removedSessionIds, tombstoneSessions, untombstoneSessions } from '@/store/session-removal'
 import type { SessionInfo } from '@/types/hermes'
 
-import { __resetSessionProbeCache, cachedSessionRow, resolveSessionProfile, resolveStoredSession } from './utils'
+import { cachedSessionRow, resolveStoredSession } from './utils'
 
 vi.mock('@/hermes', async importActual => ({
   ...(await importActual<typeof HermesModule>()),
@@ -30,19 +27,11 @@ describe('resolveStoredSession profile ownership', () => {
     $messagingSessions.set([])
     $sessions.set([])
     $projectTree.set([])
-    $pinnedSessionIds.set([])
-    $prBranchBySession.set({})
-    $prScannedSessions.set([])
-    $sessionSeenCounts.set({})
-    $unreadFinishedMarkers.set({})
+    $removedSessionIds.set(new Set())
     $profiles.set(profiles('default', 'meta'))
     $activeGatewayProfile.set('meta')
+    $unlistedSessionOwnerRows.set([])
     mockGetSession.mockReset()
-    // Dead-profile memory is module state shared across tests.
-    __resetMissingProfiles()
-    // So is the negative/in-flight probe cache: a miss recorded by one test
-    // would otherwise short-circuit the next test's lookup of the same id.
-    __resetSessionProbeCache()
   })
 
   afterEach(() => {
@@ -50,13 +39,10 @@ describe('resolveStoredSession profile ownership', () => {
     $messagingSessions.set([])
     $sessions.set([])
     $projectTree.set([])
-    $pinnedSessionIds.set([])
-    $prBranchBySession.set({})
-    $prScannedSessions.set([])
-    $sessionSeenCounts.set({})
-    $unreadFinishedMarkers.set({})
+    $removedSessionIds.set(new Set())
     $profiles.set([])
     $activeGatewayProfile.set('default')
+    $unlistedSessionOwnerRows.set([])
   })
 
   it('returns a cached row that carries an owning profile', async () => {
@@ -79,6 +65,19 @@ describe('resolveStoredSession profile ownership', () => {
     expect(resolved?.profile).toBe('default')
     expect(mockGetSession).not.toHaveBeenCalled()
     expect($sessions.get()).toEqual([])
+  })
+
+  it('routes a moved resolve into its current slice instead of duplicating it', async () => {
+    // Cross-room /resume rewrote the row to source='matrix' (#113827): the
+    // stale regular-sessions copy must go and the row must land in messaging.
+    $sessions.set([session({ id: 's1' })])
+    mockGetSession.mockResolvedValueOnce(session({ id: 's1', profile: 'meta', source: 'matrix' }))
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.source).toBe('matrix')
+    expect($sessions.get()).toEqual([])
+    expect($messagingSessions.get().map(s => s.id)).toEqual(['s1'])
   })
 
   it('treats a profile-less cache hit as unresolved when multiple profiles exist', async () => {
@@ -134,6 +133,29 @@ describe('resolveStoredSession profile ownership', () => {
     expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('meta')
   })
 
+  it('parks a hidden by-id hit off-list — canonical Bot Chats never get a sidebar row (#113273)', async () => {
+    // Opening a bot's chat resolves it by id; the backend row carries
+    // hidden=true. Listed, it would paint a Sessions row the refresh
+    // keep-list then holds open indefinitely.
+    mockGetSession.mockResolvedValueOnce(session({ hidden: true, id: 's1' }))
+
+    const resolved = await resolveStoredSession('s1')
+
+    expect(resolved?.hidden).toBe(true)
+    expect($sessions.get()).toEqual([])
+    // owner resolution still finds the row on the off-list stub atom
+    expect($unlistedSessionOwnerRows.get().find(s => s.id === 's1')?.hidden).toBe(true)
+  })
+
+  it('returns an internal delegate child without promoting it into regular sessions', async () => {
+    mockGetSession.mockResolvedValueOnce(session({ id: 'child', is_internal_child: true }))
+
+    const resolved = await resolveStoredSession('child')
+
+    expect(resolved).toMatchObject({ id: 'child', is_internal_child: true, profile: 'meta' })
+    expect($sessions.get()).toEqual([])
+  })
+
   it('probed desktop profile overrides a remote backend answering as its own "default"', async () => {
     // Per-profile remote override: Electron strips the desktop alias before
     // forwarding, so the standalone backend stamps its backend-local root.
@@ -159,180 +181,118 @@ describe('resolveStoredSession profile ownership', () => {
     expect($sessions.get().find(s => s.id === 's1')?.profile).toBe('default')
   })
 
-  it('resolveSessionProfile routes a default-profile session from a non-default gateway', async () => {
-    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
-    mockGetSession.mockResolvedValueOnce(session({ id: 's1', profile: 'default' }))
+  it('does not recache a by-id row while its session is tombstoned (#85163)', async () => {
+    // The archive row click's bubbled resume raced the tombstone: the by-id
+    // resolve started just before the archive, and its response must not
+    // re-insert the row the archive optimistically evicted.
+    let resolveRequest!: (value: SessionInfo) => void
+    mockGetSession.mockReturnValueOnce(
+      new Promise<SessionInfo>(resolve => {
+        resolveRequest = resolve
+      })
+    )
 
-    await expect(resolveSessionProfile('s1')).resolves.toBe('default')
+    const pending = resolveStoredSession('s1')
+    tombstoneSessions(['s1'])
+    resolveRequest(session({ archived: false, id: 's1' }))
+
+    await expect(pending).resolves.toMatchObject({ id: 's1' })
+    expect($sessions.get()).toEqual([])
+    untombstoneSessions(['s1'])
   })
 
-  // Regression: the cross-profile probe's catch treated every failure alike, so
-  // a profile the Electron spawn guard had already declared permanently gone
-  // ("no longer exists") was re-probed on every single lookup — the repeating
-  // `?profile=<dead>` bursts in the dev console. A dead profile must drop out
-  // of the fan-out after the first rejection.
-  it('stops probing a profile once the spawn guard reports it gone', async () => {
-    $profiles.set(profiles('default', 'meta', 'ghost'))
-    $activeGatewayProfile.set('meta')
+  it('does not recache an archived by-id row', async () => {
+    // The direct lookup can also observe the archive itself: the backend row
+    // already carries archived=true while the tombstone is still settling.
+    mockGetSession.mockResolvedValueOnce(session({ archived: true, id: 's1' }))
 
-    // First lookup: active backend misses, `default` misses, `ghost` is gone.
-    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
-    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
-    mockGetSession.mockRejectedValueOnce(new Error('Profile "ghost" no longer exists.'))
+    const resolved = await resolveStoredSession('s1')
 
-    await expect(resolveStoredSession('s1')).resolves.toBeUndefined()
-    expect(mockGetSession).toHaveBeenCalledWith('s1', 'ghost')
-
-    // Second lookup: `ghost` must not be probed again.
-    mockGetSession.mockReset()
-    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
-    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
-
-    await expect(resolveStoredSession('s2')).resolves.toBeUndefined()
-
-    const probed = mockGetSession.mock.calls.map(call => call[1])
-
-    expect(probed).not.toContain('ghost')
+    expect(resolved?.archived).toBe(true)
+    expect($sessions.get()).toEqual([])
   })
 
-  // The other half of the contract: a plain 404 is a legitimate miss, not a
-  // dead profile. Blacklisting on a 404 would skip the profile that actually
-  // owns a later session and make it unresolvable.
-  it('keeps probing a profile that merely 404s for one session id', async () => {
-    $profiles.set(profiles('default', 'meta'))
-    $activeGatewayProfile.set('meta')
+  it('does not recache a stale by-id row when its tombstone clears before the response', async () => {
+    // A failed archive rolls the row back (untombstone) while the by-id
+    // request is still in flight: the response raced the doomed row even
+    // though membership looks untouched.
+    let resolveRequest!: (value: SessionInfo) => void
+    mockGetSession.mockReturnValueOnce(
+      new Promise<SessionInfo>(resolve => {
+        resolveRequest = resolve
+      })
+    )
+    tombstoneSessions(['s1'])
 
+    const pending = resolveStoredSession('s1')
+    untombstoneSessions(['s1'])
+    resolveRequest(session({ archived: false, id: 's1' }))
+
+    await expect(pending).resolves.toMatchObject({ id: 's1' })
+    expect($sessions.get()).toEqual([])
+  })
+
+  it('does not recache a stale by-id row after an in-flight tombstone ABA cycle', async () => {
+    // Tombstone added AND removed while the request was in flight: membership
+    // is back to empty, but the generation moved, so the response is stale.
+    let resolveRequest!: (value: SessionInfo) => void
+    mockGetSession.mockReturnValueOnce(
+      new Promise<SessionInfo>(resolve => {
+        resolveRequest = resolve
+      })
+    )
+
+    const pending = resolveStoredSession('s1')
+    tombstoneSessions(['s1'])
+    untombstoneSessions(['s1'])
+    expect($removedSessionIds.get()).toEqual(new Set())
+    resolveRequest(session({ archived: false, id: 's1' }))
+
+    await expect(pending).resolves.toMatchObject({ id: 's1' })
+    expect($sessions.get()).toEqual([])
+  })
+
+  it('does not recache a stale cross-profile by-id row after an in-flight tombstone cycle', async () => {
+    let resolveProbe!: (value: SessionInfo) => void
     mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
-    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
+    mockGetSession.mockReturnValueOnce(
+      new Promise<SessionInfo>(resolve => {
+        resolveProbe = resolve
+      })
+    )
 
-    await expect(resolveStoredSession('missing')).resolves.toBeUndefined()
+    const pending = resolveStoredSession('s1')
+    await vi.waitFor(() => expect(mockGetSession).toHaveBeenCalledTimes(2))
+    tombstoneSessions(['s1'])
+    untombstoneSessions(['s1'])
+    resolveProbe(session({ archived: false, id: 's1' }))
 
-    // A later id that DOES live on `default` still resolves.
-    mockGetSession.mockReset()
-    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
-    mockGetSession.mockResolvedValueOnce(session({ id: 's9', profile: 'default' }))
-
-    await expect(resolveStoredSession('s9')).resolves.toMatchObject({ profile: 'default' })
+    await expect(pending).resolves.toMatchObject({ id: 's1', profile: 'default' })
+    expect($sessions.get()).toEqual([])
   })
 
-  // The negative cache is what keeps a stuck id (dead deep link, orphaned Bot
-  // tile) from re-running the N-profile fan-out on every 1.5s backstop poll.
-  it('serves a repeat miss from the negative cache instead of re-probing', async () => {
-    mockGetSession.mockRejectedValue(new Error('404: Session not found'))
+  it('does not recache a stale owner-routed by-id row after an in-flight tombstone cycle', async () => {
+    let resolveRequest!: (value: SessionInfo) => void
+    mockGetSession.mockReturnValueOnce(
+      new Promise<SessionInfo>(resolve => {
+        resolveRequest = resolve
+      })
+    )
 
-    await expect(resolveStoredSession('stuck')).resolves.toBeUndefined()
+    const pending = resolveStoredSession('s1', {
+      connectionId: 'remote-1',
+      profile: 'meta',
+      targetProfile: 'meta'
+    } as never)
 
-    const afterFirst = mockGetSession.mock.calls.length
+    tombstoneSessions(['s1'])
+    untombstoneSessions(['s1'])
 
-    expect(afterFirst).toBeGreaterThan(0)
+    resolveRequest(session({ archived: false, id: 's1' }))
 
-    await expect(resolveStoredSession('stuck')).resolves.toBeUndefined()
-
-    expect(mockGetSession).toHaveBeenCalledTimes(afterFirst)
-  })
-
-  it('prunes client-only caches only after every profile rejects the stored id', async () => {
-    $sessionSeenCounts.set({ default: { keep: 1, stuck: 2 }, meta: { stuck: 3 } })
-    $unreadFinishedMarkers.set({ default: ['keep', 'stuck'], meta: ['stuck'] })
-    $prScannedSessions.set(['keep', 'stuck'])
-    $prBranchBySession.set({ keep: 'repo\nkeep', stuck: 'repo\nstuck' })
-    // Pins reconcile against their backend row and are not a resolver cache.
-    $pinnedSessionIds.set(['stuck'])
-    mockGetSession.mockRejectedValue(new Error('404: Session not found'))
-
-    await expect(resolveStoredSession('stuck')).resolves.toBeUndefined()
-
-    expect($sessionSeenCounts.get()).toEqual({ default: { keep: 1 } })
-    expect($unreadFinishedMarkers.get()).toEqual({ default: ['keep'] })
-    expect($prScannedSessions.get()).toEqual(['keep'])
-    expect($prBranchBySession.get()).toEqual({ keep: 'repo\nkeep' })
-    expect($pinnedSessionIds.get()).toEqual(['stuck'])
-  })
-
-  it('does not prune client caches when any profile probe is not a confirmed session 404', async () => {
-    const seen = { default: { stuck: 2 }, meta: { stuck: 3 } }
-    const markers = { default: ['stuck'], meta: ['stuck'] }
-    const scanned = ['stuck']
-    const branches = { stuck: 'repo\nstuck' }
-    $sessionSeenCounts.set(seen)
-    $unreadFinishedMarkers.set(markers)
-    $prScannedSessions.set(scanned)
-    $prBranchBySession.set(branches)
-    mockGetSession.mockRejectedValueOnce(new Error('500: gateway temporarily unavailable'))
-    mockGetSession.mockRejectedValueOnce(new Error('404: Session not found'))
-
-    await expect(resolveStoredSession('stuck')).resolves.toBeUndefined()
-
-    expect($sessionSeenCounts.get()).toEqual(seen)
-    expect($unreadFinishedMarkers.get()).toEqual(markers)
-    expect($prScannedSessions.get()).toEqual(scanned)
-    expect($prBranchBySession.get()).toEqual(branches)
-  })
-
-  it('does not prune client caches when a profile resolves the stored id', async () => {
-    const seen = { default: { live: 2 } }
-    const markers = { default: ['live'] }
-    const scanned = ['live']
-    const branches = { live: 'repo\nlive' }
-    $sessionSeenCounts.set(seen)
-    $unreadFinishedMarkers.set(markers)
-    $prScannedSessions.set(scanned)
-    $prBranchBySession.set(branches)
-    mockGetSession.mockResolvedValueOnce(session({ id: 'live', profile: 'meta' }))
-
-    await expect(resolveStoredSession('live')).resolves.toMatchObject({ id: 'live' })
-
-    expect($sessionSeenCounts.get()).toEqual(seen)
-    expect($unreadFinishedMarkers.get()).toEqual(markers)
-    expect($prScannedSessions.get()).toEqual(scanned)
-    expect($prBranchBySession.get()).toEqual(branches)
-  })
-
-  // It is a TTL, not a blacklist: once the window lapses the id is probed
-  // again, so a session that appears moments later still resolves.
-  it('re-probes after the negative TTL lapses', async () => {
-    vi.useFakeTimers()
-
-    try {
-      mockGetSession.mockRejectedValue(new Error('404: Session not found'))
-
-      await expect(resolveStoredSession('later')).resolves.toBeUndefined()
-
-      mockGetSession.mockReset()
-      vi.advanceTimersByTime(20_000)
-
-      mockGetSession.mockResolvedValueOnce(session({ id: 'later', profile: 'default' }))
-
-      await expect(resolveStoredSession('later')).resolves.toMatchObject({ profile: 'default' })
-    } finally {
-      vi.useRealTimers()
-    }
-  })
-
-  // Concurrent callers (wiring.tsx probes + the backstop poll) must share one
-  // fan-out, not each start their own.
-  it('de-dups concurrent lookups of the same id into one probe', async () => {
-    mockGetSession.mockRejectedValue(new Error('404: Session not found'))
-
-    // Baseline: what one lookup costs in backend calls.
-    await resolveStoredSession('same')
-
-    const singleProbeCalls = mockGetSession.mock.calls.length
-
-    expect(singleProbeCalls).toBeGreaterThan(0)
-
-    __resetSessionProbeCache()
-    mockGetSession.mockClear()
-
-    // Three simultaneous callers must not cost three fan-outs.
-    const results = await Promise.all([
-      resolveStoredSession('same'),
-      resolveStoredSession('same'),
-      resolveStoredSession('same')
-    ])
-
-    expect(results).toEqual([undefined, undefined, undefined])
-    expect(mockGetSession.mock.calls.length).toBe(singleProbeCalls)
+    await expect(pending).resolves.toMatchObject({ connection_id: 'remote-1', id: 's1', profile: 'meta' })
+    expect(mockGetSession).toHaveBeenCalledWith('s1', { connectionId: 'remote-1', profile: 'meta' })
+    expect($sessions.get()).toEqual([])
   })
 })
 

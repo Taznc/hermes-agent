@@ -1,108 +1,84 @@
-// @vitest-environment jsdom
-import { act, cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
-import { afterEach, describe, expect, it, vi } from 'vitest'
+import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
-const getCuratorStatus = vi.fn()
-const getMemoryStatus = vi.fn()
-const getActionStatus = vi.fn()
+import type * as HermesApi from '@/hermes'
+import { getActionStatus } from '@/hermes'
+import { $desktopActionTasks } from '@/store/activity'
 
-vi.mock('@/hermes', () => ({
-  getActionStatus: (name: string, lines?: number) => getActionStatus(name, lines),
-  getCuratorStatus: () => getCuratorStatus(),
-  getMemoryStatus: () => getMemoryStatus(),
-  resetMemory: vi.fn(),
-  runBackup: vi.fn(),
-  runCurator: vi.fn(),
-  runDebugShare: vi.fn(),
-  runDoctor: vi.fn(),
-  runSecurityAudit: vi.fn(),
-  setCuratorPaused: vi.fn()
-}))
+import { MaintenancePanel } from './maintenance'
 
-vi.mock('@/store/activity', () => ({
-  upsertDesktopActionTask: vi.fn()
-}))
+// The backend spawns each op under one fixed action name ('doctor', 'security-audit',
+// 'backup', 'curator-run'), a re-spawn replaces the record under that name, and
+// /api/actions/<name>/status reports the latest run. The fake keeps that contract.
+const runs: Record<string, number> = {}
+const running: Record<string, boolean> = {}
+let nextRunStaysRunning = false
 
-vi.mock('@/store/notifications', () => ({
-  notify: vi.fn(),
-  notifyError: vi.fn()
-}))
+function spawn(name: string) {
+  runs[name] = (runs[name] ?? 0) + 1
+  running[name] = nextRunStaysRunning
 
-async function renderMaintenance() {
-  const { MaintenancePanel } = await import('./maintenance')
-  let result: ReturnType<typeof render>
-  await act(async () => {
-    result = render(<MaintenancePanel />)
-  })
-
-  return result!
+  return Promise.resolve({ name, ok: true, pid: 1000 + runs[name] })
 }
 
-afterEach(() => {
-  cleanup()
-  vi.clearAllMocks()
+vi.mock('@/hermes', async importOriginal => ({
+  ...(await importOriginal<typeof HermesApi>()),
+  getActionStatus: vi.fn(async (name: string) => ({
+    exit_code: running[name] ? null : 0,
+    lines: [`${name} run ${runs[name]} output`],
+    name,
+    pid: 1000 + runs[name],
+    running: running[name]
+  })),
+  getCuratorStatus: vi.fn(() => new Promise(() => {})),
+  getMemoryStatus: vi.fn(() => new Promise(() => {})),
+  runDoctor: vi.fn(() => spawn('doctor')),
+  runSecurityAudit: vi.fn(() => spawn('security-audit'))
+}))
+
+beforeEach(() => {
+  for (const key of Object.keys(runs)) {
+    delete runs[key]
+    delete running[key]
+  }
+
+  nextRunStaysRunning = false
+  $desktopActionTasks.set({})
+  vi.mocked(getActionStatus).mockClear()
 })
 
-describe('MaintenancePanel — swallowed-error infinite loaders', () => {
-  it('renders an error row + working Retry instead of an eternal loader when curator status rejects', async () => {
-    getCuratorStatus.mockRejectedValueOnce(new Error('boom'))
-    getMemoryStatus.mockResolvedValue({ active: null, builtin_files: { memory: 0, user: 0 } })
+afterEach(cleanup)
 
-    await renderMaintenance()
+const button = (name: string) => screen.getByRole('button', { name }) as HTMLButtonElement
 
-    // No PageLoader branch reachable on a settled-rejected query: the status
-    // element must be the error row, never the perpetual "Loading" status.
-    await waitFor(() => expect(screen.getByText('Could not load curator status')).toBeTruthy())
+describe('MaintenancePanel action tail', () => {
+  it('tails a second run of the same op', async () => {
+    render(<MaintenancePanel />)
 
-    const retry = screen.getByRole('button', { name: 'Retry' })
-    expect(retry).toBeTruthy()
+    await act(async () => void fireEvent.click(button('Run doctor')))
+    await screen.findByText('doctor run 1 output')
 
-    getCuratorStatus.mockResolvedValueOnce({ enabled: true, paused: false, last_run_at: null })
+    nextRunStaysRunning = true
+    await act(async () => void fireEvent.click(button('Run doctor')))
 
-    await act(async () => {
-      fireEvent.click(retry)
-    })
-
-    await waitFor(() => expect(screen.queryByText('Could not load curator status')).toBeNull())
-    expect(await screen.findByText('Active')).toBeTruthy()
+    await screen.findByText('doctor run 2 output')
+    expect(vi.mocked(getActionStatus)).toHaveBeenCalledTimes(2)
+    expect(screen.getByText('Running...')).toBeTruthy()
+    expect(button('Run doctor').disabled).toBe(true)
+    expect($desktopActionTasks.get().doctor?.status).toMatchObject({ pid: 1002, running: true })
   })
 
-  it('renders an error row + working Retry when memory status rejects', async () => {
-    getCuratorStatus.mockResolvedValue({ enabled: false, paused: false, last_run_at: null })
-    getMemoryStatus.mockRejectedValueOnce(new Error('network down'))
+  it('tails a different op launched after the first', async () => {
+    render(<MaintenancePanel />)
 
-    await renderMaintenance()
+    await act(async () => void fireEvent.click(button('Run doctor')))
+    await screen.findByText('doctor run 1 output')
 
-    await waitFor(() => expect(screen.getByText('Could not load memory data')).toBeTruthy())
+    nextRunStaysRunning = true
+    await act(async () => void fireEvent.click(button('Security audit')))
 
-    getMemoryStatus.mockResolvedValueOnce({ active: null, builtin_files: { memory: 10, user: 0 } })
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
-    })
-
-    await waitFor(() => expect(screen.queryByText('Could not load memory data')).toBeNull())
+    await screen.findByText('security-audit run 1 output')
+    expect(vi.mocked(getActionStatus)).toHaveBeenLastCalledWith('security-audit', 200)
+    expect(button('Security audit').disabled).toBe(true)
   })
-
-  it('stops tailing and shows a lost-track message after repeated action-status failures', async () => {
-    getCuratorStatus.mockResolvedValue({ enabled: false, paused: false, last_run_at: null })
-    getMemoryStatus.mockResolvedValue({ active: null, builtin_files: { memory: 0, user: 0 } })
-    getActionStatus.mockRejectedValue(new Error('status endpoint down'))
-
-    const { runDoctor } = await import('@/hermes')
-    vi.mocked(runDoctor).mockResolvedValue({ name: 'doctor-1' } as never)
-
-    await renderMaintenance()
-
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Run doctor' }))
-    })
-
-    // Retry-with-backoff is bounded (3 attempts, full-jitter delays under a
-    // few seconds) — real timers keep this deterministic without fighting
-    // the component's own async poll() microtask chain.
-    expect(
-      await screen.findByText('Lost track of this task — view in activity rail', {}, { timeout: 10_000 })
-    ).toBeTruthy()
-  }, 15_000)
 })

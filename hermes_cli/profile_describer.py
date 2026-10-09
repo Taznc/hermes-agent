@@ -134,7 +134,7 @@ def describe_profile(profile_name: str, *, overwrite: bool = False, timeout: Opt
     all_skills = _collect_skills(profile_dir)
     skill_list = "\n".join(f"  - {n}" for n in _sample_skills(all_skills)) or "  (no skills installed)"
     try:
-        model, provider, _effort = profiles_mod._read_config_model(profile_dir)
+        model, provider = profiles_mod._read_config_model(profile_dir)
     except Exception:
         model, provider = None, None
     try:
@@ -199,11 +199,3 @@ def list_describable_profiles(*, missing_only: bool = True) -> list[str]:
         p.name for p in profiles_mod.list_profiles()
         if not (missing_only and (p.description or "").strip() and not p.description_auto)
     ]
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-import json  # noqa: F401,E402
-# ---- END PLUGIN-COMPAT ----

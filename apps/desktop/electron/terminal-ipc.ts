@@ -12,10 +12,9 @@ import nodePty from 'node-pty'
 
 import { resolveTerminalConnectionForSender } from './connection-apply'
 import { ensureSpawnHelperExecutable } from './spawn-helper-perms'
-import { SSH_BINARY_MISSING_MESSAGE } from './ssh-binary'
 import { buildInteractiveSshArgs } from './ssh-connection'
-import { createTerminalOutputBatcher } from './terminal-output-batcher'
 import { createTerminalOutputGate } from './terminal-output-gate'
+import { applyWindowsMsysBashEnvDefaults } from './windows-msys-bash-env'
 import { buildWindowsInteractiveCommand } from './windows-remote-lifecycle'
 
 export interface TerminalIpcDeps {
@@ -23,10 +22,10 @@ export interface TerminalIpcDeps {
   findOnPath: (command: string) => null | string
   rememberLog: (line: string) => void
   activeSshTerminalTarget: (webContentsId: number) => unknown
+  /** The ssh client to spawn for remote terminals (resolveSshBinary). */
+  sshBinary: () => string
   ensureBackend: (webContentsId: number) => Promise<unknown>
   getSshConnectionState: (scope: string) => undefined | { remotePlatform?: string }
-  /** Shared System32 → PATH → Git-for-Windows ladder (see ssh-binary.ts). */
-  resolveSshBinary: () => null | string
 }
 
 export interface TerminalIpcApi {
@@ -35,61 +34,31 @@ export interface TerminalIpcApi {
   disposeAllTerminalSessions: () => void
 }
 
+// macOS accepts the bare charset name "UTF-8" as a locale; glibc does not, so
+// every Linux pane would print `bash: warning: setlocale: LC_CTYPE: cannot
+// change locale (UTF-8)`. Reuse the user's LANG there, else the glibc-guaranteed
+// C.UTF-8. Pure: the platform arrives as data so tests need not fake the host.
+export function terminalLcCtype(
+  env: { LANG?: string; LC_CTYPE?: string },
+  platform: NodeJS.Platform = process.platform
+): string {
+  if (env.LC_CTYPE) {
+    return env.LC_CTYPE
+  }
+
+  return platform === 'darwin' ? 'UTF-8' : env.LANG || 'C.UTF-8'
+}
+
 export function registerTerminalIpc({
   isWindows,
   findOnPath,
   rememberLog,
   activeSshTerminalTarget,
+  sshBinary,
   ensureBackend,
-  getSshConnectionState,
-  resolveSshBinary
+  getSshConnectionState
 }: TerminalIpcDeps): TerminalIpcApi {
   const terminalSessions = new Map()
-  // One 'destroyed' listener per webContents id, not one per terminal. Every
-  // terminal start used to add its own `event.sender.once('destroyed', ...)`;
-  // a sender that opens more than ~10 terminals over its lifetime (routine on
-  // a long-lived tab) trips Node's MaxListenersExceededWarning and pins one
-  // closure per terminal ever opened on that webContents, even after the
-  // terminal itself was disposed. Track session ids per webContents id and
-  // install a single shared listener the first time that id is seen.
-  const sessionIdsByWebContentsId = new Map<number, Set<string>>()
-
-  function forgetTerminalSession(id: string) {
-    const sessionInfo = terminalSessions.get(id)
-
-    terminalSessions.delete(id)
-
-    if (sessionInfo) {
-      const siblingIds = sessionIdsByWebContentsId.get(sessionInfo.webContentsId)
-
-      siblingIds?.delete(id)
-
-      if (siblingIds && siblingIds.size === 0) {
-        sessionIdsByWebContentsId.delete(sessionInfo.webContentsId)
-      }
-    }
-
-    return sessionInfo
-  }
-
-  function trackTerminalSessionForWebContents(webContentsId: number, id: string, sender: Electron.WebContents) {
-    let siblingIds = sessionIdsByWebContentsId.get(webContentsId)
-
-    if (!siblingIds) {
-      siblingIds = new Set()
-      sessionIdsByWebContentsId.set(webContentsId, siblingIds)
-
-      sender.once('destroyed', () => {
-        for (const siblingId of [...(sessionIdsByWebContentsId.get(webContentsId) ?? [])]) {
-          disposeTerminalSession(siblingId)
-        }
-
-        sessionIdsByWebContentsId.delete(webContentsId)
-      })
-    }
-
-    siblingIds.add(id)
-  }
 
   function isExecutableFile(filePath) {
     if (!filePath || !path.isAbsolute(filePath)) {
@@ -206,7 +175,7 @@ export function registerTerminalIpc({
     delete env.COLORFGBG
 
     env.COLORTERM = 'truecolor'
-    env.LC_CTYPE = env.LC_CTYPE || 'UTF-8'
+    env.LC_CTYPE = terminalLcCtype(env)
     env.TERM = 'xterm-256color'
     env.TERM_PROGRAM = 'Hermes'
     env.TERM_PROGRAM_VERSION = app.getVersion()
@@ -216,7 +185,7 @@ export function registerTerminalIpc({
     // which marks the agent *backend* and gates cron/gateway behavior.
     env.HERMES_DESKTOP_TERMINAL = '1'
 
-    return env
+    return applyWindowsMsysBashEnvDefaults(env, isWindows)
   }
 
   function terminalChannel(id, suffix) {
@@ -269,13 +238,13 @@ export function registerTerminalIpc({
   }
 
   function disposeTerminalSession(id: string) {
-    const sessionInfo = forgetTerminalSession(id)
+    const sessionInfo = terminalSessions.get(id)
 
     if (!sessionInfo) {
       return false
     }
 
-    sessionInfo.outputBatcher.dispose()
+    terminalSessions.delete(id)
 
     try {
       sessionInfo.pty.kill()
@@ -353,23 +322,13 @@ export function registerTerminalIpc({
         ? buildWindowsInteractiveCommand(String(payload?.cwd || '').trim())
         : undefined
 
-    let ptyProcess
-
-    if (remote) {
-      const sshBinary = resolveSshBinary()
-
-      if (!sshBinary) {
-        throw new Error(SSH_BINARY_MISSING_MESSAGE)
-      }
-
-      ptyProcess = nodePty.spawn(
-        sshBinary,
-        buildInteractiveSshArgs(sshTarget.ssh, String(payload?.cwd || '').trim(), undefined, remoteCommand),
-        { cols, cwd: app.getPath('home'), env: terminalShellEnv(), name: 'xterm-256color', rows }
-      )
-    } else {
-      ptyProcess = nodePty.spawn(command, args, { cols, cwd, env: terminalShellEnv(), name: 'xterm-256color', rows })
-    }
+    const ptyProcess = remote
+      ? nodePty.spawn(
+          sshBinary(),
+          buildInteractiveSshArgs(sshTarget.ssh, String(payload?.cwd || '').trim(), undefined, remoteCommand),
+          { cols, cwd: app.getPath('home'), env: terminalShellEnv(), name: 'xterm-256color', rows }
+        )
+      : nodePty.spawn(command, args, { cols, cwd, env: terminalShellEnv(), name: 'xterm-256color', rows })
 
     const send = (suffix, payload) => {
       if (event.sender.isDestroyed()) {
@@ -379,58 +338,35 @@ export function registerTerminalIpc({
       event.sender.send(terminalChannel(id, suffix), payload)
     }
 
-    // Output pipeline: pty -> batcher -> gate -> renderer.
-    // The batcher coalesces PTY output into batched sends and applies ack-based
-    // flow control (pause the pty past the high-water mark, resume once the
-    // renderer acks enough of the outstanding backlog) — see
-    // terminal-output-batcher.ts. The gate holds everything (data AND exit)
-    // until the renderer has subscribed via hermes:terminal:attach, so output
-    // produced between `start` resolving and the listener being installed is
-    // never lost — see terminal-output-gate.ts.
     const outputGate = createTerminalOutputGate({
-      onExitFlushed: () => forgetTerminalSession(id),
+      onExitFlushed: () => disposeTerminalSession(id),
       sendData: data => send('data', data),
       sendExit: payload => send('exit', payload)
     })
 
-    const outputBatcher = createTerminalOutputBatcher({
-      pause: () => {
-        try {
-          ptyProcess.pause()
-        } catch {
-          // Process may already be gone.
-        }
-      },
-      resume: () => {
-        try {
-          ptyProcess.resume()
-        } catch {
-          // Process may already be gone.
-        }
-      },
-      send: data => outputGate.data(data)
-    })
-
     terminalSessions.set(id, {
-      outputBatcher,
       outputGate,
       pty: ptyProcess,
       webContentsId: event.sender.id,
       ...(remote ? { sshScope: sshTarget.scope, remoteCwd: String(payload?.cwd || '') } : {})
     })
 
-    ptyProcess.onData(data => outputBatcher.push(data))
+    ptyProcess.onData(data => outputGate.data(data))
     ptyProcess.onExit(({ exitCode, signal }) => {
-      // Flush any output still buffered so it lands before the exit message —
-      // without this a shell's final printf could be silently dropped or
-      // reordered after 'exit' reaches the renderer. The gate then forgets the
-      // session once the exit has actually been delivered (which may be
-      // deferred until the renderer attaches).
-      outputBatcher.flush()
-      outputBatcher.dispose()
       outputGate.exit({ code: exitCode, signal: signal == null ? null : String(signal) })
+
+      // The child is gone but node-pty keeps the /dev/ptmx master fd open
+      // until kill() runs; release it here instead of waiting for the tab to
+      // close (or the renderer to attach), or repeated `exit`s exhaust macOS
+      // PTYs (#128942). The map entry stays until the gate flushes the
+      // buffered exit, so a late attach still receives it.
+      try {
+        ptyProcess.kill()
+      } catch {
+        // Already reaped.
+      }
     })
-    trackTerminalSessionForWebContents(event.sender.id, id, event.sender)
+    event.sender.once('destroyed', () => disposeTerminalSession(id))
 
     return { cwd: remote ? null : cwd, id, shell: remote ? 'ssh' : name }
   })
@@ -447,45 +383,31 @@ export function registerTerminalIpc({
     return true
   })
 
-  ipcMain.on('hermes:terminal:write', (_event, id, data) => {
+  ipcMain.handle('hermes:terminal:write', (_event, id, data) => {
     const sessionInfo = terminalSessions.get(String(id || ''))
 
     if (!sessionInfo) {
-      return
+      return false
     }
 
     sessionInfo.pty.write(String(data || ''))
+
+    return true
   })
 
-  // Renderer's ack of processed output bytes, driving the pty's pause/resume
-  // flow control (see terminal-output-batcher.ts). Fire-and-forget like write:
-  // a lost ack just means flow control stays conservative for a bit longer,
-  // never a hang, since the next ack (or a fresh session) can still resume it.
-  ipcMain.on('hermes:terminal:ack', (_event, id, bytes) => {
+  ipcMain.handle('hermes:terminal:resize', (_event, id, size = {}) => {
     const sessionInfo = terminalSessions.get(String(id || ''))
 
     if (!sessionInfo) {
-      return
-    }
-
-    const acked = Number(bytes)
-
-    if (Number.isFinite(acked) && acked > 0) {
-      sessionInfo.outputBatcher.ack(acked)
-    }
-  })
-
-  ipcMain.on('hermes:terminal:resize', (_event, id, size = {}) => {
-    const sessionInfo = terminalSessions.get(String(id || ''))
-
-    if (!sessionInfo) {
-      return
+      return false
     }
 
     const cols = Math.max(2, Number.parseInt(String(size?.cols || 80), 10) || 80)
     const rows = Math.max(2, Number.parseInt(String(size?.rows || 24), 10) || 24)
 
     sessionInfo.pty.resize(cols, rows)
+
+    return true
   })
   ipcMain.handle('hermes:terminal:cwd', async (_event, id) => {
     const sessionInfo = terminalSessions.get(String(id || ''))

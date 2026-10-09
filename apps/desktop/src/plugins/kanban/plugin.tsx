@@ -6,7 +6,7 @@
  * backend, no core edits.
  *
  * Ships OFF by default (`defaultEnabled: false`): it inventories in
- * Settings ▸ Plugins and registers nothing until the user flips the switch.
+ * Capabilities ▸ Plugins and registers nothing until the user flips the switch.
  */
 
 import './kanban.css'
@@ -29,58 +29,26 @@ import {
   useQuery,
   useValue
 } from '@hermes/plugin-sdk'
-import { useEffect, useRef } from 'react'
 
-import { $boardSlug, ALL_BOARDS, bindApi, boardKey, fetchAllBoards, fetchBoard, primeAllBoardsSocket } from './api'
+import { $boardSlug, bindApi, boardKey, fetchBoard, useKanbanScope } from './api'
 import { KanbanBoardPage } from './board'
 import { KANBAN_LOCALES } from './i18n'
 import { $newTaskLane, useKanban } from './ui'
 
 // Live "N running / ready" pill — one glance at fleet activity from anywhere,
-// toggles the board. Shares the board query (one cache, one poll with
+// clicks through to the board. Shares the board query (one cache, one poll with
 // the page); hidden when nothing is in flight (or unloaded).
-export function KanbanCount() {
+function KanbanCount() {
   const k = useKanban()
+  const scope = useKanbanScope()
   const slug = useValue($boardSlug)
-  const isAllBoards = slug === ALL_BOARDS
-
-  const previousRoute = useRef({
-    connectionId: host.state.connectionId.get(),
-    path: '#/',
-    profile: host.state.profile.get()
-  })
-
-  const toggleBoard = () => {
-    const profile = host.state.profile.get()
-    const connectionId = host.state.connectionId.get()
-    const path = window.location.hash || '#/'
-
-    if (path.split('?')[0] === '#/kanban') {
-      const previous = previousRoute.current
-      host.navigate(previous.profile === profile && previous.connectionId === connectionId ? previous.path : '/')
-    } else {
-      previousRoute.current = { connectionId, path, profile }
-      host.navigate('/kanban')
-    }
-  }
 
   // Socket-invalidated like the page (same cache); slow socketless heartbeat.
-  // In All Boards mode this must fetch the consolidated view too — falling
-  // through to fetchBoard would silently show a single (arbitrary) board's
-  // count while the switcher reads "All Boards".
   const { data: board } = useQuery({
-    queryFn: () => (isAllBoards ? fetchAllBoards(false) : fetchBoard(false)),
-    queryKey: boardKey(slug, false),
+    queryFn: () => fetchBoard(false),
+    queryKey: boardKey(scope, slug, false),
     refetchInterval: 60_000
   })
-
-  // Idempotent per All-Boards selection (see api.ts) — safe alongside board.tsx's own call
-  // since only whichever mounts first actually opens the socket.
-  useEffect(() => {
-    if (isAllBoards && board?.cursors) {
-      primeAllBoardsSocket(board.cursors)
-    }
-  }, [isAllBoards, board?.cursors])
 
   if (!board) {
     return null
@@ -100,7 +68,7 @@ export function KanbanCount() {
           'inline-flex h-full items-center gap-1 rounded-none px-1.5 text-[0.6875rem] tabular-nums transition-colors',
           'text-(--ui-text-tertiary) hover:bg-(--chrome-action-hover) hover:text-foreground'
         )}
-        onClick={toggleBoard}
+        onClick={() => host.navigate('/kanban')}
         type="button"
       >
         <Codicon name="project" size="0.7rem" />
@@ -144,50 +112,60 @@ const plugin: HermesPlugin = {
         render: () => <KanbanBoardPage />
       },
       {
-        id: 'nav',
-        area: SIDEBAR_NAV_AREA,
-        order: 50,
-        data: { codicon: 'project', label: 'Kanban', path: '/kanban' } satisfies SidebarNavContribution
-      },
-      {
         id: 'count',
         area: STATUSBAR_AREAS.right,
         order: 80,
         render: () => <KanbanCount />
-      },
-      {
-        id: 'open',
-        area: PALETTE_AREA,
-        data: {
-          id: 'kanban.open',
-          label: 'Kanban: Open board',
-          keywords: ['kanban', 'board', 'tasks', 'agents'],
-          run: () => host.navigate('/kanban')
-        } satisfies PaletteContribution
-      },
-      {
-        id: 'new-task',
-        area: PALETTE_AREA,
-        data: {
-          id: 'kanban.newTask',
-          action: 'kanban.newTask',
-          label: ctx.i18n.t('newTaskCommand'),
-          keywords: ['kanban', 'task', 'new', 'create', 'triage'],
-          run: newTask
-        } satisfies PaletteContribution
-      },
-      {
-        id: 'new-task',
-        area: KEYBINDS_AREA,
-        data: {
-          id: 'kanban.newTask',
-          category: 'view',
-          defaults: ['mod+alt+n'],
-          label: ctx.i18n.t('newTaskCommand'),
-          run: newTask
-        } satisfies KeybindContribution
       }
     ])
+
+    const registerLabels = () =>
+      ctx.registerMany([
+        {
+          id: 'nav',
+          area: SIDEBAR_NAV_AREA,
+          order: 50,
+          data: { codicon: 'project', label: ctx.i18n.t('nav'), path: '/kanban' } satisfies SidebarNavContribution
+        },
+        {
+          id: 'open',
+          area: PALETTE_AREA,
+          data: {
+            id: 'kanban.open',
+            label: ctx.i18n.t('openBoard'),
+            keywords: ['kanban', 'board', 'tasks', 'agents'],
+            run: () => host.navigate('/kanban')
+          } satisfies PaletteContribution
+        },
+        {
+          id: 'new-task',
+          area: PALETTE_AREA,
+          data: {
+            id: 'kanban.newTask',
+            action: 'kanban.newTask',
+            label: ctx.i18n.t('newTaskCommand'),
+            keywords: ['kanban', 'task', 'new', 'create', 'triage'],
+            run: newTask
+          } satisfies PaletteContribution
+        },
+        {
+          id: 'new-task',
+          area: KEYBINDS_AREA,
+          data: {
+            id: 'kanban.newTask',
+            category: 'view',
+            defaults: ['mod+alt+n'],
+            label: ctx.i18n.t('newTaskCommand'),
+            run: newTask
+          } satisfies KeybindContribution
+        }
+      ])
+
+    let disposeLabels = registerLabels()
+    ctx.i18n.onLocaleChange(() => {
+      disposeLabels()
+      disposeLabels = registerLabels()
+    })
   }
 }
 

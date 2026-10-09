@@ -5,17 +5,12 @@ import os
 import subprocess
 import shutil
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
 from agent import coding_context as cc
 
 
-def test_coding_guidance_advertises_persistent_terminal_state():
-    assert "Terminal state persists across calls" in cc.CODING_AGENT_GUIDANCE
-    assert "Activate a virtualenv" in cc.CODING_AGENT_GUIDANCE
-    assert "instead of re-sourcing it before every test command" in cc.CODING_AGENT_GUIDANCE
 
 
 def _git_init(path):
@@ -30,6 +25,11 @@ def _git_init(path):
     (Path(path) / "main.py").write_text("print('hi')\n")
     for args in (
         ["init", "-q", "-b", "main"],
+        # Pin line-ending handling to the repo itself: with a host-global
+        # core.autocrlf=true, a just-committed tree can report "1 modified"
+        # immediately after init (CRLF round-trip), which poisons the
+        # clean-status contract this suite asserts.
+        ["config", "core.autocrlf", "false"],
         ["add", "-A"],
         ["commit", "-q", "-m", "init commit"],
     ):
@@ -275,20 +275,6 @@ class TestEditFormatSteering:
         assert cc._model_family(None) is None
         assert cc._model_family("") is None
 
-    def test_openai_family_gets_v4a_nudge(self, tmp_path):
-        _git_init(tmp_path)
-        mode = cc.resolve_runtime_mode(
-            platform="cli", cwd=tmp_path,
-            config={"agent": {"coding_context": "on"}}, model="openai/gpt-5.4",
-        )
-        brief = mode.system_blocks()[0]
-        assert "mode='patch'" in brief
-        assert "V4A" in brief
-        assert "write_file" in brief  # new files authored, not patched
-        # Codex-family harnesses ship apply_patch (V4A) as the ONLY editor and
-        # instruct it even for single-file edits — never nudge replace mode.
-        assert "single-file" in brief
-        assert "mode='replace'" not in brief
 
 
 
@@ -300,14 +286,6 @@ class TestEditFormatSteering:
 class TestProfiles:
 
 
-    def test_coding_profile_shape(self):
-        # The coding profile declares the seams other domains read.
-        assert cc.CODING_PROFILE.toolset == cc.CODING_TOOLSET
-        assert cc.CODING_PROFILE.guidance
-        assert cc.CODING_PROFILE.model_hint == "coding"
-        # General is inert.
-        assert cc.GENERAL_PROFILE.toolset is None
-        assert cc.GENERAL_PROFILE.guidance == ""
 
     def test_skill_demotion_gated_on_focus(self, tmp_path):
         # Names-only demotion is opt-in via focus mode — the default (auto)
@@ -333,78 +311,6 @@ class TestProfiles:
         # General posture demotes nothing.
         general = cc.resolve_runtime_mode(platform="telegram", cwd=tmp_path, config={})
         assert general.compact_skill_categories() == frozenset()
-
-    def test_configured_compact_categories_apply_on_every_posture(self, tmp_path):
-        # Operator-pinned skills.compact_categories demotes on ANY platform/posture — unlike the
-        # coding-focus deny-list it is not gated on `focus` or on being in a code workspace.
-        cfg = {"skills": {"compact_categories": ["creative", "media"]}}
-        general = cc.coding_compact_skill_categories(platform="telegram", cwd=tmp_path, config=cfg)
-        assert general == frozenset({"creative", "media"})
-        # Nested categories fold to their top-level segment.
-        nested_cfg = {"skills": {"compact_categories": ["social-media/twitter"]}}
-        nested = cc.coding_compact_skill_categories(platform="cli", cwd=tmp_path, config=nested_cfg)
-        assert nested == frozenset({"social-media"})
-        # A bare string is accepted the same as a one-item list.
-        bare_cfg = {"skills": {"compact_categories": "research"}}
-        bare = cc.coding_compact_skill_categories(platform="cli", cwd=tmp_path, config=bare_cfg)
-        assert bare == frozenset({"research"})
-        # Malformed values fail open to no demotion rather than raising.
-        for bad in (None, 42, {"not": "a list"}):
-            bad_cfg = {"skills": {"compact_categories": bad}}
-            assert cc.coding_compact_skill_categories(platform="cli", cwd=tmp_path, config=bad_cfg) == frozenset()
-
-    def test_configured_compact_categories_union_with_focus_posture(self, tmp_path):
-        # The operator list and the focus-posture deny-list compose (union), they don't replace
-        # each other.
-        _git_init(tmp_path)
-        cfg = {"agent": {"coding_context": "focus"}, "skills": {"compact_categories": ["devops"]}}
-        combined = cc.coding_compact_skill_categories(platform="cli", cwd=tmp_path, config=cfg)
-        assert "social-media" in combined  # from the focus posture deny-list
-        assert "devops" in combined        # from the operator config, which focus alone keeps full
-
-    def test_configured_compact_categories_render_names_only_end_to_end(self, monkeypatch, tmp_path):
-        # Drives the real config -> agent.system_prompt._skills_prompt -> build_skills_system_prompt
-        # wire, not just the resolver's returned frozenset (the review round's exact ask: the
-        # pre-existing prompt-builder test passes compact_categories directly and cannot catch a
-        # broken config-to-render wire). A demoted category renders names-only; an undemoted one
-        # keeps its full description.
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        monkeypatch.delenv("HERMES_PLATFORM", raising=False)
-        monkeypatch.delenv("HERMES_SESSION_PLATFORM", raising=False)
-        (tmp_path / "config.yaml").write_text(
-            "skills:\n  compact_categories: [creative]\n", encoding="utf-8"
-        )
-        demoted_dir = tmp_path / "skills" / "creative" / "demoted-skill"
-        demoted_dir.mkdir(parents=True)
-        (demoted_dir / "SKILL.md").write_text(
-            "---\nname: demoted-skill\ndescription: Demoted skill description text\n---\n",
-            encoding="utf-8",
-        )
-        kept_dir = tmp_path / "skills" / "devops" / "kept-skill"
-        kept_dir.mkdir(parents=True)
-        (kept_dir / "SKILL.md").write_text(
-            "---\nname: kept-skill\ndescription: Kept skill description text\n---\n",
-            encoding="utf-8",
-        )
-
-        from hermes_cli.config import _LOAD_CONFIG_CACHE, _RAW_CONFIG_CACHE
-        _LOAD_CONFIG_CACHE.clear()
-        _RAW_CONFIG_CACHE.clear()
-        from agent.prompt_builder import clear_skills_system_prompt_cache
-        clear_skills_system_prompt_cache(clear_snapshot=True)
-        from agent.system_prompt import _skills_prompt
-        agent = SimpleNamespace(
-            valid_tool_names=["skill_manage"], platform="desktop",
-            _session_db=None, session_id=None,
-        )
-        rendered = _skills_prompt(agent)
-
-        # Demoted category: name visible, description gone (names-only line).
-        assert "demoted-skill" in rendered
-        assert "Demoted skill description text" not in rendered
-        # Undemoted category: name AND full description survive.
-        assert "kept-skill" in rendered
-        assert "Kept skill description text" in rendered
 
 
 # ── detection signals ───────────────────────────────────────────────────────

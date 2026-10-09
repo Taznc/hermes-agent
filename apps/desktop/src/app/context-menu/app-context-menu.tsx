@@ -1,11 +1,10 @@
 import { useStore } from '@nanostores/react'
 import type { ReactNode } from 'react'
 import { useEffect } from 'react'
-import { useNavigate } from 'react-router'
 
-import { pickRevealLabel } from '@/app/right-sidebar/file-actions'
 import { terminalMenuHandleFor } from '@/app/right-sidebar/terminal/terminal-context-menu'
-import { toggleTargetZoneTabStrip } from '@/components/pane-shell/tree/store'
+import { openStarMapNodeMenuFor } from '@/app/starmap/context-menu-handle'
+import { DROPDOWN_KIT } from '@/components/ui/actions-menu'
 import { Codicon } from '@/components/ui/codicon'
 import { HERMES_CONTEXT_MENU_TRIGGER_ATTR } from '@/components/ui/context-menu'
 import { writeClipboardText } from '@/components/ui/copy-button'
@@ -18,22 +17,13 @@ import {
   DropdownMenuTrigger
 } from '@/components/ui/dropdown-menu'
 import { type Translations, useI18n } from '@/i18n'
-import { canUseNativeFileActions } from '@/lib/desktop-fs'
 import { hostPathLabel, hudForcesNativeLinks, normalizeExternalUrl, openExternalLink } from '@/lib/external-link'
 import { formatCombo } from '@/lib/keybinds/combo'
-import { normalizeOrLocalPreviewTarget, resolveChatLinkPath } from '@/lib/local-preview'
-import { isFileMediaPath, isRemoteGateway } from '@/lib/media'
+import { isRemoteGateway } from '@/lib/media'
 import { reachablePreviewUrl } from '@/lib/preview-reach'
-import { openCommandPalette } from '@/store/command-palette'
-import { copyFilePath, revealFile } from '@/store/file-actions'
-import { notifyError } from '@/store/notifications'
 import { openPreview } from '@/store/preview'
-import { getKnownHomeDir } from '@/store/session'
-import { toggleStatusbarVisible } from '@/store/statusbar-prefs'
-import { canOpenNewWindow, openNewWindow } from '@/store/windows'
 
-import { navigateToWorkspacePage, NEW_CHAT_ROUTE, SETTINGS_ROUTE } from '../routes'
-
+import { ShellMenuItems } from './shell-menu-items'
 import {
   $contextMenu,
   augmentSpellcheck,
@@ -42,7 +32,7 @@ import {
   openDomContextMenu,
   openTerminalContextMenu
 } from './store'
-import { isWebUrl, nativeContextMenuHandled, resolveDomTarget } from './target'
+import { isWebUrl, resolveDomTarget } from './target'
 
 /** Marks a surface that owns PLAIN right-clicks itself (the user-message
  *  reaction bubble). Owned targets inside it — links, images, editables,
@@ -95,11 +85,6 @@ function Item({
   )
 }
 
-type ShellVerbs = {
-  navigate: ReturnType<typeof useNavigate>
-  t: Translations
-}
-
 function terminalSections(open: Extract<OpenContextMenu, { kind: 'terminal' }>, t: Translations): ReactNode[][] {
   const { terminal } = open
   const selection = terminal.getSelection()
@@ -141,11 +126,6 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
   const sections: ReactNode[][] = []
   const linkUrl = target.linkUrl ? normalizeExternalUrl(target.linkUrl) : ''
   const linkIsWeb = isWebUrl(linkUrl)
-  // A bare path made clickable in chat (`InlinePathLink`) carries the raw
-  // path as its href. It is a file on the AGENT's machine, so the verbs are
-  // file verbs — preview, default app, reveal, copy path — not browser ones.
-  const linkIsFile = Boolean(linkUrl) && !linkIsWeb && isFileMediaPath(linkUrl)
-  const localFs = canUseNativeFileActions()
   const imageIsWeb = isWebUrl(target.imageUrl)
   const openInApp = !hudForcesNativeLinks()
   const showResolvedCopy = linkIsWeb && isRemoteGateway() && isLoopbackUrl(linkUrl)
@@ -202,48 +182,7 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
     withEditableFocus(() => void window.hermesDesktop?.contextMenuSpellcheck?.(action))
   }
 
-  if (linkIsFile) {
-    const { path: filePath, url: fileUrl } = resolveChatLinkPath(linkUrl, getKnownHomeDir())
-
-    const openInPreview = async () => {
-      try {
-        const preview = await normalizeOrLocalPreviewTarget(linkUrl)
-
-        if (!preview) {
-          throw new Error(`Could not open preview target: ${linkUrl}`)
-        }
-
-        openPreview(preview, 'explicit-link')
-      } catch (error) {
-        notifyError(error, t.preview.unavailable)
-      }
-    }
-
-    sections.push(
-      [
-        openInApp ? (
-          <Item icon="open-preview" key="file-open-preview" label={copy.file.openPreview} onSelect={() => void openInPreview()} />
-        ) : null,
-        localFs ? (
-          <Item
-            icon="link-external"
-            key="file-open-default"
-            label={copy.file.openDefaultApp}
-            onSelect={() => openExternalLink(fileUrl)}
-          />
-        ) : null,
-        localFs ? (
-          <Item
-            icon="folder-opened"
-            key="file-reveal"
-            label={pickRevealLabel(t.fileMenu.revealFinder, t.fileMenu.revealExplorer, t.fileMenu.revealFileManager)}
-            onSelect={() => void revealFile(filePath)}
-          />
-        ) : null,
-        <Item icon="copy" key="file-copy-path" label={t.fileMenu.copyPath} onSelect={() => void copyFilePath(filePath)} />
-      ].filter(Boolean)
-    )
-  } else if (linkUrl) {
+  if (linkUrl) {
     sections.push(
       [
         linkIsWeb && openInApp ? (
@@ -251,12 +190,7 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
             icon="globe"
             key="link-open-app"
             label={copy.link.openInApp}
-            onSelect={() =>
-              openPreview(
-                { kind: 'url', label: hostPathLabel(linkUrl), source: linkUrl, url: linkUrl },
-                'explicit-link'
-              )
-            }
+            onSelect={() => openPreview({ kind: 'url', label: hostPathLabel(linkUrl), source: linkUrl, url: linkUrl })}
           />
         ) : null,
         <Item
@@ -292,10 +226,12 @@ function domSections(open: Extract<OpenContextMenu, { kind: 'dom' }>, t: Transla
             key="image-open-app"
             label={copy.link.openInApp}
             onSelect={() =>
-              openPreview(
-                { kind: 'url', label: hostPathLabel(target.imageUrl), source: target.imageUrl, url: target.imageUrl },
-                'explicit-link'
-              )
+              openPreview({
+                kind: 'url',
+                label: hostPathLabel(target.imageUrl),
+                source: target.imageUrl,
+                url: target.imageUrl
+              })
             }
           />
         ) : null,
@@ -466,12 +402,7 @@ function guestSections(open: Extract<OpenContextMenu, { kind: 'guest' }>, t: Tra
             icon="globe"
             key="guest-link-open-app"
             label={copy.link.openInApp}
-            onSelect={() =>
-              openPreview(
-                { kind: 'url', label: hostPathLabel(linkUrl), source: linkUrl, url: linkUrl },
-                'explicit-link'
-              )
-            }
+            onSelect={() => openPreview({ kind: 'url', label: hostPathLabel(linkUrl), source: linkUrl, url: linkUrl })}
           />
         ) : null,
         <Item
@@ -612,59 +543,13 @@ function guestSections(open: Extract<OpenContextMenu, { kind: 'guest' }>, t: Tra
   return sections
 }
 
-/** Bare right-click on app chrome: the window verbs (the old shell fallback). */
-function shellSections({ navigate, t }: ShellVerbs): ReactNode[][] {
-  return [
-    [
-      <Item
-        icon="add"
-        key="shell-new-chat"
-        label={t.commandCenter.nav.newChat.title}
-        onSelect={() => navigateToWorkspacePage(navigate, NEW_CHAT_ROUTE)}
-      />,
-      canOpenNewWindow() ? (
-        <Item
-          icon="multiple-windows"
-          key="shell-new-window"
-          label={t.keybinds.actions['session.newWindow']}
-          onSelect={() => void openNewWindow()}
-        />
-      ) : null,
-      <Item icon="search" key="shell-palette" label={t.commandCenter.paletteTitle} onSelect={openCommandPalette} />
-    ].filter(Boolean),
-    [
-      <Item
-        icon="layout-statusbar"
-        key="shell-statusbar"
-        label={t.keybinds.actions['view.toggleStatusbar']}
-        onSelect={toggleStatusbarVisible}
-      />,
-      // The pointer-only way back to a hidden tab strip: right-clicking the
-      // shell reaches this menu from anywhere, including a zone that has no
-      // chrome left to right-click.
-      <Item
-        icon="layout-menubar"
-        key="shell-tabstrip"
-        label={t.keybinds.actions['view.toggleTabStrip']}
-        onSelect={() => void toggleTargetZoneTabStrip()}
-      />,
-      <Item
-        icon="settings-gear"
-        key="shell-settings"
-        label={t.commandCenter.settings}
-        onSelect={() => navigateToWorkspacePage(navigate, SETTINGS_ROUTE)}
-      />
-    ]
-  ]
-}
-
 /**
  * THE app context menu: one capture-phase listener, one store, one menu.
  *
  * Every right-click in the app resolves here first. Radix-owned surfaces
  * (session rows and other `context-menu-trigger` wrappers) keep their own
- * menus; the reaction bubble keeps plain right-clicks; terminals answer
- * through their registered xterm handles; everything else gets a menu
+ * menus; the reaction bubble keeps plain right-clicks; terminals and the
+ * Star Map answer through registered handles; everything else gets a menu
  * assembled from what the click landed on — link, image, editable,
  * selection — with the window verbs as the empty-target fallback. Replaced
  * both the native Electron menu and the shell fallback wrapper, so labels
@@ -672,27 +557,30 @@ function shellSections({ navigate, t }: ShellVerbs): ReactNode[][] {
  */
 export function AppContextMenu() {
   const { t } = useI18n()
-  const navigate = useNavigate()
   const open = useStore($contextMenu)
 
   useEffect(() => {
-    // stopPropagation beats other renderer handlers in every shell.
-    // preventDefault is conditional on nativeContextMenuHandled(): in
-    // Electron, "default" is a main-process context-menu event this app
-    // handles without popping a native menu (see target.ts for the sentinel
-    // and why), so skipping preventDefault there costs nothing and keeps
-    // that forward alive. In a plain browser there is no main process —
-    // "default" IS Chromium's own context menu, so it must be prevented or
-    // it paints on top of this one.
+    // stopPropagation beats other renderer handlers; preventDefault is never
+    // called because Chromium emits the main-process context-menu event (the
+    // spellcheck + image-coordinate source) only for unprevented gestures —
+    // and with no Menu.popup anywhere, "default" means no menu at all.
     const onContextMenu = (event: MouseEvent) => {
       const element = event.target instanceof Element ? event.target : null
 
-      // Surfaces with their own Radix context menu keep the whole gesture.
-      // Guard the dedicated marker first: Radix `asChild` Slot merges
-      // `mergeProps(slotProps, childProps)` so the child's `data-slot` wins
-      // (status bar footer is `data-slot="statusbar"`). The marker is stamped
-      // after `{...props}` on ContextMenuTrigger and is not overwritten.
-      if (element?.closest(`[${HERMES_CONTEXT_MENU_TRIGGER_ATTR}], [data-slot="context-menu-trigger"]`)) {
+      const trigger = element?.closest(`[${HERMES_CONTEXT_MENU_TRIGGER_ATTR}], [data-slot="context-menu-trigger"]`)
+
+      // Only the pane-body wrapper is a fallback menu. Explicit row, tab and
+      // status-bar menus still own their whole gesture, even inside a pane.
+      if (trigger && !trigger.hasAttribute('data-zone-body')) {
+        return
+      }
+
+      // The Star Map owns node hits, but empty canvas space still reaches the
+      // shell fallback below. A canvas-wide opt-out would lose that fallback.
+      if (openStarMapNodeMenuFor(element, event.clientX, event.clientY)) {
+        event.preventDefault()
+        event.stopPropagation()
+
         return
       }
 
@@ -702,23 +590,29 @@ export function AppContextMenu() {
 
       if (terminal) {
         event.stopPropagation()
-
-        if (!nativeContextMenuHandled()) {
-          event.preventDefault()
-        }
-
         openTerminalContextMenu(event.clientX, event.clientY, terminal)
 
         return
       }
 
       const target = resolveDomTarget(element)
-      // Message text alone is deliberately NOT "owned": the user bubble's
-      // reaction picker claims bare right-clicks via the skip attr, and only a
-      // link/image/editable/selection outranks it. An assistant message is in
-      // no skip region, so it falls through and gets the DOM menu (which now
-      // carries Copy message) without this check.
-      const owned = Boolean(target.linkUrl || target.onImage || target.editable || target.selectionText)
+      const selection = window.getSelection()
+
+      const selected = Boolean(
+        target.selectionText &&
+        element &&
+        selection &&
+        Array.from({ length: selection.rangeCount }, (_, index) => selection.getRangeAt(index)).some(range =>
+          range.intersectsNode(element)
+        )
+      )
+
+      const owned = Boolean(target.linkUrl || target.onImage || target.editable || selected)
+
+      // A selection elsewhere in the same pane must not take its bare menu.
+      if (!owned && trigger) {
+        return
+      }
 
       // The reaction bubble owns bare right-clicks; a link inside it still
       // opens the link menu.
@@ -727,11 +621,6 @@ export function AppContextMenu() {
       }
 
       event.stopPropagation()
-
-      if (!nativeContextMenuHandled()) {
-        event.preventDefault()
-      }
-
       openDomContextMenu(event.clientX, event.clientY, target)
     }
 
@@ -753,7 +642,7 @@ export function AppContextMenu() {
       ? terminalSections(open, t)
       : open.kind === 'guest'
         ? guestSections(open, t)
-        : (list => (list.length ? list : shellSections({ navigate, t })))(domSections(open, t))
+        : (list => (list.length ? list : [[<ShellMenuItems key="shell" kit={DROPDOWN_KIT} />]]))(domSections(open, t))
 
   return (
     <DropdownMenu

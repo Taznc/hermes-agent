@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_process_hermes_home
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -104,10 +104,7 @@ def start_loop_liveness_watchdog(
             except RuntimeError:  # normally closed loop: nothing left to backstop
                 return
             except Exception:
-                logger.warning(
-                    "Gateway loop liveness watchdog is STOPPING: scheduling a probe raised. The "
-                    "event loop no longer has a liveness backstop for the rest of this process.",
-                    exc_info=True)
+                logger.debug("Failed to schedule gateway loop liveness probe", exc_info=True)
                 return
             deadline = time.monotonic() + probe_timeout
             while not stop_event.is_set():  # poll so a stop() mid-wait is honoured within ~50ms
@@ -138,33 +135,49 @@ def start_loop_liveness_watchdog(
             if stop_event.is_set():
                 return
             _mark_exited_quietly(exit_code, "loop_liveness_watchdog")
-            os._exit(exit_code)
+            _hard_exit(exit_code)
     thread = threading.Thread(target=_watchdog, daemon=True, name="gateway-loop-liveness-watchdog")
     try:
         thread.start()
     except Exception:
-        # WARNING, not debug: an unarmed watchdog is invisible until the loop wedges and nothing
-        # escalates. A 16h dispatch outage was diagnosed only by the ABSENCE of this evidence.
-        logger.warning("Failed to start gateway loop liveness watchdog — the event loop has NO "
-                       "liveness backstop; a wedged loop will not self-restart", exc_info=True)
+        logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
         return None
-    logger.info("Gateway loop liveness watchdog armed (probe every %.0fs, timeout %.0fs, "
-                "%d strikes to hard-exit %d)", probe_interval, probe_timeout, max_strikes,
-                exit_code)
     return _LoopLivenessWatchdogHandle(stop_event, thread)
 
 
+def _hard_exit(exit_code: int) -> None:
+    """``os._exit`` skips every cleanup: SIGKILL in-flight foreground commands first, they run in their
+    own process group and would outlive the gateway, reparented to init."""
+    with contextlib.suppress(Exception):
+        from tools.environments.base import kill_live_foreground_processes
+        kill_live_foreground_processes(now=True)
+    os._exit(exit_code)
+
+
 def _mark_exited_quietly(exit_code: int, reason: str) -> None:
-    """Best-effort lifecycle-ledger stamp so the next boot names the watchdog, not SIGKILL/OOM."""
+    """Best-effort terminal stamp on BOTH lifecycle records before ``os._exit`` skips teardown:
+    the lifecycle ledger (so the next boot names the watchdog, not SIGKILL/OOM) and
+    ``gateway_state.json`` (so ``hermes gateway status`` and every other reader of that file stop
+    seeing ``running`` for a process the watchdog killed — #113372). The runtime-status write goes
+    LAST: it is the record housekeeping refreshes, so nothing may overwrite it after we stamp it."""
     with contextlib.suppress(Exception):
         from gateway.lifecycle_ledger import mark_exited
         mark_exited(exit_code, reason=reason)
+    with contextlib.suppress(Exception):  # os._exit skips atexit: stamp the exit-metrics marker now
+        from hermes_cli.observability.shared_metrics_process import stamp_exit
+        stamp_exit("watchdog")
+    with contextlib.suppress(Exception):
+        from gateway.status import write_runtime_status
+        # Only the supervisor-restart code asserts a restart; other codes leave the recorded
+        # operator intent (a restart-drain that wedged is still a requested restart) untouched.
+        restart = {"restart_requested": True} if exit_code == GATEWAY_SERVICE_RESTART_EXIT_CODE else {}
+        write_runtime_status(
+            gateway_state="degraded", exit_reason=reason, wait_timeout=0.25, **restart)
 
 
 def _process_hermes_home() -> Path:
     """HERMES_HOME for process-level identity files (ignore profile overrides)."""
-    val = os.environ.get("HERMES_HOME", "").strip()
-    return Path(val) if val else get_hermes_home()
+    return get_process_hermes_home() if os.environ.get("HERMES_HOME", "").strip() else get_hermes_home()
 
 
 def _home(home: Optional[Path]) -> Path:
@@ -292,7 +305,7 @@ def arm_shutdown_watchdog(
             from hermes_logging import drain_log_queue
             drain_log_queue(timeout=1.0)
         _mark_exited_quietly(exit_code, "shutdown_watchdog")
-        os._exit(exit_code)
+        _hard_exit(exit_code)
     try:
         threading.Thread(target=_watchdog, daemon=True, name=name).start()
     except Exception:
@@ -331,8 +344,7 @@ def _sweep_stale_tick_sockets(own_path: Path) -> None:
 
 async def loop_heartbeat_forever(
     *, interval_s: float = DEFAULT_HEARTBEAT_INTERVAL_S, start_time: Optional[float] = None,
-    home: Optional[Path] = None, should_continue: Optional[Callable[[], bool]] = None,
-    snapshot_fn: Optional[Callable[[], Dict[str, Any]]] = None) -> None:
+    home: Optional[Path] = None, should_continue: Optional[Callable[[], bool]] = None) -> None:
     """Rewrite the loop heartbeat file on a cadence until cancelled / gated off. Runs on the
     gateway loop so a frozen loop lets the file age for monitors. The fsync write goes to a thread
     (inline, a stalled filesystem blocked the loop inside its own heartbeat and the liveness
@@ -370,17 +382,9 @@ async def loop_heartbeat_forever(
     extra = {"loop_tick_socket": tick_server is not None, "loop_tick_tcp_port": tick_tcp_port}
     try:
         while True:  # first write is immediate so monitors see a fresh file at once
-            # Capture on-loop, before the off-loop write: a stalled dispatcher
-            # must not manufacture a new attempt/success just because we beat.
-            current_extra = dict(extra)
-            if snapshot_fn is not None:
-                try:
-                    current_extra["kanban_dispatcher"] = snapshot_fn()
-                except Exception:
-                    logger.debug("Dispatcher heartbeat snapshot failed", exc_info=True)
             try:
                 await asyncio.to_thread(write_loop_heartbeat, start_time=start_time, home=home,
-                                        extra=current_extra)
+                                        extra=extra)
             except Exception:  # write_loop_heartbeat never raises: executor problem, keep the task
                 logger.debug("Loop heartbeat write failed off-loop", exc_info=True)
             if should_continue is not None and not should_continue():

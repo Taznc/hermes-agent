@@ -2,12 +2,10 @@ from __future__ import annotations
 
 import contextlib
 import sqlite3
-import threading
 from pathlib import Path
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
-from hermes_cli import kanban_db_notify as kbn
 
 
 def _make_legacy_db(path: Path) -> None:
@@ -125,18 +123,6 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
 
 
-def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
-    """The crash that motivated #35096 — ``int(None)`` on a NULL cursor — is
-    gone after migration; the notifier query returns an integer cursor."""
-    db_path = _setup_home(tmp_path, monkeypatch)
-    _make_legacy_db(db_path)
-
-    with kbc.connect(db_path) as conn:
-        cursor, events = kbn.unseen_events_for_sub(
-            conn, task_id="task-1", platform="telegram", chat_id="123"
-        )
-        assert isinstance(cursor, int)
-        assert isinstance(events, list)
 
 
 def _default_board_db(tmp_path, monkeypatch) -> Path:
@@ -218,13 +204,13 @@ def test_healthy_fast_path_stays_lock_free(tmp_path, monkeypatch):
     with kbc.connect_closing(db_path):
         pass
 
-    locks: list[tuple[Path, bool]] = []
+    locks: list[Path] = []
     real_lock = kbc._cross_process_init_lock
 
     @contextlib.contextmanager
-    def recording_lock(path, *, existing_only=False):
-        locks.append((path, existing_only))
-        with real_lock(path, existing_only=existing_only):
+    def recording_lock(path):
+        locks.append(path)
+        with real_lock(path):
             yield
 
     monkeypatch.setattr(kbc, "_cross_process_init_lock", recording_lock)
@@ -233,10 +219,7 @@ def test_healthy_fast_path_stays_lock_free(tmp_path, monkeypatch):
         pass
     assert locks == []
 
-    # The legacy top-level default board is not an inventory entry, so its
-    # re-init must keep the create-capable mode — ``existing_only=True`` here
-    # could not recreate the DB that was just unlinked.
     db_path.unlink()
     with kbc.connect_closing(db_path):
         pass
-    assert locks == [(db_path, False)]
+    assert len(locks) == 1

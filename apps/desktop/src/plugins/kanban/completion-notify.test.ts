@@ -39,9 +39,7 @@ type NotifyInput = {
   message: string
   title?: string
   kind?: string
-  meta?: string
   detail?: string
-  contextCard?: { eyebrow?: string; meta?: string; summary?: string; title?: string }
   action?: { label: string; onClick: () => void }
 }
 
@@ -327,17 +325,17 @@ describe('ambiguous alias', () => {
 })
 
 describe('notification content', () => {
-  it('zero artifacts stays compact instead of exposing an id-only Details expander', async () => {
+  it('zero artifacts: task identity only', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)
 
     await m.onKanbanEventsFrame('smoke', [ev(101, 'completed', { summary: 'Done', artifacts: [] })])
 
-    expect(lastNotify()).toEqual({
+    expect(lastNotify()).toMatchObject({
       kind: 'success',
-      title: 'Task completed',
       message: 'Done',
-      action: { label: 'Open card', onClick: expect.any(Function) }
+      detail: 't101',
+      action: { onClick: expect.any(Function) }
     })
   })
 
@@ -349,18 +347,7 @@ describe('notification content', () => {
       ev(101, 'completed', { summary: 'Done', artifacts: ['/work/x/out/report.md'] })
     ])
 
-    expect(lastNotify().detail).toBe('report.md')
-  })
-
-  it('multiple artifacts: "<N> artifacts"', async () => {
-    const m = await loadModule()
-    m.bindCompletionNotify(makeRest(() => 100) as never)
-
-    await m.onKanbanEventsFrame('smoke', [
-      ev(101, 'completed', { summary: 'Done', artifacts: ['/a/1.md', '/b/2.md', '/c/3.md'] })
-    ])
-
-    expect(lastNotify().detail).toBe('3 artifacts')
+    expect(lastNotify().detail).toBe('t101 · report.md')
   })
 
   it('malformed payload does not crash: null payload, non-array artifacts, non-string summary', async () => {
@@ -376,50 +363,17 @@ describe('notification content', () => {
     // All three are unseen completions; none may throw.
     expect(hostMock.notify).toHaveBeenCalledTimes(3)
     expect(lastNotify().message).toBe('ok')
-    expect(lastNotify().detail).toBe('ok.md')
+    expect(lastNotify().detail).toBe('t103 · ok.md')
   })
 
-  it('shows the card title and metadata, then opens that exact card', async () => {
-    const rest = vi.fn(async (path: string) => {
-      if (path.startsWith('/board')) {
-        return { latest_event_id: 100 }
-      }
-
-      if (path === '/tasks/t101?board=smoke') {
-        return {
-          task: {
-            assignee: 'reviewer',
-            body: 'Fallback task description',
-            latest_summary: 'Landed with focused coverage',
-            status: 'done',
-            title: 'Make Kanban notifications readable'
-          }
-        }
-      }
-
-      throw new Error(`unexpected rest call: ${path}`)
-    })
-
+  it('Open Kanban action navigates to the native /kanban page', async () => {
     const m = await loadModule()
-    m.bindCompletionNotify(rest as never)
+    m.bindCompletionNotify(makeRest(() => 100) as never)
 
-    await m.onKanbanEventsFrame('smoke', [ev(101, 'completed', { summary: 'Worker result' })])
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'completed', { summary: 'Done' })])
 
-    const input = lastNotify()
-    expect(input).toMatchObject({
-      kind: 'success',
-      message: 'Worker result',
-      title: 'Task completed'
-    })
-    expect(input.contextCard).toEqual({
-      eyebrow: 'Done · reviewer',
-      meta: 'Task ID: t101',
-      summary: 'Landed with focused coverage',
-      title: 'Make Kanban notifications readable'
-    })
-    expect(input.action?.label).toBe('Open card')
-    input.action?.onClick()
-    expect(hostMock.navigate).toHaveBeenCalledWith('/kanban?board=smoke&task=t101')
+    lastNotify().action?.onClick()
+    expect(hostMock.navigate).toHaveBeenCalledWith('/kanban')
   })
 })
 
@@ -454,32 +408,47 @@ describe('terminal kinds beyond completed', () => {
     expect(fired).toBe(true)
     expect(lastNotify()).toMatchObject({
       kind: 'warning',
-      title: 'Task blocked — needs your input',
-      message: 'needs API key'
+      message: 'needs API key',
+      detail: 't101'
     })
   })
 
-  it('block_loop_detected notifies (routed-to-triage handoff)', async () => {
+  it('block_loop_detected notifies that a decision is needed', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)
 
     const fired = await m.onKanbanEventsFrame('smoke', [ev(101, 'block_loop_detected', { reason: 'same cause 3x' })])
 
     expect(fired).toBe(true)
-    expect(lastNotify()).toMatchObject({ kind: 'warning', message: 'same cause 3x' })
+    expect(lastNotify()).toMatchObject({
+      kind: 'warning',
+      message: 'same cause 3x'
+    })
   })
 
-  it('gave_up carries the payload error; crashed and timed_out fall back to the task id', async () => {
+  it('gave_up: plain-words body, raw payload error only in detail; crashed and timed_out fall back to the task id', async () => {
     const m = await loadModule()
     m.bindCompletionNotify(makeRest(() => 100) as never)
 
-    await m.onKanbanEventsFrame('smoke', [ev(101, 'gave_up', { error: 'spawn failed' })])
-    expect(lastNotify()).toMatchObject({ kind: 'error', message: 'spawn failed' })
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'gave_up', { error: 'spawn failed: ECONNREFUSED 127.0.0.1:9999' })])
+    const gaveUp = lastNotify()
+    expect(gaveUp.kind).toBe('error')
+    expect(gaveUp.message).not.toContain('spawn failed')
+    expect(gaveUp.detail).toContain('spawn failed: ECONNREFUSED 127.0.0.1:9999')
+    expect(gaveUp.detail).toContain('t101')
 
     await m.onKanbanEventsFrame('smoke', [ev(102, 'crashed'), ev(103, 'timed_out', { limit_seconds: 900 })])
     expect(hostMock.notify).toHaveBeenCalledTimes(3)
     expect(hostMock.notify.mock.calls[1][0]).toMatchObject({ kind: 'error', message: 't102' })
     expect(hostMock.notify.mock.calls[2][0]).toMatchObject({ kind: 'warning', message: 't103' })
+  })
+
+  it('gave_up without a payload error still gets the plain-words body and no empty detail noise', async () => {
+    const m = await loadModule()
+    m.bindCompletionNotify(makeRest(() => 100) as never)
+
+    await m.onKanbanEventsFrame('smoke', [ev(101, 'gave_up', null)])
+    expect(lastNotify()).toMatchObject({ kind: 'error', detail: 't101' })
   })
 
   it('silent kinds (status/archived/unblocked) advance the cursor but never notify', async () => {
@@ -509,10 +478,7 @@ describe('native OS door', () => {
     await m.onKanbanEventsFrame('smoke', [ev(101, 'blocked', { reason: 'needs input' })])
 
     expect(os.notify).toHaveBeenCalledTimes(1)
-    expect(os.notify.mock.calls[0][0]).toEqual({
-      title: 'Task blocked — needs your input',
-      body: 'needs input'
-    })
+    expect(os.notify.mock.calls[0][0]).toMatchObject({ body: 'needs input\nt101' })
   })
 
   it('an os door that throws never breaks the toast or the frame result', async () => {
@@ -552,8 +518,8 @@ describe('i18n routing', () => {
         return 'タスク完了'
       }
 
-      if (key === 'notify.openCard') {
-        return 'カードを開く'
+      if (key === 'notify.openKanban') {
+        return 'かんばんを開く'
       }
 
       if (key === 'notify.artifacts') {
@@ -570,8 +536,8 @@ describe('i18n routing', () => {
 
     expect(lastNotify()).toMatchObject({
       title: 'タスク完了',
-      detail: '成果物 2 件',
-      action: { label: 'カードを開く', onClick: expect.any(Function) }
+      detail: 't101 · 成果物 2 件',
+      action: { label: 'かんばんを開く', onClick: expect.any(Function) }
     })
   })
 
@@ -581,6 +547,7 @@ describe('i18n routing', () => {
 
     await m.onKanbanEventsFrame('smoke', [ev(101, 'timed_out')])
 
-    expect(lastNotify().title).toBe('Task timed out — will retry')
+    expect(lastNotify().title).toBeTruthy()
+    expect(lastNotify().title).not.toMatch(/^notify\./)
   })
 })

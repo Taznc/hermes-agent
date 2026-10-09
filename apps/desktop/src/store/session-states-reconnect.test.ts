@@ -9,19 +9,19 @@ import {
   $awaitingResponse,
   $busy,
   $selectedStoredSessionId,
+  $turnStartedAt,
   $unreadFinishedSessionIds
 } from './session'
+import { stampSecondaryProfileOwner } from './session-event-provenance'
 import {
   $attentionSessionIds,
-  $catchingUpSessionIds,
+  $sessionStates,
   $stalledSessionIds,
-  $turnLostSessionIds,
   $workingSessionIds,
   clearAllSessionStates,
-  dismissTurnLost,
+  liveSessionScopes,
   publishSessionState,
   reconcileBusyStatesOnReconnect,
-  RECONNECT_CATCHUP_GRACE_MS,
   recordSessionEventScope,
   SESSION_WATCHDOG_TIMEOUT_MS,
   type SessionTileDelegate,
@@ -69,6 +69,7 @@ describe('reconcileBusyStatesOnReconnect', () => {
     $selectedStoredSessionId.set(null)
     $activeSessionId.set(null)
     $busy.set(false)
+    $turnStartedAt.set(null)
     $awaitingResponse.set(false)
     setSessionTileDelegate(noDelegate)
   })
@@ -81,6 +82,7 @@ describe('reconcileBusyStatesOnReconnect', () => {
     $selectedStoredSessionId.set(null)
     $activeSessionId.set(null)
     $busy.set(false)
+    $turnStartedAt.set(null)
     $awaitingResponse.set(false)
     setSessionTileDelegate(noDelegate)
   })
@@ -92,6 +94,17 @@ describe('reconcileBusyStatesOnReconnect', () => {
     reconcileBusyStatesOnReconnect()
 
     expect($workingSessionIds.get()).not.toContain('s1')
+  })
+
+  it('retires the clock and live claim when the backend cannot finish a pending bubble', () => {
+    $activeSessionId.set('rt1')
+    publishSessionState('rt1', state({ busy: true, turnStartedAt: 1_000, turnLive: true }))
+    $turnStartedAt.set(1_000)
+
+    reconcileBusyStatesOnReconnect()
+
+    expect($sessionStates.get()['rt1']).toMatchObject({ busy: false, turnStartedAt: null, turnLive: false })
+    expect($turnStartedAt.get()).toBeNull()
   })
 
   it('disarms the stall watchdog with the busy claim', () => {
@@ -112,6 +125,31 @@ describe('reconcileBusyStatesOnReconnect', () => {
 
     expect($workingSessionIds.get()).not.toContain('s1')
     expect($attentionSessionIds.get()).toContain('s1')
+  })
+
+  it('primary reconnect leaves a registry-scoped turn clock alone', () => {
+    $activeSessionId.set('rtA')
+    publishSessionState('rtA', state({ busy: true, storedSessionId: 'sA', turnStartedAt: 1_000, turnLive: true }))
+    recordSessionEventScope({ connectionId: 'connA', profile: 'default', session_id: 'rtA' })
+    $turnStartedAt.set(1_000)
+
+    reconcileBusyStatesOnReconnect()
+
+    expect($sessionStates.get()['rtA']).toMatchObject({ busy: true, turnStartedAt: 1_000, turnLive: true })
+    expect($turnStartedAt.get()).toBe(1_000)
+  })
+
+  it('scoped reconnect retires its own focused turn clock', () => {
+    const scope = registryBackendScopeKey('connA', 'default')
+    $activeSessionId.set('rtA')
+    publishSessionState('rtA', state({ busy: true, storedSessionId: 'sA', turnStartedAt: 1_000, turnLive: true }))
+    recordSessionEventScope({ connectionId: 'connA', profile: 'default', session_id: 'rtA' })
+    $turnStartedAt.set(1_000)
+
+    reconcileBusyStatesOnReconnect(scope)
+
+    expect($sessionStates.get()['rtA']).toMatchObject({ busy: false, turnStartedAt: null, turnLive: false })
+    expect($turnStartedAt.get()).toBeNull()
   })
 
   it('primary reconcile leaves registry-scoped sessions alone', () => {
@@ -142,6 +180,29 @@ describe('reconcileBusyStatesOnReconnect', () => {
     expect($workingSessionIds.get()).not.toContain('sA')
     expect($workingSessionIds.get()).toContain('sB')
     expect($workingSessionIds.get()).toContain('sLocal')
+  })
+
+  it('primary reconcile leaves local-secondary scoped sessions alone, and scoped reconcile clears them (#121865)', () => {
+    publishSessionState('rtJody', state({ busy: true, storedSessionId: 'sJody' }))
+    const event = stampSecondaryProfileOwner({ session_id: 'rtJody' } as never, 'jody')
+    recordSessionEventScope(event)
+    publishSessionState('rtLocalPrimary', state({ busy: true, storedSessionId: 'sLocalPrimary' }))
+
+    reconcileBusyStatesOnReconnect()
+
+    expect($workingSessionIds.get()).toContain('sJody')
+    expect($workingSessionIds.get()).not.toContain('sLocalPrimary')
+
+    reconcileBusyStatesOnReconnect('jody')
+    expect($workingSessionIds.get()).not.toContain('sJody')
+  })
+
+  it('liveSessionScopes includes local secondary profiles for busy sessions (#121865)', () => {
+    publishSessionState('rtJody', state({ busy: true, storedSessionId: 'sJody' }))
+    const event = stampSecondaryProfileOwner({ session_id: 'rtJody' } as never, 'jody')
+    recordSessionEventScope(event)
+
+    expect(liveSessionScopes().has('jody')).toBe(true)
   })
 
   // #93059: the store is a mirror of the wiring cache; downgrading only the
@@ -210,101 +271,36 @@ describe('reconcileBusyStatesOnReconnect', () => {
 
     expect($workingSessionIds.get()).toContain('s1')
   })
-})
 
-// Catch-up / turn-lost tracking: reconcileBusyStatesOnReconnect force-clears a
-// pre-reconnect busy flag because its runtime id died with the old
-// connection. That is indistinguishable from "the turn actually finished"
-// without an explicit marker, so it arms a grace window distinguishing a
-// live turn re-asserting itself ("catching up" resolves) from genuine
-// silence ("turn lost").
-describe('reconnect catch-up / turn-lost tracking', () => {
-  beforeEach(() => {
-    vi.useFakeTimers()
-    vi.setSystemTime(0)
-    clearAllSessionStates()
-    $unreadFinishedSessionIds.set([])
-    $selectedStoredSessionId.set(null)
-    $activeSessionId.set(null)
-  })
-
-  afterEach(() => {
-    vi.runOnlyPendingTimers()
-    vi.useRealTimers()
-    clearAllSessionStates()
-    $unreadFinishedSessionIds.set([])
-    $selectedStoredSessionId.set(null)
-    $activeSessionId.set(null)
-  })
-
-  it('marks a downgraded-busy session catching-up and arms the grace timer', () => {
-    publishSessionState('rt1', state({ busy: true, storedSessionId: 's1' }))
+  // #113029: the reconcile downgrade is blind (live turns included), so it must
+  // not light the completed-unread dot — that is the green flash mid-turn. An
+  // authoritative busy→idle afterwards still does.
+  it('does not mark a live turn completed-unread on a routine reconnect', () => {
+    publishSessionState('rt1', state({ busy: true, sawAssistantPayload: true, storedSessionId: 's1', turnLive: true }))
 
     reconcileBusyStatesOnReconnect()
+    expect($unreadFinishedSessionIds.get()).not.toContain('s1')
 
-    expect($catchingUpSessionIds.get()).toContain('s1')
-    expect($turnLostSessionIds.get()).not.toContain('s1')
+    // The turn is alive: its next stream event re-asserts busy, then finishes.
+    publishSessionState('rt1', { ...$sessionStates.get().rt1, busy: true })
+    expect($workingSessionIds.get()).toContain('s1')
+    expect($unreadFinishedSessionIds.get()).not.toContain('s1')
+
+    publishSessionState('rt1', { ...$sessionStates.get().rt1, busy: false })
+    expect($unreadFinishedSessionIds.get()).toContain('s1')
   })
 
-  it('flips catching-up to turn-lost when nothing re-publishes busy before the grace window ends', () => {
-    publishSessionState('rt1', state({ busy: true, storedSessionId: 's1' }))
-    reconcileBusyStatesOnReconnect()
-    expect($catchingUpSessionIds.get()).toContain('s1')
-
-    vi.advanceTimersByTime(RECONNECT_CATCHUP_GRACE_MS - 1)
-    expect($catchingUpSessionIds.get()).toContain('s1')
-    expect($turnLostSessionIds.get()).not.toContain('s1')
-
-    vi.advanceTimersByTime(2)
-
-    expect($catchingUpSessionIds.get()).not.toContain('s1')
-    expect($turnLostSessionIds.get()).toContain('s1')
-  })
-
-  it('a live busy republish inside the grace window clears both catching-up and turn-lost', () => {
-    publishSessionState('rt1', state({ busy: true, storedSessionId: 's1' }))
-    reconcileBusyStatesOnReconnect()
-    expect($catchingUpSessionIds.get()).toContain('s1')
-
-    // The genuinely-alive backend's next event lands under a fresh runtime id
-    // before the grace window expires — this IS the "still running" answer.
-    vi.advanceTimersByTime(RECONNECT_CATCHUP_GRACE_MS / 2)
-    publishSessionState('rt2', state({ busy: true, storedSessionId: 's1' }))
-
-    expect($catchingUpSessionIds.get()).not.toContain('s1')
-    expect($turnLostSessionIds.get()).not.toContain('s1')
-
-    // And the grace timer was actually disarmed, not just raced — running
-    // past the original window must not retroactively mark it lost.
-    vi.advanceTimersByTime(RECONNECT_CATCHUP_GRACE_MS)
-    expect($turnLostSessionIds.get()).not.toContain('s1')
-  })
-
-  it('dismissTurnLost clears the mark and disarms any pending grace timer', () => {
-    publishSessionState('rt1', state({ busy: true, storedSessionId: 's1' }))
-    reconcileBusyStatesOnReconnect()
-    vi.advanceTimersByTime(RECONNECT_CATCHUP_GRACE_MS)
-    expect($turnLostSessionIds.get()).toContain('s1')
-
-    dismissTurnLost('s1')
-
-    expect($turnLostSessionIds.get()).not.toContain('s1')
-    expect($catchingUpSessionIds.get()).not.toContain('s1')
-  })
-
-  it('dismissTurnLost is a no-op for a session with no lost mark', () => {
-    expect(() => dismissTurnLost('never-marked')).not.toThrow()
-    expect($turnLostSessionIds.get()).not.toContain('never-marked')
-  })
-
-  it('scoped reconcile only arms catch-up tracking for sessions in that scope', () => {
-    publishSessionState('rtA', state({ busy: true, storedSessionId: 'sA' }))
+  // The only confirm producer for a parked completion is the ACTIVE profile's
+  // session.active_list poll, which never lists a background socket's
+  // runtimes. Parking a scoped downgrade would therefore lose the dot for a
+  // turn that ended while that socket was down; it lights at once instead.
+  it('a scoped reconcile lights the unread dot immediately — no poll can confirm it', () => {
+    publishSessionState('rtA', state({ busy: true, sawAssistantPayload: true, storedSessionId: 'sA' }))
     recordSessionEventScope({ connectionId: 'connA', profile: 'default', session_id: 'rtA' })
-    publishSessionState('rtLocal', state({ busy: true, storedSessionId: 'sLocal' }))
 
-    reconcileBusyStatesOnReconnect()
+    reconcileBusyStatesOnReconnect(registryBackendScopeKey('connA', 'default'))
 
-    expect($catchingUpSessionIds.get()).toContain('sLocal')
-    expect($catchingUpSessionIds.get()).not.toContain('sA')
+    expect($workingSessionIds.get()).not.toContain('sA')
+    expect($unreadFinishedSessionIds.get()).toEqual(['sA'])
   })
 })

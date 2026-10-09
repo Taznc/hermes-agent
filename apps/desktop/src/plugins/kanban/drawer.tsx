@@ -1,27 +1,20 @@
 /**
- * Task drawer — the desktop port of the dashboard's task detail.
- *
- * FACADE. It owns the shell (status-colored header band, tab strip, the
- * queries and mutations) and delegates each tab's body to a `drawer_<topic>`
- * sibling:
- *   - `drawer_overview` — diagnostics, meta, description, deps, result
- *   - `drawer_activity` — event feed, runs, comments + composer
- *   - `drawer_log`      — worker log tail, attachments
- *   - `drawer_events`   — pure event/run text derivation (no React)
- *   - `drawer_cta`      — the call-to-action banner + choice questions
- *
- * Color: every tone here comes from `columnMeta(status)` / `SEVERITY_TONE`
- * and is applied through `wash()` — the drawer never picks a color itself, so
- * it stays consistent with the board by construction.
+ * Task modal — the desktop port of the dashboard's task detail, Linear-style:
+ * a centered two-column dialog (main: diagnostics, description, result,
+ * dependencies, comments, activity, runs, log tail; right sidebar: property
+ * rows with the inline editors), instead of the old cramped right drawer.
  */
 
 import {
-  $paneWidthOverride,
+  Badge,
+  Button,
   cn,
   Codicon,
-  ConfirmDialog,
+  compactNumber,
+  CopyButton,
   Dialog,
   DialogContent,
+  DialogTitle,
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
@@ -29,143 +22,820 @@ import {
   DropdownMenuTrigger,
   ErrorState,
   host,
+  isSubmitEnter,
   Loader,
-  setPaneWidthOverride,
+  LogView,
+  MessageTextContent,
+  SegmentedControl,
+  Textarea,
+  Tip,
+  useI18n,
   useMutation,
   useQuery,
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { type PointerEvent as ReactPointerEvent, useEffect, useMemo, useState } from 'react'
+import { type ReactNode, useEffect, useRef, useState } from 'react'
 
 import {
   $boardSlug,
   addComment,
+  boardKeyPrefix,
   deleteTask,
+  estimateTask,
   fetchLog,
   fetchProfiles,
   fetchTask,
-  linkTasks,
   logKey,
   patchTask,
-  PROFILES_KEY,
+  profilesKey,
   reassignTask,
   reclaimTask,
+  routedToScope,
   taskKey,
-  unlinkTasks,
-  uploadAttachment
+  uploadAttachment,
+  useKanbanScope
 } from './api'
-import { ActivityRow, CommentsSection, RunsSection } from './drawer_activity'
-import { CtaBanner } from './drawer_cta'
-import { groupActivity } from './drawer_events'
+import { ModelOverrideField, overridePatch } from './model-override'
 import {
-  AttachmentsSection,
-  FULL_LOG_TAIL_BYTES,
-  ImagesSection,
-  isImageAttachment,
-  WorkerLogSection
-} from './drawer_log'
-import {
-  AssigneeMenu,
-  DependenciesSection,
-  DescriptionSection,
-  Diagnostics,
-  EstimateSection,
-  isAdminSummary,
-  MetaRow
-} from './drawer_overview'
-import { ModelOverrideField, overrideLabel, overridePatch } from './model-override'
-import { PriorityPicker } from './priority-picker'
-import { statusGuidance } from './status-guidance'
-import { type ChoiceResponse, columnMeta, type KanbanTaskDetail, SEVERITY_TONE } from './types'
+  type Diagnostic,
+  type DiagnosticAction,
+  type KanbanAttachment,
+  type KanbanEvent,
+  type KanbanTaskDetail,
+  SEVERITY_TONE,
+  type TaskEstimate,
+  type WorkerLog
+} from './types'
 import {
   ago,
+  Avatar,
   Callout,
-  CollapsibleMarkdown,
+  columnLabel,
+  duration,
   errText,
-  FIELD_LABEL,
-  IdChip,
   isLockedTarget,
+  type KanbanText,
   lockedReason,
+  PriorityGlyph,
   ScrollFade,
   Section,
   shortId,
   StatusMenu,
-  TabStrip,
   useDefaultAssignee,
-  useKanban,
-  wash
+  useKanban
 } from './ui'
 
-export { ActivityRow, RunErrorLine } from './drawer_activity'
-// Re-exported for the plugin's existing test suite and for board.tsx, which
-// import these by name. Behavior lives in the siblings; this is the door.
-export { CtaBanner, parseBlockedChoices, parseCmdFences } from './drawer_cta'
-export { type ActivityGroup, groupActivity, latestBlockReason, runErrorText } from './drawer_events'
-export { ImagesSection, ImageThumb, isImageAttachment } from './drawer_log'
-
-type TabId = 'activity' | 'log' | 'overview'
-
 /**
- * Pending focus request for the comment composer. The CTA banner's Reply lives
- * on Overview while the composer lives on Activity, so the deep-link is a
- * two-beat action: switch tabs, then focus once the input has mounted. A
- * one-shot flag (rather than a direct querySelector at click time) is what
- * keeps Reply from being a silently dead button.
+ * Turn a task_events row into an operator-readable line. The backend logs
+ * machine payloads ("status" + {"status":"ready"}); rendering the raw kind
+ * made the feed useless ("status · 2 sec. ago" after a drag). Known kinds get
+ * prose with the payload folded in; unknown kinds fall back to kind + compact
+ * key=value detail so new backend events still say something.
  */
-const FOCUS_COMMENT_ATTEMPTS = 10
+function eventText(event: KanbanEvent, k: KanbanText): { detail?: string; label: string } {
+  let p: Record<string, unknown> = {}
 
-/**
- * Drawer width sash. The Log tab carries raw shell output, and 26rem wraps it
- * to shreds — so the drawer's left edge is a drag handle, the same interaction
- * the shell's column seam and the docked detail pane already use, persisted
- * through the same pane store so a width chosen once survives reopens and
- * restarts. Drag geometry is inverted from the shell's rail: this drawer is
- * anchored right, so pulling LEFT widens it.
- */
-const DRAWER_PANE_ID = 'kanban.taskDrawer'
-/** The authored 26rem default, in px — the width the class paints when no
- *  override is stored, and the drag's starting point on a first drag. */
-const DRAWER_DEFAULT_WIDTH_PX = 416
-const DRAWER_MIN_WIDTH_PX = 384
-const DRAWER_MAX_VW = 0.68
+  if (typeof event.payload === 'string' && event.payload) {
+    try {
+      p = JSON.parse(event.payload) as Record<string, unknown>
+    } catch {
+      return { label: event.kind.replace(/_/g, ' '), detail: event.payload }
+    }
+  } else if (event.payload && typeof event.payload === 'object') {
+    p = event.payload as Record<string, unknown>
+  }
 
-/** Clamp to [24rem, 68vw], with the ceiling floored at the minimum so a window
- *  narrower than 24rem can't invert the range and pin the drawer to a sliver. */
-function clampDrawerWidth(px: number) {
-  const max = Math.max(DRAWER_MIN_WIDTH_PX, Math.round(window.innerWidth * DRAWER_MAX_VW))
+  const str = (key: string): null | string => {
+    const value = p[key]
 
-  return Math.min(max, Math.max(DRAWER_MIN_WIDTH_PX, Math.round(px)))
+    return typeof value === 'string' && value ? value : null
+  }
+
+  const col = (key: string) => {
+    const value = str(key)
+
+    return value ? columnLabel(k, value) : null
+  }
+
+  switch (event.kind) {
+    case 'created':
+      return { label: k.evtCreated(col('status') ?? '', str('assignee') ?? '') }
+    case 'status': {
+      const reason = str('reason')
+
+      return {
+        label: k.evtMovedTo(col('status') ?? '?'),
+        detail: reason === 'parent_reopened' ? k.evtParentReopened(str('parent') ?? '') : (reason ?? undefined)
+      }
+    }
+
+    case 'assigned': {
+      const assignee = str('assignee')
+
+      return { label: assignee ? k.evtAssignedTo(assignee) : k.evtUnassigned }
+    }
+
+    case 'commented':
+      return { label: k.evtCommentBy(str('author') ?? k.someone) }
+
+    case 'claimed':
+      return { label: str('source_status') === 'review' ? k.evtClaimedReview : k.evtClaimedWorker }
+
+    case 'spawned':
+      return { label: k.evtWorkerStarted, detail: p.pid != null ? `pid ${p.pid}` : undefined }
+
+    case 'completed':
+      return { label: k.evtCompleted }
+
+    case 'blocked':
+      return { label: k.evtBlocked, detail: str('reason') ?? undefined }
+
+    case 'unblocked':
+      return { label: k.evtUnblocked(col('status') ?? '') }
+
+    case 'reclaimed':
+      return { label: k.evtReclaimed, detail: str('reason') ?? undefined }
+
+    case 'specified':
+      return { label: k.evtSpecified }
+
+    case 'promoted':
+      return { label: k.evtPromoted }
+
+    case 'scheduled':
+      return { label: k.evtScheduled, detail: str('reason') ?? undefined }
+
+    case 'archived':
+      return { label: k.evtArchived }
+
+    case 'reprioritized':
+      return { label: k.evtReprioritized(String(p.priority ?? '?')) }
+    default: {
+      const detail = Object.entries(p)
+        .filter(([, value]) => value != null && typeof value !== 'object')
+        .map(([key, value]) => `${key}=${String(value)}`)
+        .join(' ')
+
+      return { label: event.kind.replace(/_/g, ' '), detail: detail || undefined }
+    }
+  }
 }
 
-function focusCommentInput(attemptsLeft = FOCUS_COMMENT_ATTEMPTS): void {
-  const el = document.querySelector<HTMLElement>('[data-kanban-comment-input="true"]')
+// Task bodies, results, summaries and comments are agent-written markdown;
+// rendering them raw left `**Goal:**` and backticks literal. Same renderer as
+// chat. `media={false}`: kanban text is not session-scoped, so `MEDIA:` paths
+// must not be resolved against the active gateway.
+function TaskMarkdown({ text }: { text: string }) {
+  return (
+    <div className="min-w-0 [&_.aui-md>:first-child]:mt-0 [&_.aui-md>:last-child]:mb-0" data-selectable-text="true">
+      <MessageTextContent media={false} text={text} />
+    </div>
+  )
+}
 
-  if (el) {
-    el.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
-    el.focus()
+// Sidebar property row: a Section (so every sidebar label — these, Estimate,
+// Attachments — shares FIELD_LABEL and one rhythm) whose value slot holds the
+// inline editors. Values wrap anywhere so a long path never clips at the edge.
+function MetaRow({ children, label }: { children: ReactNode; label: string }) {
+  return (
+    <Section label={label}>
+      <div className="min-w-0 text-[0.75rem] text-(--ui-text-secondary) [overflow-wrap:anywhere]">{children}</div>
+    </Section>
+  )
+}
 
-    return
+// The task's workspace: the kind as a badge when it says more than "a
+// directory", the path in mono (wrapping), and a copy affordance.
+function WorkspaceValue({ kind, path }: { kind: null | string | undefined; path: string }) {
+  return (
+    <div className="flex items-start gap-1.5">
+      <div className="flex min-w-0 flex-1 flex-col items-start gap-1">
+        {kind && kind !== 'dir' && (
+          <Badge size="xs" variant="muted">
+            {kind}
+          </Badge>
+        )}
+        <span className="font-mono text-[0.6875rem] leading-snug text-(--ui-text-tertiary)">{path}</span>
+      </div>
+      <CopyButton
+        appearance="icon"
+        buttonSize="icon-xs"
+        buttonVariant="ghost"
+        className="-mt-0.5 shrink-0"
+        text={path}
+      />
+    </div>
+  )
+}
+
+/** The dashboard's diagnostics panel: severity-toned, plain-English, with the
+ *  backend's structured recovery actions as buttons. `reassign` is skipped —
+ *  the Assignee control in the meta table IS that action, inline. */
+function Diagnostics({
+  items,
+  onReclaim,
+  onUnblock
+}: {
+  items: Diagnostic[]
+  onReclaim: () => void
+  onUnblock: () => void
+}) {
+  const k = useKanban()
+
+  const act = (action: DiagnosticAction) => {
+    if (action.kind === 'reclaim') {
+      onReclaim()
+    } else if (action.kind === 'unblock') {
+      onUnblock()
+    } else if (action.kind === 'cli_hint') {
+      void navigator.clipboard.writeText(String(action.payload?.command ?? action.label))
+      host.notify({ kind: 'info', message: k.commandCopied })
+    }
   }
 
-  if (attemptsLeft > 0) {
-    requestAnimationFrame(() => focusCommentInput(attemptsLeft - 1))
+  return (
+    <div className="flex flex-col gap-2">
+      {items.map(diag => {
+        const tone = SEVERITY_TONE[diag.severity]
+
+        const actions = diag.actions.filter(
+          action => action.kind === 'reclaim' || action.kind === 'unblock' || action.kind === 'cli_hint'
+        )
+
+        return (
+          <Callout
+            key={`${diag.kind}-${diag.last_seen_at}`}
+            title={`${diag.title}${diag.count > 1 ? ` ×${diag.count}` : ''}`}
+            tone={tone}
+          >
+            <p className="whitespace-pre-wrap text-[0.6875rem] leading-relaxed text-(--ui-text-secondary)">
+              {diag.detail}
+            </p>
+            {actions.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {actions.map(action => (
+                  <Button
+                    key={`${action.kind}-${action.label}`}
+                    onClick={() => act(action)}
+                    size="xs"
+                    variant={action.suggested ? 'secondary' : 'outline'}
+                  >
+                    {action.kind === 'cli_hint' && <Codicon name="copy" size="0.7rem" />}
+                    {action.label}
+                  </Button>
+                ))}
+              </div>
+            )}
+          </Callout>
+        )
+      })}
+    </div>
+  )
+}
+
+/** Jira-style inline assignee editor: the meta row IS the control — click the
+ *  assignee to reassign (reclaims a running worker first, resets the failure
+ *  streak — the explicit human recovery action). */
+function AssigneeMenu({
+  current,
+  onReassign
+}: {
+  current: null | string | undefined
+  onReassign: (p: string) => void
+}) {
+  const k = useKanban()
+  const scope = useKanbanScope()
+  const { data: roster } = useQuery({ queryKey: profilesKey(scope), queryFn: fetchProfiles, staleTime: 60_000 })
+
+  return (
+    <DropdownMenu>
+      <DropdownMenuTrigger asChild>
+        <button
+          className="-mx-1 inline-flex max-w-full items-center gap-1.5 rounded px-1 py-0.5 text-left transition-colors hover:bg-(--chrome-action-hover)"
+          type="button"
+        >
+          {current ? (
+            <>
+              <Avatar name={current} size="0.875rem" />
+              <span className="truncate">{current}</span>
+            </>
+          ) : (
+            <span className="text-(--ui-text-quaternary)">{k.unassigned}</span>
+          )}
+          <Codicon className="shrink-0 text-(--ui-text-quaternary)" name="chevron-down" size="0.65rem" />
+        </button>
+      </DropdownMenuTrigger>
+      <DropdownMenuContent align="start">
+        {(roster?.profiles ?? []).map(profile => (
+          <DropdownMenuItem key={profile.name} onSelect={() => onReassign(profile.name)}>
+            <Avatar name={profile.name} size="0.875rem" />
+            {profile.name}
+            {profile.name === current && <Codicon className="ml-auto" name="check" size="0.8rem" />}
+          </DropdownMenuItem>
+        ))}
+      </DropdownMenuContent>
+    </DropdownMenu>
+  )
+}
+
+// Mirrors the review pane's commit-message field: one row tall to start
+// (button-height), CSS field-sizing grows it with content, button hugs the
+// bottom edge as it grows.
+//
+// On a RUNNING task the worker polls its comment thread and folds new notes
+// into the live turn (OUT-OF-BAND steer), so a plain note reaches the agent
+// mid-run within a few seconds — no block/unblock dance. `onRequeue` is the
+// heavier option: post the note AND reclaim so the task restarts from scratch
+// with the note in context (use when the current run has gone off the rails).
+function CommentComposer({
+  onRequeue,
+  onSubmit,
+  pending,
+  running
+}: {
+  onRequeue?: (body: string) => void
+  onSubmit: (body: string) => void
+  pending: boolean
+  running?: boolean
+}) {
+  const k = useKanban()
+  const [body, setBody] = useState('')
+
+  const submit = () => {
+    const trimmed = body.trim()
+
+    if (trimmed && !pending) {
+      onSubmit(trimmed)
+      setBody('')
+    }
   }
+
+  const requeue = () => {
+    const trimmed = body.trim()
+
+    if (trimmed && !pending && onRequeue) {
+      onRequeue(trimmed)
+      setBody('')
+    }
+  }
+
+  const empty = !body.trim() || pending
+  const sendLabel = running ? k.send : k.comment
+
+  // Sized like the new-project idea field (default control padding, inset icon
+  // action); a labelled text button floating inside the textarea read as part
+  // of the input.
+  return (
+    <div className="flex flex-col gap-1.5">
+      <div className="relative">
+        <Textarea
+          className="field-sizing-content max-h-40 resize-none pr-9 text-[0.8125rem]"
+          onChange={event => setBody(event.target.value)}
+          onKeyDown={event => {
+            if (isSubmitEnter(event) && !event.shiftKey) {
+              event.preventDefault()
+              submit()
+            }
+          }}
+          placeholder={running ? k.messageWorker : k.addComment}
+          value={body}
+        />
+        <Tip label={sendLabel}>
+          <Button
+            aria-label={sendLabel}
+            className="absolute top-1 right-1 text-muted-foreground/80 hover:text-foreground"
+            disabled={empty}
+            onClick={submit}
+            size="icon-xs"
+            type="button"
+            variant="ghost"
+          >
+            <Codicon name="arrow-up" size="0.85rem" />
+          </Button>
+        </Tip>
+      </div>
+      {running && onRequeue && (
+        <div className="flex items-center justify-between gap-2">
+          <span className="text-[0.625rem] leading-tight text-(--ui-text-quaternary)">{k.deliveredLive}</span>
+          <Button className="shrink-0" disabled={empty} onClick={requeue} size="xs" variant="outline">
+            <Codicon name="debug-restart" size="0.7rem" />
+            {k.requeueWithNote}
+          </Button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+function DescriptionSection({ body, onSave }: { body: null | string | undefined; onSave: (body: string) => void }) {
+  const k = useKanban()
+  const [editing, setEditing] = useState(false)
+  const [draft, setDraft] = useState('')
+
+  return (
+    <Section
+      action={
+        <Button
+          aria-label={editing ? k.cancelEdit : k.editDescription}
+          onClick={() => {
+            setDraft(body ?? '')
+            setEditing(!editing)
+          }}
+          size="icon-xs"
+          variant="ghost"
+        >
+          <Codicon name={editing ? 'close' : 'edit'} size="0.75rem" />
+        </Button>
+      }
+      label={k.description}
+    >
+      {editing ? (
+        <div className="flex flex-col gap-1.5">
+          <Textarea
+            className="min-h-24 text-[0.75rem]"
+            onChange={event => setDraft(event.target.value)}
+            value={draft}
+          />
+          <Button
+            className="self-end"
+            onClick={() => {
+              onSave(draft)
+              setEditing(false)
+            }}
+            size="xs"
+            variant="secondary"
+          >
+            {k.save}
+          </Button>
+        </div>
+      ) : body ? (
+        <TaskMarkdown text={body} />
+      ) : (
+        <p className="text-[0.8125rem] text-(--ui-text-quaternary)">{k.noDescription}</p>
+      )}
+    </Section>
+  )
+}
+
+// `latest_summary` is just the newest non-null run summary. A reclaim writes an
+// administrative note into that slot; hide those (Runs still shows them).
+const isAdminSummary = (summary: string) => /^status changed to \w+ \(dashboard\/direct\)$/.test(summary)
+
+// The filename is the download action. The path is the backend's own
+// stored_path, saved through the connection/profile that returned this detail;
+// a row without one (older backend) stays inert rather than guessing a path.
+function AttachmentDownload({
+  attachment,
+  onDownload
+}: {
+  attachment: KanbanAttachment
+  onDownload: (path: string, suggestedName: string) => Promise<void>
+}) {
+  const { t } = useI18n()
+  const path = attachment.stored_path?.trim()
+
+  const download = useMutation({
+    mutationFn: () => onDownload(path!, attachment.filename)
+  })
+
+  // Long names truncate in the narrow sidebar; the tip reveals the full name.
+  return (
+    <Tip label={attachment.filename} placement="row">
+      <Button
+        aria-label={`${t.fileMenu.download} ${attachment.filename}`}
+        className="max-w-full justify-start font-normal"
+        disabled={!path || download.isPending}
+        onClick={() => download.mutate()}
+        size="inline"
+        variant="text"
+      >
+        <Codicon name={download.isPending ? 'sync' : 'cloud-download'} size="0.75rem" spinning={download.isPending} />
+        <span className="truncate">{attachment.filename}</span>
+      </Button>
+    </Tip>
+  )
+}
+
+function AttachmentsSection({
+  attachments,
+  onDownload,
+  onUpload,
+  pending
+}: {
+  attachments: KanbanAttachment[]
+  onDownload: (path: string, suggestedName: string) => Promise<void>
+  onUpload: (file: File) => void
+  pending: boolean
+}) {
+  const k = useKanban()
+  const fileRef = useRef<HTMLInputElement>(null)
+
+  return (
+    <Section
+      action={
+        <>
+          <input
+            hidden
+            onChange={event => {
+              const file = event.target.files?.[0]
+
+              if (file) {
+                onUpload(file)
+              }
+
+              event.target.value = ''
+            }}
+            ref={fileRef}
+            type="file"
+          />
+          <Button
+            aria-label={k.uploadAttachment}
+            disabled={pending}
+            onClick={() => fileRef.current?.click()}
+            size="icon-xs"
+            variant="ghost"
+          >
+            <Codicon name={pending ? 'sync' : 'cloud-upload'} size="0.8rem" spinning={pending} />
+          </Button>
+        </>
+      }
+      label={k.attachments(attachments.length)}
+    >
+      {attachments.length > 0 ? (
+        <ul className="flex flex-col gap-1">
+          {attachments.map(attachment => (
+            <li className="flex items-center gap-1.5 text-[0.75rem] text-(--ui-text-tertiary)" key={attachment.id}>
+              <AttachmentDownload attachment={attachment} onDownload={onDownload} />
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-[0.75rem] text-(--ui-text-quaternary)">{k.noAttachments}</p>
+      )}
+    </Section>
+  )
+}
+
+// Rough effort estimate via the auxiliary (auto-routed) model. Tokens +
+// complexity, never dollars — providers don't report cost reliably. Gated
+// behind an explicit click + disclaimer since it makes a model call. The
+// control keeps a stable footprint (spinner swaps in place) so there's no
+// layout jump when it runs.
+function EstimateSection({ id }: { id: string }) {
+  const k = useKanban()
+  const [result, setResult] = useState<null | TaskEstimate>(null)
+
+  const est = useMutation({
+    mutationFn: () => estimateTask(id),
+    onError: err => host.notify({ kind: 'error', message: errText(err) }),
+    onSuccess: r => {
+      if (r.ok) {
+        setResult(r)
+      } else {
+        host.notify({ kind: 'warning', message: r.reason || k.couldNotEstimate })
+      }
+    }
+  })
+
+  // A new task resets the cached estimate (the drawer reuses one instance).
+  useEffect(() => setResult(null), [id])
+
+  return (
+    <Section label={k.estimate}>
+      {result?.ok ? (
+        <div className="flex flex-col gap-1">
+          <div className="flex items-center gap-2 text-[0.8125rem]">
+            <span className="font-medium tabular-nums text-(--ui-text-secondary)">
+              ~{compactNumber(result.est_tokens)} {k.tokUnit}
+            </span>
+            {result.complexity && (
+              <span className="text-(--ui-text-tertiary)">
+                · {k.complexity[result.complexity] ?? result.complexity}
+              </span>
+            )}
+            <Tip label={k.reEstimate}>
+              <Button
+                aria-label={k.reEstimate}
+                className="ml-auto"
+                disabled={est.isPending}
+                onClick={() => est.mutate()}
+                size="icon-xs"
+                variant="ghost"
+              >
+                <Codicon name="refresh" size="0.75rem" spinning={est.isPending} />
+              </Button>
+            </Tip>
+          </div>
+          {result.rationale && (
+            <p className="text-[0.6875rem] leading-relaxed text-(--ui-text-quaternary)">{result.rationale}</p>
+          )}
+        </div>
+      ) : (
+        <div className="flex items-center gap-2">
+          <Button disabled={est.isPending} onClick={() => est.mutate()} size="xs" variant="outline">
+            <Codicon name={est.isPending ? 'loading' : 'dashboard'} size="0.75rem" spinning={est.isPending} />
+            {est.isPending ? k.estimating : k.estimateEffort}
+          </Button>
+          <Tip label={k.estimateTipLong}>
+            <span className="text-[0.625rem] text-(--ui-text-quaternary)">{k.makesModelCall}</span>
+          </Tip>
+        </div>
+      )}
+    </Section>
+  )
+}
+
+// Sidebar dependency chips: one wrap of title-labeled buttons per side
+// (Blocked by = parents, Blocks = children). Titles come from the backend's
+// `link_tasks`; ids remain in the tooltip + as the fallback label.
+function LinkChips({
+  ids,
+  linkTitles,
+  onOpen
+}: {
+  ids: string[]
+  linkTitles: Map<string, string>
+  onOpen: (id: string) => void
+}) {
+  return (
+    <div className="flex flex-wrap gap-1">
+      {ids.map(linked => {
+        const label = linkTitles.get(linked) || shortId(linked)
+
+        // Chips truncate in the narrow sidebar; the tip reveals the full title.
+        return (
+          <Tip key={linked} label={label} placement="row">
+            <button
+              aria-label={label}
+              className="max-w-full truncate rounded bg-(--ui-bg-quaternary) px-1.5 py-0.5 text-[0.6875rem] text-(--ui-text-secondary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground"
+              onClick={() => onOpen(linked)}
+              type="button"
+            >
+              {label}
+            </button>
+          </Tip>
+        )
+      })}
+    </div>
+  )
+}
+
+/** The main column's feed: Comments (default) / Activity / Runs / Worker log,
+ *  selected Jira-style with a segmented control ("Activity ▸ Show: …"). The
+ *  control hides itself when only comments exist — nothing to switch to. */
+function FeedTabs({
+  commentPending,
+  detail,
+  log,
+  onComment,
+  onRequeue,
+  running
+}: {
+  commentPending: boolean
+  detail: KanbanTaskDetail
+  log: null | WorkerLog
+  onComment: (body: string) => void
+  onRequeue: (body: string) => void
+  running: boolean
+}) {
+  const k = useKanban()
+  const [tab, setTab] = useState<'activity' | 'comments' | 'log' | 'runs'>('comments')
+
+  const hasLog = !!log?.exists && !!log.content
+  const switchable = detail.events.length > 0 || detail.runs.length > 0 || hasLog
+
+  const tabs = [
+    { id: 'comments' as const, label: k.comments(detail.comments.length) },
+    { id: 'activity' as const, label: k.activity(detail.events.length) },
+    { id: 'runs' as const, label: k.runs(detail.runs.length) },
+    { id: 'log' as const, label: k.workerLog }
+  ].filter(
+    t =>
+      t.id === 'comments' ||
+      (t.id === 'activity' ? detail.events.length > 0 : t.id === 'runs' ? detail.runs.length > 0 : hasLog)
+  )
+
+  const help = (
+    <Tip label={running ? k.commentsHelpRunning : k.commentsHelp}>
+      <span className="grid size-5 place-items-center rounded text-(--ui-text-quaternary) hover:text-(--ui-text-secondary)">
+        <Codicon name="question" size="0.8rem" />
+      </span>
+    </Tip>
+  )
+
+  const body = (
+    <div className="flex flex-col gap-4">
+      {tab === 'comments' && (
+        <>
+          {detail.comments.length > 0 && (
+            <ul className="flex flex-col gap-3">
+              {detail.comments.map(comment => (
+                <li className="flex flex-col gap-0.5" key={comment.id}>
+                  <div className="flex items-baseline gap-2 text-[0.75rem]">
+                    <span className="font-medium text-(--ui-text-secondary)">{comment.author}</span>
+                    <span className="text-[0.625rem] text-(--ui-text-quaternary)">{ago(comment.created_at)}</span>
+                  </div>
+                  <TaskMarkdown text={comment.body} />
+                </li>
+              ))}
+            </ul>
+          )}
+          <CommentComposer onRequeue={onRequeue} onSubmit={onComment} pending={commentPending} running={running} />
+        </>
+      )}
+      {tab === 'activity' && (
+        <ScrollFade deps={detail.events.length} max="7rem">
+          <ul className="flex flex-col gap-1">
+            {detail.events.map(event => {
+              const { detail: extra, label } = eventText(event, k)
+
+              return (
+                <li className="flex items-baseline gap-2 text-[0.6875rem]" key={event.id}>
+                  <span className="shrink-0 text-(--ui-text-secondary)">{label}</span>
+                  {extra && (
+                    <span className="min-w-0 truncate text-[0.625rem] text-(--ui-text-quaternary)" title={extra}>
+                      {extra}
+                    </span>
+                  )}
+                  <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">{ago(event.created_at)}</span>
+                </li>
+              )
+            })}
+          </ul>
+        </ScrollFade>
+      )}
+      {tab === 'runs' && (
+        <ScrollFade max="11rem">
+          <ul className="flex flex-col gap-1.5">
+            {detail.runs.map(run => {
+              const failed = ['crashed', 'failed', 'timed_out', 'gave_up'].includes(run.outcome ?? run.status)
+
+              return (
+                <li className="flex flex-col gap-0.5 text-[0.6875rem]" key={run.id}>
+                  <div className="flex items-center gap-2">
+                    <Badge size="xs" variant={failed ? 'destructive' : 'muted'}>
+                      {run.outcome ?? run.status}
+                    </Badge>
+                    {run.profile && <span className="text-(--ui-text-tertiary)">{run.profile}</span>}
+                    {duration(run.started_at, run.ended_at) && (
+                      <span className="text-(--ui-text-quaternary)">{duration(run.started_at, run.ended_at)}</span>
+                    )}
+                    <span className="ml-auto shrink-0 text-(--ui-text-quaternary)">
+                      {ago(run.ended_at ?? run.started_at)}
+                    </span>
+                  </div>
+                  {(run.error || run.summary) && (
+                    <p
+                      className={cn(
+                        'line-clamp-2 whitespace-pre-wrap',
+                        run.error ? 'text-destructive' : 'text-(--ui-text-quaternary)'
+                      )}
+                    >
+                      {run.error ?? run.summary}
+                    </p>
+                  )}
+                </li>
+              )
+            })}
+          </ul>
+        </ScrollFade>
+      )}
+      {tab === 'log' && (
+        <ScrollFade deps={log?.content.length} max="12rem">
+          <LogView className="border-0 px-0">{log!.content}</LogView>
+        </ScrollFade>
+      )}
+    </div>
+  )
+
+  // With something to switch to, the segmented control IS the heading — a
+  // label above it only repeated the active tab ("Comments · 2" twice).
+  if (!switchable) {
+    return (
+      <Section action={help} label={k.comments(detail.comments.length)}>
+        {body}
+      </Section>
+    )
+  }
+
+  return (
+    <section className="flex flex-col gap-3">
+      <div className="flex items-center justify-between gap-2">
+        <SegmentedControl onChange={setTab} options={tabs} value={tab} />
+        {help}
+      </div>
+      {body}
+    </section>
+  )
 }
 
 export function TaskDrawer({
-  board: taskBoard,
   columns,
   id,
   onClose,
   onOpen
 }: {
-  /** The card's own board, from the caller's board cache — REQUIRED to route
-   *  every fetch/mutation correctly in All Boards mode, where `$boardSlug` is
-   *  the `'*'` sentinel and cannot resolve a real board on its own. `undefined`
-   *  in single-board mode (byte-identical to the pre-existing behavior: every
-   *  call falls through to `$boardSlug`). */
-  board?: string
   columns: string[]
   id: null | string
   onClose: () => void
@@ -173,140 +843,50 @@ export function TaskDrawer({
 }) {
   const k = useKanban()
   const qc = useQueryClient()
+  const scope = useKanbanScope()
   const slug = useValue($boardSlug)
-  const [lightbox, setLightbox] = useState<null | { filename: string; src: string }>(null)
-  // Tab selection is pure presentation and belongs to this component — a
-  // global store would make one drawer's tab leak into the next card.
-  const [tab, setTab] = useState<TabId>('overview')
-  // Drawer width: persisted override (undefined = the authored w-[26rem]).
-  const widthOverride = useValue($paneWidthOverride(DRAWER_PANE_ID))
-  const [resizing, setResizing] = useState(false)
-  // Roadmap → Ready is the one lane spawn that skips auto-decompose, so it
-  // confirms — same gate as the board's drag/menu path (`spawnReadyKey`),
-  // scoped to this single open card instead of a cardKey since the drawer
-  // only ever has one task in view.
-  const [confirmingReady, setConfirmingReady] = useState(false)
-
-  const startResize = (event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0) {
-      return
-    }
-
-    event.preventDefault()
-    const startX = event.clientX
-    const startWidth = widthOverride ?? DRAWER_DEFAULT_WIDTH_PX
-    setResizing(true)
-
-    // Right-anchored: leftward pointer travel is negative dx but MORE width.
-    const onMove = (move: globalThis.PointerEvent) =>
-      setPaneWidthOverride(DRAWER_PANE_ID, clampDrawerWidth(startWidth + (startX - move.clientX)))
-
-    // Same teardown contract as the shell's sashes: pointercancel (window
-    // drag-out, touch cancel, system gesture) ends the drag exactly like
-    // pointerup, with explicit cross-removal of both — `{ once: true }`
-    // wouldn't remove the sibling path.
-    const onUp = () => {
-      window.removeEventListener('pointermove', onMove)
-      window.removeEventListener('pointerup', onUp)
-      window.removeEventListener('pointercancel', onUp)
-      setResizing(false)
-    }
-
-    window.addEventListener('pointermove', onMove)
-    window.addEventListener('pointerup', onUp)
-    window.addEventListener('pointercancel', onUp)
-  }
 
   // Socket-invalidated (bindApi); the interval is only the socketless heartbeat.
   const { data: detail, error } = useQuery({
-    enabled: !!id,
-    queryFn: () => fetchTask(id!, taskBoard),
-    queryKey: taskKey(slug, id ?? ''),
+    enabled: query => !!id && routedToScope(query),
+    queryFn: () => fetchTask(id!),
+    queryKey: taskKey(scope, slug, id ?? ''),
     refetchInterval: 30_000
   })
 
   const task = detail?.task
   const running = task?.status === 'running'
-  // The task's liveness fields summarize the card; the active attempt's own
-  // timestamp lives in the run collection and is the only honest run clock
-  // after retries or review/rework cycles.
-  const currentRun = running ? detail?.runs.find(run => run.status === 'running') : undefined
   const defaultAssignee = useDefaultAssignee()
 
-  // Resolve what an un-overridden task ACTUALLY runs: the assignee profile's
-  // own configured model/provider/effort from the roster. The Model row then
-  // reads "provider: model · Effort" (muted = inherited) instead of an opaque
-  // "Profile default" that hides the real depth. Older backends without the
-  // roster fields quietly fall back to the generic copy.
-  const { data: roster } = useQuery({ queryFn: fetchProfiles, queryKey: PROFILES_KEY, staleTime: 60_000 })
-  const assigneeName = task?.assignee || defaultAssignee
-  const assigneeProfile = assigneeName ? roster?.profiles.find(p => p.name === assigneeName) : undefined
-
-  const resolvedInheritLabel =
-    assigneeProfile && (assigneeProfile.model || assigneeProfile.reasoning_effort)
-      ? overrideLabel(
-          {
-            effort: assigneeProfile.reasoning_effort ?? '',
-            model: assigneeProfile.model ?? '',
-            provider: assigneeProfile.provider ?? ''
-          },
-          k.modelInherit
-        )
-      : undefined
-
-  // The worker artifact is capped/rotated by the backend at this same size,
-  // so this is the entire retained log — never an arbitrary UI tail that
-  // readers need to page through.
-  const logTail = FULL_LOG_TAIL_BYTES
-  // A different card starts on Overview — carrying the previous card's tab
-  // over would open a log the user never asked for. A confirm bound to the
-  // PREVIOUS card must not linger open against the new one.
-  useEffect(() => {
-    setTab('overview')
-    setConfirmingReady(false)
-  }, [id])
-
   const { data: log } = useQuery({
-    enabled: !!id,
-    queryFn: () => fetchLog(id!, logTail, taskBoard),
-    queryKey: logKey(slug, id ?? '', logTail),
+    enabled: query => !!id && routedToScope(query),
+    queryFn: () => fetchLog(id!),
+    queryKey: logKey(scope, slug, id ?? ''),
     refetchInterval: running ? 3_000 : 15_000
   })
 
-  // Esc closes the drawer even though it isn't modal (no backdrop to click off).
-  useEffect(() => {
-    if (!id) {
-      return
-    }
-
-    const onKey = (event: KeyboardEvent) => event.key === 'Escape' && onClose()
-    window.addEventListener('keydown', onKey)
-
-    return () => window.removeEventListener('keydown', onKey)
-  }, [id, onClose])
-
   const invalidate = () => {
-    void qc.invalidateQueries({ queryKey: taskKey(slug, id!) })
-    void qc.invalidateQueries({ queryKey: ['kanban', 'board', slug] })
+    void qc.invalidateQueries({ queryKey: taskKey(scope, slug, id!) })
+    void qc.invalidateQueries({ queryKey: boardKeyPrefix(scope) })
   }
 
   // Optimistic status change against the task cache; rolls back + toasts on a
   // rejected transition (the backend enforces the workflow).
   const moveMut = useMutation({
-    mutationFn: (status: string) => patchTask(id!, { status }, taskBoard),
+    mutationFn: (status: string) => patchTask(id!, { status }),
     onMutate: async status => {
-      await qc.cancelQueries({ queryKey: taskKey(slug, id!) })
-      const previous = qc.getQueryData<KanbanTaskDetail>(taskKey(slug, id!))
+      await qc.cancelQueries({ queryKey: taskKey(scope, slug, id!) })
+      const previous = qc.getQueryData<KanbanTaskDetail>(taskKey(scope, slug, id!))
 
       if (previous) {
-        qc.setQueryData(taskKey(slug, id!), { ...previous, task: { ...previous.task, status } })
+        qc.setQueryData(taskKey(scope, slug, id!), { ...previous, task: { ...previous.task, status } })
       }
 
       return { previous }
     },
     onError: (err, _status, context) => {
       if (context?.previous) {
-        qc.setQueryData(taskKey(slug, id!), context.previous)
+        qc.setQueryData(taskKey(scope, slug, id!), context.previous)
       }
 
       host.notify({ kind: 'error', message: errText(err) })
@@ -324,8 +904,7 @@ export function TaskDrawer({
     )
 
   const commentMut = useMutation({
-    mutationFn: ({ body, choice }: { body: string; choice?: ChoiceResponse }) =>
-      addComment(id!, body, choice, taskBoard),
+    mutationFn: (body: string) => addComment(id!, body),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: invalidate
   })
@@ -335,8 +914,8 @@ export function TaskDrawer({
   // replacement for the block → comment → unblock dance.
   const requeueMut = useMutation({
     mutationFn: async (body: string) => {
-      await addComment(id!, body, undefined, taskBoard)
-      await reclaimTask(id!, taskBoard)
+      await addComment(id!, body)
+      await reclaimTask(id!)
     },
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: () => {
@@ -345,47 +924,26 @@ export function TaskDrawer({
     }
   })
 
-  // Priority-only PATCH — never touches status/title/body/assignee.
-  const priorityMut = useMutation({
-    mutationFn: (priority: number) => patchTask(id!, { priority }, taskBoard),
-    onError: err => host.notify({ kind: 'error', message: errText(err) }),
-    onSuccess: invalidate
-  })
-
   const uploadMut = useMutation({
     mutationFn: async (file: File) =>
-      uploadAttachment(
-        id!,
-        {
-          bytes: await file.arrayBuffer(),
-          contentType: file.type || undefined,
-          filename: file.name
-        },
-        taskBoard
-      ),
+      uploadAttachment(id!, {
+        bytes: await file.arrayBuffer(),
+        contentType: file.type || undefined,
+        filename: file.name
+      }),
     onError: err => host.notify({ kind: 'error', message: errText(err) }),
     onSuccess: invalidate
   })
-
-  const activityGroups = useMemo(() => (detail ? groupActivity(detail.events, k) : []), [detail, k])
-
-  // Upstream made `attachments` optional on the drawer payload: an older backend
-  // omits the key entirely, which means "this backend has no attachment support"
-  // and is NOT the same as an empty list. `supportsAttachments` preserves that
-  // distinction (upstream gates its section on `Array.isArray(detail.attachments)`
-  // for the same reason) while `attachments` gives the two filtered sections a
-  // safe array to read without each guarding the shape itself.
-  const supportsAttachments = Array.isArray(detail?.attachments)
-
-  const attachments = useMemo(() => (Array.isArray(detail?.attachments) ? detail.attachments : []), [detail])
 
   if (!id) {
     return null
   }
 
   const errorMessage = error ? errText(error) : null
-  const tone = columnMeta(task?.status ?? '').tone
-  const attachmentCount = attachments.length
+
+  // Linked tasks resolved to titles by the backend (`link_tasks`); absent on
+  // older backends, where the chips fall back to short ids.
+  const linkTitles = new Map((detail?.link_tasks ?? []).map(linked => [linked.id, linked.title]))
 
   const move = (status: string) => {
     if (!task || status === task.status) {
@@ -398,338 +956,229 @@ export function TaskDrawer({
       return
     }
 
-    // Spawning straight to Ready skips auto-decompose, which is the standing
-    // default for a roadmap item — so it is the one lane move that asks
-    // first, same rule as the board's drag/menu path.
-    if (task.status === 'roadmap' && status === 'ready') {
-      setConfirmingReady(true)
-
-      return
-    }
-
     moveMut.mutate(status)
   }
 
-  /** Reply deep-link: comments live on Activity, so switch there first and
-   *  focus once the composer has mounted. */
-  const focusComment = () => {
-    setTab('activity')
-    requestAnimationFrame(() => focusCommentInput())
-  }
-
+  // The shared Dialog owns the chrome tokens, focus trap, Esc and outside-click
+  // dismissal, and publishes itself as the portal container so the status,
+  // assignee, actions and model menus open inside it (no z-index rung needed).
+  // The body box is split into two independently scrolling columns, so it
+  // clips instead of scrolling itself; its height follows the content up to
+  // the cap.
   return (
-    <div
-      className="absolute inset-y-0 right-0 z-20 flex w-[26rem] flex-col border-l border-(--ui-stroke-tertiary) bg-(--ui-bg-elevated) duration-150 ease-out animate-in fade-in slide-in-from-right-4"
-      style={widthOverride !== undefined ? { width: `${widthOverride}px` } : undefined}
-    >
-      {/* Left-edge drag sash — widen the drawer to read the Log tab, double-
-          click to fall back to the authored 26rem. */}
-      <div
-        className="group/vsash absolute inset-y-0 left-0 z-10 w-1 -translate-x-1/2 cursor-col-resize"
-        data-kanban-drawer-sash="true"
-        onDoubleClick={() => setPaneWidthOverride(DRAWER_PANE_ID, undefined)}
-        onPointerDown={startResize}
+    <Dialog onOpenChange={open => !open && onClose()} open>
+      <DialogContent
+        aria-describedby={undefined}
+        bodyClassName="flex max-h-[min(84vh,54rem)] flex-col gap-0 overflow-hidden p-0"
+        className="w-[min(62rem,94vw)] max-w-none"
+        showCloseButton={false}
       >
-        <div
-          className={cn(
-            'absolute inset-y-0 left-1/2 w-px -translate-x-1/2 transition-colors',
-            resizing ? 'bg-(--ui-stroke-secondary)' : 'group-hover/vsash:bg-(--ui-stroke-secondary)'
-          )}
-        />
-      </div>
-
-      {/* Status-colored header band — the card's state is the first thing the
-          eye lands on, and it's the same tone the board's column uses. */}
-      <header
-        className="flex flex-col gap-2 px-4 pt-3.5 pb-3"
-        style={task ? { backgroundColor: wash(tone, 8), boxShadow: `inset 0 -1px 0 ${wash(tone, 22)}` } : undefined}
-      >
-        <div className="flex items-center gap-2">
-          {task ? (
-            <StatusMenu columns={columns} onMove={move} status={task.status} />
-          ) : (
-            <span className="font-mono text-sm text-(--ui-text-tertiary)">{shortId(id)}</span>
-          )}
-          {task && <IdChip className="text-[0.625rem]" id={task.id} />}
-          <div className="ml-auto flex items-center gap-0.5">
+        <header className="flex flex-col gap-2 px-5 pt-4 pb-3">
+          <div className="flex items-center gap-2">
+            {task ? (
+              <StatusMenu columns={columns} onMove={move} status={task.status} />
+            ) : (
+              <span className="font-mono text-sm text-(--ui-text-tertiary)">{shortId(id)}</span>
+            )}
             {task && (
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <button
-                    aria-label={k.taskActions}
-                    className="grid size-6 place-items-center rounded text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground"
-                    type="button"
-                  >
-                    <Codicon name="ellipsis" size="0.9rem" />
-                  </button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end">
-                  <DropdownMenuItem
-                    onSelect={() => {
-                      void navigator.clipboard.writeText(task.id)
-                      host.notify({ kind: 'info', message: k.copiedId(task.id) })
-                    }}
-                  >
-                    <Codicon name="copy" size="0.85rem" />
-                    {k.copyTaskId}
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    onSelect={() => {
-                      void navigator.clipboard.writeText(task.title || task.id)
-                      host.notify({ kind: 'info', message: k.copiedTitle })
-                    }}
-                  >
-                    <Codicon name="copy" size="0.85rem" />
-                    {k.copyTitle}
-                  </DropdownMenuItem>
-                  <DropdownMenuSeparator />
-                  <DropdownMenuItem
-                    onSelect={mutate(() => patchTask(task.id, { status: 'archived' }, taskBoard), onClose)}
-                  >
-                    <Codicon name="archive" size="0.85rem" />
-                    {k.archive}
-                  </DropdownMenuItem>
-                  <DropdownMenuItem
-                    className="text-destructive"
-                    onSelect={mutate(() => deleteTask(task.id, taskBoard), onClose)}
-                  >
-                    <Codicon name="trash" size="0.85rem" />
-                    {k.delete}
-                  </DropdownMenuItem>
-                </DropdownMenuContent>
-              </DropdownMenu>
+              <span className="font-mono text-[0.625rem] text-(--ui-text-quaternary)" data-selectable-text="true">
+                {shortId(task.id)}
+              </span>
             )}
-            <button
-              aria-label={k.close}
-              className="grid size-6 place-items-center rounded text-(--ui-text-tertiary) transition-colors hover:bg-(--chrome-action-hover) hover:text-foreground"
-              onClick={onClose}
-              type="button"
-            >
-              <Codicon name="close" size="0.9rem" />
-            </button>
+            <div className="ml-auto flex items-center gap-0.5">
+              {task && (
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button aria-label={k.taskActions} size="icon-xs" variant="ghost">
+                      <Codicon name="ellipsis" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end">
+                    <DropdownMenuItem
+                      onSelect={() => {
+                        void navigator.clipboard.writeText(task.id)
+                        host.notify({ kind: 'info', message: k.copiedId(task.id) })
+                      }}
+                    >
+                      <Codicon name="copy" size="0.85rem" />
+                      {k.copyTaskId}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      onSelect={() => {
+                        void navigator.clipboard.writeText(task.title || task.id)
+                        host.notify({ kind: 'info', message: k.copiedTitle })
+                      }}
+                    >
+                      <Codicon name="copy" size="0.85rem" />
+                      {k.copyTitle}
+                    </DropdownMenuItem>
+                    <DropdownMenuSeparator />
+                    <DropdownMenuItem onSelect={mutate(() => patchTask(task.id, { status: 'archived' }), onClose)}>
+                      <Codicon name="archive" size="0.85rem" />
+                      {k.archive}
+                    </DropdownMenuItem>
+                    <DropdownMenuItem
+                      className="text-destructive"
+                      onSelect={mutate(() => deleteTask(task.id), onClose)}
+                    >
+                      <Codicon name="trash" size="0.85rem" />
+                      {k.delete}
+                    </DropdownMenuItem>
+                  </DropdownMenuContent>
+                </DropdownMenu>
+              )}
+              <Button aria-label={k.close} onClick={onClose} size="icon-xs" variant="ghost">
+                <Codicon name="close" />
+              </Button>
+            </div>
           </div>
-        </div>
-        {task && (
-          <h2 className="text-sm leading-snug font-semibold text-foreground" data-selectable-text="true">
-            {task.title || task.id}
-          </h2>
-        )}
-      </header>
+          <DialogTitle className="leading-snug" data-selectable-text="true">
+            {task ? task.title || task.id : shortId(id)}
+          </DialogTitle>
+        </header>
 
-      {detail && task && (
-        <TabStrip
-          active={tab}
-          onSelect={next => setTab(next as TabId)}
-          tabs={[
-            { id: 'overview', label: k.tabOverview },
-            { id: 'activity', label: k.tabActivity, count: detail.events.length },
-            { id: 'log', label: k.tabLog, count: attachmentCount }
-          ]}
-        />
-      )}
+        <div className="flex min-h-0 flex-1 flex-col" data-selectable-text="true">
+          {errorMessage ? (
+            <ErrorState title={errorMessage} />
+          ) : !detail || !task ? (
+            <div className="grid h-32 place-items-center">
+              <Loader type="lemniscate-bloom" />
+            </div>
+          ) : (
+            <div className="flex min-h-0 flex-1">
+              <div className="min-w-0 flex-1 overflow-y-auto px-5 pb-5">
+                <div className="flex flex-col gap-5">
+                  {task.status === 'ready' && !task.assignee && !defaultAssignee && (
+                    <Callout title={k.readyUnassignedTitle} tone={SEVERITY_TONE.warning}>
+                      <p className="text-[0.6875rem] leading-relaxed text-(--ui-text-secondary)">
+                        {k.readyUnassignedBody}
+                      </p>
+                    </Callout>
+                  )}
 
-      <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3 pb-10" data-selectable-text="true">
-        {errorMessage ? (
-          <ErrorState title={errorMessage} />
-        ) : !detail || !task ? (
-          <div className="grid h-32 place-items-center">
-            <Loader type="lemniscate-bloom" />
-          </div>
-        ) : (
-          <div className="flex flex-col gap-4 text-sm" id={`kanban-tabpanel-${tab}`} role="tabpanel">
-            {tab === 'overview' && (
-              <>
-                <CtaBanner
-                  comments={detail.comments}
-                  events={detail.events}
-                  onFocusComment={focusComment}
-                  onMove={move}
-                  onSubmitChoice={(body, choice) => commentMut.mutateAsync({ body, choice })}
-                  runs={detail.runs}
-                  task={task}
-                />
-
-                <p className="text-[0.71rem] leading-relaxed text-(--ui-text-tertiary)">
-                  {statusGuidance(task.status, task, detail.events, detail.runs, k)}
-                </p>
-
-                {task.status === 'ready' && !task.assignee && !defaultAssignee && (
-                  <Callout title={k.readyUnassignedTitle} tone={SEVERITY_TONE.warning}>
-                    <p className="text-[0.71rem] leading-relaxed text-(--ui-text-secondary)">{k.readyUnassignedBody}</p>
-                  </Callout>
-                )}
-
-                {task.diagnostics && task.diagnostics.length > 0 && (
-                  <Section label={k.diagnosticsN(task.diagnostics.length)} tone={SEVERITY_TONE.warning}>
-                    <Diagnostics
-                      items={task.diagnostics}
-                      onReclaim={() => void mutate(() => reclaimTask(task.id, taskBoard))()}
-                    />
-                  </Section>
-                )}
-
-                <DescriptionSection
-                  body={task.body}
-                  onSave={body => void mutate(() => patchTask(task.id, { body }, taskBoard))()}
-                />
-
-                <div className="flex flex-col gap-1.5">
-                  <div className={FIELD_LABEL}>{k.metaSectionLabel}</div>
-                  <div className="grid grid-cols-[5.5rem_minmax(0,1fr)] gap-x-3 gap-y-0.5 text-[0.71rem]">
-                    <MetaRow label={k.assignee}>
-                      <AssigneeMenu
-                        current={task.assignee}
-                        onReassign={profile => void mutate(() => reassignTask(task.id, profile, taskBoard))()}
+                  {task.diagnostics && task.diagnostics.length > 0 && (
+                    <Section label={k.diagnosticsN(task.diagnostics.length)}>
+                      <Diagnostics
+                        items={task.diagnostics}
+                        onReclaim={() => void mutate(() => reclaimTask(task.id))()}
+                        onUnblock={() =>
+                          void mutate(
+                            () => patchTask(task.id, { status: 'ready' }),
+                            () => host.notify({ kind: 'success', message: k.unblockedMessage(shortId(task.id)) })
+                          )()
+                        }
                       />
-                    </MetaRow>
-                    <MetaRow label={k.metaPriority}>
-                      <PriorityPicker onChange={priority => priorityMut.mutate(priority)} priority={task.priority} />
-                    </MetaRow>
-                    {task.tenant && <MetaRow label={k.metaTenant}>{task.tenant}</MetaRow>}
-                    {task.workspace_path && (
-                      <MetaRow
-                        label={k.workspace}
-                        title={`${task.workspace_kind ? `${task.workspace_kind}: ` : ''}${task.workspace_path}`}
-                      >
-                        {task.workspace_kind ? `${task.workspace_kind}: ` : ''}
-                        {task.workspace_path}
-                      </MetaRow>
-                    )}
-                    <MetaRow label={k.model}>
-                      <ModelOverrideField
-                        inheritLabel={resolvedInheritLabel}
-                        onChange={next => void mutate(() => patchTask(task.id, overridePatch(next), taskBoard))()}
-                        value={{
-                          effort: task.reasoning_effort ?? '',
-                          model: task.model_override ?? '',
-                          provider: task.provider_override ?? ''
-                        }}
-                      />
-                    </MetaRow>
-                    {task.created_by && <MetaRow label={k.metaCreatedBy}>{task.created_by}</MetaRow>}
-                    {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
-                    {currentRun?.started_at && ago(currentRun.started_at) && (
-                      <MetaRow label={k.metaRunStarted}>{ago(currentRun.started_at)}</MetaRow>
-                    )}
-                    {running && detail.runs.length > 1 && (
-                      <MetaRow label={k.metaRun}>{k.metaRunCount(detail.runs.length)}</MetaRow>
-                    )}
-                    {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
-                  </div>
+                    </Section>
+                  )}
+
+                  <DescriptionSection
+                    body={task.body}
+                    onSave={body => void mutate(() => patchTask(task.id, { body }))()}
+                  />
+
+                  {task.result && (
+                    <Section label={k.result}>
+                      <TaskMarkdown text={task.result} />
+                    </Section>
+                  )}
+
+                  {task.latest_summary && !isAdminSummary(task.latest_summary) && (
+                    <Section label={k.latestSummary}>
+                      <TaskMarkdown text={task.latest_summary} />
+                    </Section>
+                  )}
+
+                  <FeedTabs
+                    commentPending={commentMut.isPending || requeueMut.isPending}
+                    detail={detail}
+                    log={log ?? null}
+                    onComment={body => commentMut.mutate(body)}
+                    onRequeue={body => requeueMut.mutate(body)}
+                    running={running}
+                  />
                 </div>
-
-                {task.result && (
-                  <Section label={k.result} tone={columnMeta('done').tone}>
-                    <CollapsibleMarkdown text={task.result} />
-                  </Section>
+              </div>
+              <aside className="flex w-64 shrink-0 flex-col gap-4 overflow-y-auto border-l border-(--ui-stroke-tertiary) px-4 pb-5">
+                <MetaRow label={k.assignee}>
+                  <AssigneeMenu
+                    current={task.assignee}
+                    onReassign={profile => void mutate(() => reassignTask(task.id, profile))()}
+                  />
+                </MetaRow>
+                {typeof task.priority === 'number' && (
+                  <MetaRow label={k.metaPriority}>
+                    <PriorityGlyph priority={task.priority} />
+                  </MetaRow>
                 )}
-
-                {task.latest_summary && !isAdminSummary(task.latest_summary) && (
-                  <Section label={k.latestSummary}>
-                    <CollapsibleMarkdown text={task.latest_summary} />
-                  </Section>
+                {task.tenant && <MetaRow label={k.metaTenant}>{task.tenant}</MetaRow>}
+                {/* #124391 — block detail the API already returns. The kind is
+                    retained across unblock, so present it as CURRENT only
+                    while the card sits in the blocked column. */}
+                {task.status === 'blocked' && task.block_kind && (
+                  <MetaRow label={k.blockReason}>
+                    <Tip label={k.blockKindTip(task.block_kind)}>
+                      <span className="cursor-help text-destructive">{task.block_kind}</span>
+                    </Tip>
+                  </MetaRow>
                 )}
-
-                <DependenciesSection
-                  board={taskBoard}
-                  detail={detail}
-                  onLink={parentId => void mutate(() => linkTasks(parentId, task.id, taskBoard))()}
-                  onOpen={onOpen}
-                  onUnlink={(parentId, childId) => void mutate(() => unlinkTasks(parentId, childId, taskBoard))()}
-                  slug={slug}
-                  task={task}
-                />
-
-                <EstimateSection board={taskBoard} id={task.id} />
-              </>
-            )}
-
-            {tab === 'activity' && (
-              <>
-                <CommentsSection
-                  comments={detail.comments}
-                  onRequeue={body => requeueMut.mutate(body)}
-                  onSubmit={body => commentMut.mutate({ body })}
-                  pending={commentMut.isPending || requeueMut.isPending}
-                  running={running}
-                />
-
-                {detail.events.length > 0 ? (
-                  <Section label={k.activity(detail.events.length)}>
-                    {/* Activity is an audit trail, not a live terminal: retain
-                        the reader's place while it refreshes, and give a dense
-                        timeline enough room to show more than a handful of
-                        transitions at once. The Worker Log owns live-follow. */}
-                    <ScrollFade max="min(28rem, 46vh)">
-                      <ul className="flex flex-col gap-1">
-                        {activityGroups.map(group => (
-                          <ActivityRow group={group} k={k} key={group.events[0].id} />
-                        ))}
-                      </ul>
-                    </ScrollFade>
-                  </Section>
-                ) : (
-                  <p className="text-[0.75rem] text-(--ui-text-quaternary)">{k.noActivityYet}</p>
+                {typeof task.block_recurrences === 'number' && task.block_recurrences > 0 && (
+                  <MetaRow label={k.blockRecurrences}>
+                    <Tip label={k.blockRecurrencesTip}>
+                      <span className="cursor-help">×{task.block_recurrences}</span>
+                    </Tip>
+                  </MetaRow>
                 )}
+                {typeof task.consecutive_failures === 'number' && task.consecutive_failures > 0 && (
+                  <MetaRow label={k.consecutiveFailures}>{task.consecutive_failures}</MetaRow>
+                )}
+                {task.last_failure_error && (
+                  <MetaRow label={k.lastFailureError}>
+                    <span className="whitespace-pre-wrap font-mono text-[0.65rem] leading-snug text-(--ui-text-tertiary)">
+                      {task.last_failure_error}
+                    </span>
+                  </MetaRow>
+                )}
+                {task.workspace_path && (
+                  <MetaRow label={k.workspace}>
+                    <WorkspaceValue kind={task.workspace_kind} path={task.workspace_path} />
+                  </MetaRow>
+                )}
+                <MetaRow label={k.model}>
+                  <ModelOverrideField
+                    onChange={next => void mutate(() => patchTask(task.id, overridePatch(next)))()}
+                    value={{
+                      effort: task.reasoning_effort ?? '',
+                      model: task.model_override ?? '',
+                      provider: task.provider_override ?? ''
+                    }}
+                  />
+                </MetaRow>
+                {(detail.links.parents.length > 0 || detail.links.children.length > 0) &&
+                  (['parents', 'children'] as const).map(side =>
+                    detail.links[side].length > 0 ? (
+                      <MetaRow key={side} label={side === 'parents' ? k.blockedBy : k.blocks}>
+                        <LinkChips ids={detail.links[side]} linkTitles={linkTitles} onOpen={onOpen} />
+                      </MetaRow>
+                    ) : null
+                  )}
+                {task.created_by && <MetaRow label={k.metaCreatedBy}>{task.created_by}</MetaRow>}
+                {ago(task.created_at) && <MetaRow label={k.metaCreated}>{ago(task.created_at)}</MetaRow>}
+                {running && task.worker_pid ? <MetaRow label={k.metaWorkerPid}>{task.worker_pid}</MetaRow> : null}
+                <EstimateSection id={task.id} />
 
-                <RunsSection runs={detail.runs} />
-              </>
-            )}
-
-            {tab === 'log' && (
-              <>
-                <WorkerLogSection live={running} log={log} />
-
-                <ImagesSection
-                  attachments={attachments.filter(isImageAttachment)}
-                  board={taskBoard}
-                  onOpen={(filename, src) => setLightbox({ filename, src })}
-                />
-
-                {supportsAttachments && (
+                {Array.isArray(detail.attachments) && (
                   <AttachmentsSection
-                    attachments={attachments.filter(a => !isImageAttachment(a))}
+                    attachments={detail.attachments}
+                    onDownload={detail.downloadAttachment}
                     onUpload={file => uploadMut.mutate(file)}
                     pending={uploadMut.isPending}
                   />
                 )}
-              </>
-            )}
-          </div>
-        )}
-      </div>
-
-      <Dialog onOpenChange={open => !open && setLightbox(null)} open={!!lightbox}>
-        <DialogContent
-          bodyClassName="block overflow-visible p-0"
-          className="w-auto max-h-[calc(100vh-12rem)] max-w-[calc(100vw-12rem)] border-0 bg-transparent shadow-none"
-          showCloseButton={false}
-        >
-          {lightbox && (
-            <img
-              alt={lightbox.filename}
-              className="block max-h-[calc(100vh-12rem)] max-w-[calc(100vw-12rem)] cursor-zoom-out rounded-lg object-contain shadow-2xl"
-              onClick={() => setLightbox(null)}
-              onError={() => setLightbox(null)}
-              src={lightbox.src}
-            />
+              </aside>
+            </div>
           )}
-        </DialogContent>
-      </Dialog>
-
-      {/* Same seam as the board's spawn-Ready confirm: `onConfirm` returns
-          the mutation's own promise, so a server-side rejection surfaces
-          inline and the dialog stays open instead of closing on failure. */}
-      <ConfirmDialog
-        confirmLabel={k.spawnReadyConfirm}
-        description={k.spawnReadyBody}
-        onClose={() => setConfirmingReady(false)}
-        onConfirm={async () => {
-          await moveMut.mutateAsync('ready')
-        }}
-        open={confirmingReady}
-        title={k.spawnReadyTitle}
-      />
-    </div>
+        </div>
+      </DialogContent>
+    </Dialog>
   )
 }

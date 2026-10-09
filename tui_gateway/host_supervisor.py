@@ -29,6 +29,7 @@ MUTATOR_ROUTE_TABLE: dict[str, str] = {
     "session.save": "run-concurrent", "session.compress": "idle-gated",
     "prompt.submit.truncate": "idle-gated", "slash.model": "idle-gated",
     "slash.personality": "idle-gated", "slash.prompt": "idle-gated", "slash.compress": "idle-gated",
+    "slash.refine": "idle-gated",
     "session.reset": "idle-gated", "session.history.reload": "idle-gated",
     "slash.retry": "idle-gated"}
 
@@ -42,7 +43,7 @@ _LATE_CONTROL_TTL_SECS = 1800.0
 _LATE_CONTROL_MAX = 64
 # Host frames whose ``request_id`` resolves a pending/late control waiter.
 _CONTROL_REPLY_TYPES = frozenset({
-    "control.ack", "control.error", "respond.ack", "respond.error", "explain.ack", "explain.error", "interrupt.ack",
+    "control.ack", "control.error", "respond.ack", "respond.error", "interrupt.ack",
     "reload_mcp.ack", "shutdown.ack"})
 
 
@@ -50,6 +51,22 @@ def append_log_record(path: str | Path, record: str) -> None:
     """Append one log record using O_APPEND and exactly one os.write call."""
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     text = record if record.endswith("\n") else f"{record}\n"
+    if os.name == "nt":
+        # CRT O_APPEND is seek+write, not an atomic append across handles.
+        # FILE_APPEND_DATA without FILE_WRITE_DATA makes the kernel append.
+        import win32con
+        import win32file
+        from ntsecuritycon import FILE_APPEND_DATA
+        handle = win32file.CreateFile(
+            str(path), FILE_APPEND_DATA,
+            win32con.FILE_SHARE_READ | win32con.FILE_SHARE_WRITE | win32con.FILE_SHARE_DELETE,
+            None, win32con.OPEN_ALWAYS, win32con.FILE_ATTRIBUTE_NORMAL, None,
+        )
+        try:
+            win32file.WriteFile(handle, text.encode("utf-8", errors="replace"))
+        finally:
+            handle.Close()
+        return
     fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
     try:
         os.write(fd, text.encode("utf-8", errors="replace"))
@@ -255,13 +272,6 @@ class HostSupervisor:
         self.start()
         request_id = uuid.uuid4().hex
         frame = {"type": "respond", "sid": sid, "request_id": request_id, "params": dict(params)}
-        return self._await_reply(frame, request_id, timeout)
-
-    def explain(self, sid: str, params: dict[str, Any], *, timeout: float = 180.0) -> dict:
-        """Ask the host owning a live clarification for read-only help."""
-        self.start()
-        request_id = uuid.uuid4().hex
-        frame = {"type": "explain", "sid": sid, "request_id": request_id, "params": dict(params)}
         return self._await_reply(frame, request_id, timeout)
 
     def reload_mcp(self, sid: str, *, request_id: str | None = None) -> dict:

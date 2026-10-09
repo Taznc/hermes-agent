@@ -70,29 +70,18 @@ describe('ResponseLoadingIndicator timer', () => {
 
     expect(screen.getByText('⏳ waiting on local-model — 30s with no output yet')).toBeTruthy()
   })
-})
 
-// The live status line was originally marked as transcript scaffolding, on the
-// reasoning that a line sitting between tool rows and thinking headers should
-// rest at the same fade rather than claim emphasis it hasn't earned. That is
-// right for a settled row and wrong for this one: it exists only while the user
-// is waiting on it, and it is the only thing on screen saying the app is alive
-// — so the emphasis IS earned, for exactly as long as the row exists.
-//
-// Carrying the mark anyway multiplied the row by 0.67 on top of its already
-// partial text alpha, which is what made it repeatedly unreadable. It now opts
-// out and lights itself; see `activity-timer-text.test.tsx` for the alpha stack.
-describe('status line', () => {
-  afterEach(cleanup)
-
-  it('is not marked as settled scaffolding, so the fade rule cannot dim it', () => {
+  it('keeps the ticking timer out of the live region accessibility tree', () => {
     $activeSessionId.set('session-a')
     $turnStartedAt.set(Date.now())
-    const { container } = renderIndicator()
+    renderIndicator()
 
-    const row = container.querySelector('[role="status"]')
+    act(() => vi.advanceTimersByTime(2_000))
 
-    expect(row?.hasAttribute('data-conversation-scaffold')).toBe(false)
-    expect(row?.hasAttribute('data-activity-strip')).toBe(true)
+    const status = screen.getByRole('status')
+    const timer = [...status.querySelectorAll('[aria-hidden="true"]')].find(el => el.textContent === '2s')
+
+    expect(status.getAttribute('aria-live')).toBe('polite')
+    expect(timer).toBeDefined()
   })
 })

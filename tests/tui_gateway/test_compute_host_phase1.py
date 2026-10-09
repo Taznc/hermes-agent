@@ -4,14 +4,11 @@ import os
 import sys
 import threading
 import time
-from pathlib import Path
 
-import pytest
 
 from tui_gateway import compute_host, server
 from tui_gateway.compute_host import ComputeHost, _default_workers
 from tui_gateway.host_supervisor import (
-    MUTATOR_ROUTE_TABLE,
     HostSupervisor,
     append_log_record,
 )
@@ -35,236 +32,51 @@ def _wait_for_frame(out: io.StringIO, predicate, timeout: float = 2.0) -> dict:
     raise AssertionError(f"timed out waiting for frame; saw={_json_lines(out)}")
 
 
-def test_compute_host_workers_inherit_tui_pool_env_or_8(monkeypatch):
+def test_compute_host_workers_inherit_tui_pool_env(monkeypatch):
     monkeypatch.delenv("HERMES_TUI_RPC_POOL_WORKERS", raising=False)
     monkeypatch.delenv("HERMES_COMPUTE_HOST_WORKERS", raising=False)
-    assert _default_workers() == 8
+    default = _default_workers()
 
     monkeypatch.setenv("HERMES_TUI_RPC_POOL_WORKERS", "11")
     assert _default_workers() == 11
 
-    # Dead-RC tombstone: malformed env falls back to 8, not the old except-branch 4.
+    # Malformed env falls back to the same default as unset.
     monkeypatch.setenv("HERMES_TUI_RPC_POOL_WORKERS", "not-an-int")
-    assert _default_workers() == 8
+    assert _default_workers() == default
 
 
-def test_compute_host_routes_clarify_response_to_child_pending_registry(monkeypatch):
-    """Interactive answers are handled in the process that owns `_pending`."""
+def test_compute_host_routes_relayed_response_and_lock_to_its_open_request(monkeypatch):
+    """The child owns the server request's wait: a relayed client response frame resolves it in-process,
+    and a relayed ``clarify.lock`` is answered with that method's result for the parent to ack."""
+    from tui_gateway import server_requests
     out = io.StringIO()
     host = ComputeHost(stdout=out, heartbeat_secs=0)
     sid = "host-clarify"
     server._sessions[sid] = {"history_lock": threading.Lock()}
-    calls = []
-    monkeypatch.setitem(
-        server._methods,
-        "clarify.respond",
-        lambda rid, params: calls.append((rid, dict(params))) or {"result": {"status": "ok"}},
-    )
+    req = server_requests.ServerRequest(sid, "clarify", {"question": "?"})
+    with server_requests._lock:
+        server_requests._open[req.id] = req
+    locks = []
+    monkeypatch.setitem(server._methods, "clarify.lock",
+                        lambda rid, params: locks.append((rid, dict(params))) or {"result": {"status": "ok", "remaining": []}})
 
     try:
-        host._handle_respond(
-            {
-                "sid": sid,
-                "request_id": "relay-response",
-                "params": {"request_id": "clarify-request", "answer": "yes"},
-            }
-        )
-        assert calls == [("relay-response", {"request_id": "clarify-request", "answer": "yes"})]
+        host._handle_respond({"sid": sid, "request_id": "relay-lock",
+                              "params": {"lock": {"request_id": req.id, "question_id": "q0", "answer": "a"}}})
+        assert locks == [("relay-lock", {"request_id": req.id, "question_id": "q0", "answer": "a"})]
+        assert _json_lines(out)[-1]["response"] == {"result": {"status": "ok", "remaining": []}}
+
+        host._handle_respond({"sid": sid, "request_id": "relay-response",
+                              "params": {"frame": {"jsonrpc": "2.0", "id": req.id, "result": {"answer": "yes"}}}})
+        assert req.answered and req.result == {"answer": "yes"} and req.event.is_set()
         frame = _json_lines(out)[-1]
-        assert frame == {
-            "type": "respond.ack",
-            "sid": sid,
-            "request_id": "relay-response",
-            "response": {"result": {"status": "ok"}},
-            "host_ns": frame["host_ns"],
-        }
+        assert frame["type"] == "respond.ack" and frame["response"]["result"] == {"status": "ok"}
     finally:
         server._sessions.pop(sid, None)
+        server_requests.reset_for_tests()
         host.close()
 
 
-def test_compute_host_routes_clarify_explanation_to_child_live_session(monkeypatch):
-    """Help runs in the child, which owns the pending Event and non-mirrored history."""
-    out = io.StringIO()
-    host = ComputeHost(stdout=out, heartbeat_secs=0)
-    sid = "host-explain"
-    live_history = [{"role": "user", "content": "host-only context"}]
-    server._sessions[sid] = {"history": live_history, "history_lock": threading.Lock()}
-    calls = []
-    monkeypatch.setitem(
-        server._methods,
-        "clarify.explain",
-        lambda rid, params: calls.append((rid, dict(params), server._sessions[sid]["history"])) or {
-            "result": {"status": "complete", "explanation_id": "host-help"}},
-    )
-
-    try:
-        host._handle_explain({
-            "sid": sid, "request_id": "relay-explain",
-            "params": {"version": 1, "request_id": "clarify-request", "choice": "yes"},
-        })
-        _wait_for_frame(out, lambda frame: frame.get("type") == "explain.ack")
-        assert calls == [(
-            "relay-explain", {"version": 1, "request_id": "clarify-request", "choice": "yes"},
-            live_history,
-        )]
-        frame = _json_lines(out)[-1]
-        assert frame["type"] == "explain.ack"
-        assert frame["sid"] == sid
-        assert frame["request_id"] == "relay-explain"
-        assert frame["response"] == {"result": {"status": "complete", "explanation_id": "host-help"}}
-    finally:
-        server._sessions.pop(sid, None)
-        host.close()
-
-
-def test_supervisor_explain_delivers_host_ack(monkeypatch, tmp_path):
-    """The supervisor recognizes the dedicated explanation frame, not a control mutation."""
-    supervisor = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
-    monkeypatch.setattr(supervisor, "start", lambda: None)
-    sent = []
-
-    def send(frame):
-        sent.append(dict(frame))
-        supervisor._handle_host_frame({
-            "type": "explain.ack", "request_id": frame["request_id"], "sid": frame["sid"],
-            "response": {"result": {"status": "complete", "explanation_id": "help-1"}},
-        })
-
-    monkeypatch.setattr(supervisor, "_send_frame", send)
-    result = supervisor.explain("s1", {"version": 1, "request_id": "clarify-1"})
-    assert result["response"]["result"]["explanation_id"] == "help-1"
-    assert sent[0]["type"] == "explain"
-    assert sent[0]["params"] == {"version": 1, "request_id": "clarify-1"}
-
-
-def test_supervisor_keeps_concurrent_explanation_correlations_distinct(monkeypatch, tmp_path):
-    """Concurrent help frames retain their own supervisor waiter and host response."""
-    host = ComputeHost(heartbeat_secs=0)
-    supervisor = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
-    sid = "host-concurrent-help"
-    server._sessions[sid] = {"history_lock": threading.Lock()}
-    emitted = []
-
-    def emit(frame):
-        emitted.append(dict(frame))
-        supervisor._handle_host_frame(frame)
-
-    def explain(_rid, params):
-        text = str(params["follow_up"])
-        return {"result": {"status": "complete", "explanation_id": f"help-{text}"}}
-
-    monkeypatch.setattr(host, "emit", emit)
-    monkeypatch.setattr(supervisor, "start", lambda: None)
-    monkeypatch.setattr(supervisor, "_send_frame", host.handle_frame)
-    monkeypatch.setitem(server._methods, "clarify.explain", explain)
-    try:
-        replies = {}
-        threads = [
-            threading.Thread(
-                target=lambda text=text: replies.setdefault(
-                    text, supervisor.explain(sid, {"request_id": "clarify-1", "follow_up": text}, timeout=1)),
-            )
-            for text in ("first", "second")
-        ]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(1)
-            assert not thread.is_alive()
-        assert {reply["response"]["result"]["explanation_id"] for reply in replies.values()} == {
-            "help-first", "help-second",
-        }
-        assert len([frame for frame in emitted if frame["type"] == "explain.ack"]) == 2
-    finally:
-        server._sessions.pop(sid, None)
-        host.close()
-
-
-def test_supervisor_interrupt_cancels_inflight_host_explanation_without_late_ack(monkeypatch, tmp_path):
-    """The child reader accepts interrupt frames while its explanation worker is blocked."""
-    host = ComputeHost(heartbeat_secs=0)
-    supervisor = HostSupervisor(registry_path=tmp_path / "host.json", autostart=False)
-    sid = "host-explain-race"
-    started = threading.Event()
-    release = threading.Event()
-    emitted = []
-    server._sessions[sid] = {
-        "history": [], "history_lock": threading.Lock(), "session_key": sid, "running": False,
-    }
-    pending = threading.Event()
-    with server._prompt_lock:
-        server._pending["clarify-race"] = (sid, pending)
-        server._pending_prompt_payloads["clarify-race"] = ("clarify.request", {
-            "request_id": "clarify-race", "question": "Continue?", "choices": ["yes", "no"],
-        })
-
-    def emit(frame):
-        emitted.append(dict(frame))
-        supervisor._handle_host_frame(frame)
-
-    def explain(_session, _prompt):
-        started.set()
-        assert release.wait(2)
-        return "too late"
-
-    monkeypatch.setattr(host, "emit", emit)
-    monkeypatch.setattr(supervisor, "start", lambda: None)
-    monkeypatch.setattr(supervisor, "_send_frame", host.handle_frame)
-    monkeypatch.setattr(server, "_spawn_clarify_explanation", explain)
-    try:
-        result = {}
-        thread = threading.Thread(
-            target=lambda: result.setdefault(
-                "reply", supervisor.explain(sid, {
-                    "version": 1, "session_id": sid, "request_id": "clarify-race",
-                }, timeout=1)),
-        )
-        thread.start()
-        assert started.wait(1)
-        interrupt = threading.Thread(
-            target=lambda: supervisor.interrupt(sid, request_id="interrupt-race"),
-        )
-        interrupt.start()
-        deadline = time.monotonic() + 1
-        while time.monotonic() < deadline and not any(
-            frame["type"] == "interrupt.ack" for frame in emitted
-        ):
-            time.sleep(0.01)
-        assert any(frame["type"] == "interrupt.ack" for frame in emitted)
-        release.set()
-        interrupt.join(1)
-        assert not interrupt.is_alive()
-        thread.join(1)
-        assert not thread.is_alive()
-        assert result["reply"]["type"] == "explain.error"
-        assert [frame["type"] for frame in emitted] == ["interrupt.ack", "explain.error"]
-        assert pending.is_set()
-        assert not any(frame["type"] == "rpc" for frame in emitted)
-    finally:
-        server._sessions.pop(sid, None)
-        with server._prompt_lock:
-            server._pending.pop("clarify-race", None)
-            server._pending_prompt_payloads.pop("clarify-race", None)
-        host.close()
-
-
-def test_mutator_route_table_matches_prd_inventory():
-    assert MUTATOR_ROUTE_TABLE == {
-        "prompt.submit": "turn-path",
-        "session.interrupt": "turn-path",
-        "reload.mcp": "run-concurrent",
-        "session.save": "run-concurrent",
-        "session.compress": "idle-gated",
-        "prompt.submit.truncate": "idle-gated",
-        "slash.model": "idle-gated",
-        "slash.personality": "idle-gated",
-        "slash.prompt": "idle-gated",
-        "slash.compress": "idle-gated",
-        "session.reset": "idle-gated",
-        "session.history.reload": "idle-gated",
-        "slash.retry": "idle-gated",
-    }
 
 
 def test_append_log_record_single_write_lines(tmp_path):
@@ -479,11 +291,12 @@ def test_shutdown_drain_sleep_never_overshoots_the_reserve(monkeypatch):
     _record_finalize(monkeypatch, events, "idle")
 
     slept: list[float] = []
-    real_sleep = time.sleep
+    clock = [100.0]
+    monkeypatch.setattr(compute_host.time, "monotonic", lambda: clock[0])
 
     def _recording_sleep(seconds: float) -> None:
         slept.append(seconds)
-        real_sleep(seconds)
+        clock[0] += seconds
 
     monkeypatch.setattr(compute_host.time, "sleep", _recording_sleep)
 

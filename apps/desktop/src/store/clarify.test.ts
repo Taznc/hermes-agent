@@ -3,46 +3,34 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   $clarifyRequest,
   $clarifyRequests,
-  $settledClarifyHelp,
-  associateClarifyToolRequest,
   type ClarifyRequest,
-  clarifyStillBlocking,
   clearClarifyRequest,
   hasClarifyRequest,
   normalizeChoices,
   normalizeQuestions,
-  reconcileClarifyHelp,
-  sessionClarifyRequest,
   setClarifyRequest,
-  settledClarifyHelpForToolCall,
-  skipClarifyRequest,
-  updateClarifyHelp
+  skipClarifyRequest
 } from './clarify'
 import { $gateway } from './gateway'
+import { rememberServerRequest, resetServerRequestsForTests } from './server-requests'
 import { $activeSessionId } from './session'
 
 function clarify(sessionId: string | null, requestId: string): ClarifyRequest {
   return {
+    questions: [{ choices: null, multiSelect: false, qid: 'q0', question: `question-${requestId}` }],
     requestId,
-    question: `question-${requestId}`,
-    choices: null,
-    multiSelect: false,
-    sessionId,
-    receivedAt: 0,
-    timeoutSeconds: null
+    sessionId
   }
 }
 
 describe('clarify store', () => {
   beforeEach(() => {
     $clarifyRequests.set({})
-    $settledClarifyHelp.set({})
     $activeSessionId.set(null)
   })
 
   afterEach(() => {
     $clarifyRequests.set({})
-    $settledClarifyHelp.set({})
     $activeSessionId.set(null)
   })
 
@@ -95,85 +83,6 @@ describe('clarify store', () => {
     expect($clarifyRequests.get()['session-a']).toBeUndefined()
     expect($clarifyRequests.get()['session-b']?.requestId).toBe('other')
   })
-
-  it('reconciles an optimistic help entry with its event-first explanation id without leaving a loader', () => {
-    setClarifyRequest(clarify('session-a', 'req-a'))
-    updateClarifyHelp('req-a', 'session-a', 'local-1', {
-      choice: 'staging',
-      followUp: 'Why staging?',
-      status: 'loading'
-    })
-    // The gateway publishes this event before returning explanation_id to the RPC caller.
-    updateClarifyHelp('req-a', 'session-a', 'explain-1', {
-      choice: 'staging',
-      content: 'It limits blast radius.',
-      followUp: '',
-      status: 'complete'
-    })
-
-    reconcileClarifyHelp('req-a', 'session-a', 'local-1', 'explain-1')
-
-    expect($clarifyRequests.get()['session-a']?.help).toEqual({
-      'explain-1': expect.objectContaining({
-        choice: 'staging',
-        content: 'It limits blast radius.',
-        followUp: 'Why staging?',
-        status: 'complete'
-      })
-    })
-  })
-
-  it('keeps out-of-order repeated help responses correlated to their own follow-ups', () => {
-    setClarifyRequest(clarify('session-a', 'req-a'))
-    updateClarifyHelp('req-a', 'session-a', 'local-old', {
-      choice: 'staging',
-      followUp: 'old question',
-      status: 'loading'
-    })
-    updateClarifyHelp('req-a', 'session-a', 'local-new', {
-      choice: 'staging',
-      followUp: 'new question',
-      status: 'loading'
-    })
-    // A newer request completes first. Its content must not acquire the old request's metadata.
-    updateClarifyHelp('req-a', 'session-a', 'explain-new', {
-      choice: 'staging',
-      content: 'new answer',
-      followUp: '',
-      status: 'complete'
-    })
-    reconcileClarifyHelp('req-a', 'session-a', 'local-new', 'explain-new')
-    updateClarifyHelp('req-a', 'session-a', 'explain-old', {
-      choice: 'staging',
-      content: 'old answer',
-      followUp: '',
-      status: 'complete'
-    })
-    reconcileClarifyHelp('req-a', 'session-a', 'local-old', 'explain-old')
-
-    expect($clarifyRequests.get()['session-a']?.help).toEqual(
-      expect.objectContaining({
-        'explain-new': expect.objectContaining({ content: 'new answer', followUp: 'new question' }),
-        'explain-old': expect.objectContaining({ content: 'old answer', followUp: 'old question' })
-      })
-    )
-  })
-
-  it('retains help for the exact tool row after its pending request settles', () => {
-    setClarifyRequest(clarify('session-a', 'req-a'))
-    associateClarifyToolRequest('tool-a', 'req-a')
-    updateClarifyHelp('req-a', 'session-a', 'explain-a', {
-      content: 'Staging is safer for validation.',
-      followUp: '',
-      status: 'complete'
-    })
-
-    clearClarifyRequest('req-a', 'session-a')
-
-    expect(settledClarifyHelpForToolCall('tool-a')).toEqual({
-      'explain-a': expect.objectContaining({ content: 'Staging is safer for validation.' })
-    })
-  })
 })
 
 describe('skipClarifyRequest', () => {
@@ -181,6 +90,7 @@ describe('skipClarifyRequest', () => {
 
   beforeEach(() => {
     $clarifyRequests.set({})
+    resetServerRequestsForTests()
     request.mockClear()
     $gateway.set({ request } as unknown as ReturnType<typeof $gateway.get>)
   })
@@ -190,13 +100,16 @@ describe('skipClarifyRequest', () => {
     $gateway.set(null)
   })
 
-  it('answers the session\u2019s clarify with an empty answer and drops it', async () => {
+  it('cancels the session\u2019s clarify with an empty response and drops it', async () => {
+    const respond = vi.fn()
+
+    rememberServerRequest({ fail: vi.fn(), id: 'req-a', method: 'clarify', params: {}, respond })
     setClarifyRequest(clarify('session-a', 'req-a'))
     setClarifyRequest(clarify('session-b', 'req-b'))
 
     await expect(skipClarifyRequest('session-a')).resolves.toBe(true)
 
-    expect(request).toHaveBeenCalledWith('clarify.respond', { request_id: 'req-a', answer: '' })
+    expect(respond).toHaveBeenCalledWith({})
     expect(hasClarifyRequest('session-a')).toBe(false)
     // A background session's question is untouched — only the one being typed
     // over is skipped.
@@ -208,9 +121,8 @@ describe('skipClarifyRequest', () => {
     expect(request).not.toHaveBeenCalled()
   })
 
-  it('still reports the skip when the respond RPC fails', async () => {
+  it('still reports the skip when the server request is already gone (expired / other window answered)', async () => {
     setClarifyRequest(clarify('session-a', 'req-a'))
-    request.mockRejectedValueOnce(new Error('socket closed'))
 
     await expect(skipClarifyRequest('session-a')).resolves.toBe(true)
     expect(hasClarifyRequest('session-a')).toBe(false)
@@ -237,23 +149,20 @@ describe('normalizeChoices', () => {
     expect(normalizeChoices(['a', '', 'b', '   ', 'c'])).toEqual(['a', 'b', 'c'])
   })
 
-  it('drops strings with newlines', () => {
-    expect(normalizeChoices(['a', 'b\nc', 'd'])).toEqual(['a', 'd'])
+  it('keeps strings with newlines so option reasons can wrap', () => {
+    expect(normalizeChoices(['a', 'b\nc', 'd'])).toEqual(['a', 'b\nc', 'd'])
   })
 
-  it('drops strings over 200 chars', () => {
-    const long = 'x'.repeat(201)
-    const ok = 'y'.repeat(200)
-    expect(normalizeChoices(['a', long, ok])).toEqual(['a', ok])
+  it('keeps long strings and only drops them past the abuse cap', () => {
+    const long = 'x'.repeat(1500)
+    const atCap = 'y'.repeat(8000)
+    const over = 'z'.repeat(8001)
+    expect(normalizeChoices(['a', long, atCap, over])).toEqual(['a', long, atCap])
   })
 
-  it('drops empty items and keeps valid ones', () => {
-    expect(normalizeChoices(['valid', '  ', '', 'also valid'])).toEqual(['valid', 'also valid'])
-  })
-
-  it('returns empty array when nothing survives', () => {
-    expect(normalizeChoices(['', '  ', null, undefined])).toEqual([])
-    expect(normalizeChoices([])).toEqual([])
+  it('measures the cap on the bare text, discounting the (Recommended) label', () => {
+    const atCap = 'x'.repeat(8000) + ' (Recommended)'
+    expect(normalizeChoices([atCap])).toEqual([atCap])
   })
 })
 
@@ -301,46 +210,5 @@ describe('normalizeQuestions', () => {
 
     expect(result[0]?.multiSelect).toBe(true)
     expect(result[1]?.multiSelect).toBe(false)
-  })
-})
-
-describe('clarifyStillBlocking (#83319 guard)', () => {
-  const req = (receivedAt: number, timeoutSeconds: number | null): ClarifyRequest => ({
-    requestId: 'r1',
-    question: 'q',
-    choices: ['a'],
-    multiSelect: false,
-    sessionId: 's1',
-    receivedAt,
-    timeoutSeconds
-  })
-
-  it('false when there is no parked request', () => {
-    expect(clarifyStillBlocking(null)).toBe(false)
-  })
-
-  it('true while a finite server timeout has not elapsed', () => {
-    expect(clarifyStillBlocking(req(1_000, 600), 1_100)).toBe(true)
-  })
-
-  it('keeps a finite request through the server/renderer deadline boundary', () => {
-    expect(clarifyStillBlocking(req(1_000, 600), 1_601)).toBe(true)
-  })
-
-  it('returns false after the finite timeout safety margin (dialog is stale)', () => {
-    expect(clarifyStillBlocking(req(1_000, 600), 1_603)).toBe(false)
-  })
-
-  it('true forever when the server waits for a real answer (null timeout)', () => {
-    expect(clarifyStillBlocking(req(1_000, null), 4_600)).toBe(true)
-  })
-
-  it('stays conservative when an older payload has no timeout metadata', () => {
-    expect(clarifyStillBlocking({ ...req(1_000, null), timeoutSeconds: undefined }, 4_600)).toBe(true)
-  })
-
-  it('preserves an unanswered wait-forever dialog across turn-end clears', () => {
-    setClarifyRequest(req(1_000, null))
-    expect(clarifyStillBlocking(sessionClarifyRequest('s1').get())).toBe(true)
   })
 })

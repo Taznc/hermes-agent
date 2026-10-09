@@ -68,39 +68,12 @@ Rules:
   - Prefer parallelism. If two tasks can be done independently, give
     them no parents so the dispatcher fans them out at once.
   - Use 2-6 tasks for normal work. Don't create 20 tiny tasks. Don't
-    cram everything into 1 task. Scope each implementation child to one
-    coherent behavior or ownership boundary that a worker can usually finish
-    in 1-4 hours; do not split mechanical steps into separate cards.
+    cram everything into 1 task.
   - Pick assignees from the roster by matching the task to the profile's
     DESCRIPTION (not just the name). When nothing matches well, use null
     and the system will route to the default_assignee.
   - Each child task body is what a fresh worker will read with no other
-    context. It MUST follow this contract exactly — a body that breaks it is
-    rejected and you are asked to redo the whole answer:
-      1. AT MOST 5 acceptance criteria, numbered "AC1".."AC5", each ONE
-         observable, testable sentence. If the work needs more than 5, that is
-         the signal to SPLIT it into more children joined by real "parents"
-         edges — never exceed 5 in one child.
-      2. Any criterion using a quantifier ("every", "all", "any malformed")
-         must ENUMERATE the finite set inline, e.g. "every malformed input:
-         empty string, non-JSON, JSON without a `route` key, `route` not in
-         {default, mechanical}". An open-ended quantifier is what makes a
-         reviewer expand one new sub-case per round.
-      3. A "## Out of scope" section naming at least one explicit non-goal, so
-         the reviewer's scope-lock has something to lock against.
-      4. A named test obligation per criterion:
-         "Tests: <test file>::<test name or behavior>" — never "add
-         appropriate coverage".
-      5. Aim for 2,500 characters or fewer; 4,000 is the hard ceiling. A larger
-         review surface produces more findings and more rounds.
-    Also include: in-scope behavior, constraints/decisions, an "Edit-Targets:"
-    line, and the evidence expected in the handoff.
-  - Never give parallel children overlapping Edit-Targets. If two children
-    must modify the same file, merge them into one coherent child or add a real
-    parent dependency so the edits are serialized.
-  - If the original task already records an upstream/prior-art search result,
-    pass that result into relevant children. Do not ask every child to repeat
-    the same discovery search.
+    context — be specific about goal, approach, and acceptance criteria.
 
 When the task is genuinely a single unit of work (no useful decomposition),
 return:
@@ -133,89 +106,7 @@ Default assignee (used when no profile fits a task): {default_assignee}
 """
 
 
-_RETRY_TEMPLATE = """
-YOUR PREVIOUS ANSWER WAS REJECTED: {violation}
-
-Re-emit the whole JSON object with that fixed. Every child body must have at
-most {max_acs} numbered acceptance criteria (AC1..AC{max_acs}) and a
-"## Out of scope" section. If the work needs more criteria than that, split it
-into MORE children joined by real "parents" edges — do not exceed the cap.
-"""
-
-
 _FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```$", re.MULTILINE)
-
-# Child-body contract. A review round costs a full reviewer session plus a full
-# implementer session, and `kanban.max_review_rounds` is 2 — a card carrying an
-# open-ended review surface blocks instead of converging. Two of the five prompt
-# rules are mechanically checkable, so they are ENFORCED here rather than merely
-# asked for: an over-specified card is the single largest driver of extra rounds,
-# and an absent "Out of scope" section leaves the reviewer's scope-lock with
-# nothing to lock against. The other three (quantifier enumeration, per-AC test
-# names, body length) are judgment calls that only the prompt can carry.
-_MAX_ACS_PER_CHILD = 5
-_AC_LABEL_RE = re.compile(r"\bAC(\d+)\b")
-_OUT_OF_SCOPE_RE = re.compile(r"^#{1,6}\s*out[ -]of[ -]scope\b", re.IGNORECASE | re.MULTILINE)
-# CommonMark allows up to three leading spaces before a fence or block quote marker.
-_BODY_FENCE_LINE_RE = re.compile(r"^ {0,3}```")
-_BLOCKQUOTE_LINE_RE = re.compile(r"^ {0,3}>")
-
-
-def _unquoted_text(text: str) -> str:
-    """``text`` with fenced code blocks and ``>`` block quotes removed.
-
-    A child that QUOTES its parent's criteria as context must not be charged for
-    the labels it quoted — a declaration belongs to its author, not to whoever
-    reproduced it. Fence markers pair in document order, so a trailing unpaired
-    marker opens nothing and is read as ordinary text: a dangling fence must not
-    be able to hide the labels the child really declares.
-    """
-    lines = text.split("\n")
-    fences = [i for i, line in enumerate(lines) if _BODY_FENCE_LINE_RE.match(line)]
-    fenced: set[int] = set()
-    for opened, closed in zip(fences[::2], fences[1::2]):
-        fenced.update(range(opened, closed + 1))
-    return "\n".join(
-        line
-        for i, line in enumerate(lines)
-        if i not in fenced and not _BLOCKQUOTE_LINE_RE.match(line)
-    )
-
-
-def _child_body_violation(body: str) -> str:
-    """``""`` when ``body`` satisfies the child-body contract, else a one-line
-    reason naming the violation (fed back to the LLM verbatim on the retry)."""
-    text = body or ""
-    # Only the label count is quoting-aware. The "Out of scope" search stays on the
-    # raw body deliberately: tightening it would reject bodies nothing rejects today.
-    labels = set(_AC_LABEL_RE.findall(_unquoted_text(text)))
-    if len(labels) > _MAX_ACS_PER_CHILD:
-        return (
-            f"has {len(labels)} acceptance criteria (AC labels: "
-            f"{', '.join('AC' + n for n in sorted(labels, key=int))}); "
-            f"the cap is {_MAX_ACS_PER_CHILD} — split the work into more children instead"
-        )
-    if not _OUT_OF_SCOPE_RE.search(text):
-        return "is missing the mandatory '## Out of scope' section"
-    return ""
-
-
-def _contract_violation(parsed: dict) -> str:
-    """First child-body contract violation in a ``fanout=true`` reply, prefixed
-    with which child broke it; ``""`` when every child conforms."""
-    raw_tasks = parsed.get("tasks")
-    if not isinstance(raw_tasks, list):
-        return ""
-    for idx, entry in enumerate(raw_tasks):
-        if not isinstance(entry, dict):
-            continue
-        body = entry.get("body")
-        violation = _child_body_violation(body if isinstance(body, str) else "")
-        if violation:
-            title = entry.get("title")
-            label = title.strip() if isinstance(title, str) and title.strip() else "(untitled)"
-            return f"child {idx} {label!r} {violation}"
-    return ""
 
 
 @dataclass
@@ -235,27 +126,27 @@ def _profile_author() -> str:
     return _specify_author("decomposer")
 
 
-def _load_config() -> dict:
-    try:
-        from hermes_cli.config import load_config
-        return load_config() or {}
-    except Exception:
-        return {}
-
-
-def _resolve_profile_from_cfg(cfg: dict, key: str) -> str:
-    """``kanban.<key>`` if it names an existing profile, else the active
-    default profile — so a task is never stranded for lack of an owner.
+def _resolve_profile_from_cfg(cfg: dict, key: str, *, fallback: Optional[str] = None) -> str:
+    """``kanban.<key>`` if it names an existing profile, else ``fallback``
+    (the root task's own assignee) if that does, else the active default
+    profile — so a task is never stranded for lack of an owner.
     ``orchestrator_profile`` owns the root after fan-out; ``default_assignee``
-    catches children the decomposer can't route."""
+    catches children the decomposer can't route.
+
+    The root's assignee sits before the active profile because the decomposer
+    runs inside whatever profile hosts the dispatcher — an operator's
+    credential-less incognito profile, say — and that profile must never
+    silently become the owner of work the card was assigned away from (#114294).
+    """
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     explicit = (kanban_cfg.get(key) or "").strip()
-    if explicit:
-        try:
-            if profiles_mod.profile_exists(explicit):
-                return explicit
-        except Exception:
-            pass
+    for candidate in (explicit, (fallback or "").strip()):
+        if candidate:
+            try:
+                if profiles_mod.profile_exists(candidate):
+                    return candidate
+            except Exception:
+                pass
     try:
         return profiles_mod.get_active_profile_name() or "default"
     except Exception:
@@ -310,13 +201,17 @@ class _Routing:
     valid_names: set[str]
 
 
-def _load_routing() -> _Routing:
-    cfg = _load_config()
+def _load_routing(*, root_assignee: Optional[str] = None) -> _Routing:
+    from hermes_cli.config import load_config_readonly
+    try:
+        cfg = load_config_readonly()
+    except Exception:  # decompose_task promises ok=False, never a raise, on config trouble
+        cfg = {}
     kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
     roster, valid_names = _build_roster()
     return _Routing(
-        orchestrator=_resolve_profile_from_cfg(cfg, "orchestrator_profile"),
-        default_assignee=_resolve_profile_from_cfg(cfg, "default_assignee"),
+        orchestrator=_resolve_profile_from_cfg(cfg, "orchestrator_profile", fallback=root_assignee),
+        default_assignee=_resolve_profile_from_cfg(cfg, "default_assignee", fallback=root_assignee),
         auto_promote=bool(kanban_cfg.get("auto_promote_children", True)),
         roster=roster,
         valid_names=valid_names,
@@ -366,19 +261,13 @@ def _clean_children(task_id: str, raw_tasks: list, routing: _Routing) -> tuple[l
         parents = entry.get("parents") or []
         if not isinstance(parents, list):
             parents = []
-        child_entry = {
+        children.append({
             "title": title.strip()[:200],
             "body": body.strip() if isinstance(body, str) else "",
             "assignee": chosen,
             # Drop non-int, out-of-range and self parent indices.
             "parents": [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx],
-        }
-        # Optional per-child priority override; absent/non-int -> inherit the
-        # root's priority (handled downstream in decompose_triage_task).
-        priority = entry.get("priority")
-        if isinstance(priority, int) and not isinstance(priority, bool):
-            child_entry["priority"] = priority
-        children.append(child_entry)
+        })
     return children, ""
 
 
@@ -418,83 +307,37 @@ def decompose_task(
     timeout: Optional[int] = None,
 ) -> DecomposeOutcome:
     """Decompose a triage task into a graph of child tasks. Expected failures
-    (not in triage, no aux client, API error, malformed/empty reply, a child
-    body that breaks the contract twice) surface as ``ok=False``."""
+    (not in triage, no aux client, API error, malformed/empty reply) surface
+    as ``ok=False``."""
     task, reason = _load_triage_task(task_id)
     if task is None:
         return DecomposeOutcome(task_id, False, reason)
 
-    routing = _load_routing()
-    user = _USER_TEMPLATE.format(
-        **_task_prompt_fields(task),
-        roster=_format_roster(routing.roster),
-        default_assignee=routing.default_assignee,
+    routing = _load_routing(root_assignee=task.assignee)
+    raw, reason = _call_aux(
+        "decompose", task_id, aux_task="kanban_decomposer", system=_SYSTEM_PROMPT,
+        user=_USER_TEMPLATE.format(
+            **_task_prompt_fields(task),
+            roster=_format_roster(routing.roster),
+            default_assignee=routing.default_assignee,
+        ),
+        max_tokens=4000, timeout=timeout or 180, log=logger,
     )
+    if raw is None:
+        return DecomposeOutcome(task_id, False, reason)
+
+    parsed = _extract_json_blob(raw, _FENCE_RE)
+    if parsed is None:
+        return DecomposeOutcome(task_id, False, "LLM returned malformed JSON")
+
     audit_author = author or _profile_author()
-
-    # One retry, then stop. A non-conforming card is worse than no card: it is
-    # dispatched to a worker and burns two review rounds before anyone notices,
-    # so a failed contract check must never fall through to a silent create.
-    violation = ""
-    for attempt in (1, 2):
-        raw, reason = _call_aux(
-            "decompose", task_id, aux_task="kanban_decomposer", system=_SYSTEM_PROMPT,
-            user=user if attempt == 1 else user + _RETRY_TEMPLATE.format(
-                violation=violation, max_acs=_MAX_ACS_PER_CHILD,
-            ),
-            max_tokens=4000, timeout=timeout or 180, log=logger,
-        )
-        if raw is None:
-            return DecomposeOutcome(task_id, False, reason)
-
-        parsed = _extract_json_blob(raw, _FENCE_RE)
-        if parsed is None:
-            return DecomposeOutcome(task_id, False, "LLM returned malformed JSON")
-
-        if not parsed.get("fanout"):
-            return _apply_single(task, parsed, routing, audit_author)
-
-        violation = _contract_violation(parsed)
-        if not violation:
-            return _apply_fanout(task_id, parsed, routing, audit_author)
-        logger.info(
-            "decompose: task %s attempt %d violated the child body contract: %s",
-            task_id, attempt, violation,
-        )
-
-    return DecomposeOutcome(
-        task_id, False, f"child body contract violated after one retry: {violation}",
-    )
+    if not parsed.get("fanout"):
+        return _apply_single(task, parsed, routing, audit_author)
+    return _apply_fanout(task_id, parsed, routing, audit_author)
 
 
 def list_triage_ids(*, tenant: Optional[str] = None) -> list[str]:
-    """Return task ids currently in the triage column.
-
-    Tasks parked in triage by the unblock-loop breaker for a genuine human-decision gate
-    (``block_recurrences >= BLOCK_RECURRENCE_LIMIT`` AND ``block_kind == "needs_input"``) are
-    EXCLUDED: ``block_task`` routes a task that re-blocked for the same cause
-    ``BLOCK_RECURRENCE_LIMIT`` times to ``triage`` for a human. Triage is also the auto-decompose
-    sweep's input queue, so re-decomposing such a task promotes it straight back to ``ready`` →
-    claimed → blocked on the same cause → triage again, every tick (seen at ``recurrences: 18``
-    against a limit of 2). A ``needs_input`` cause is "a human has not made a decision yet",
-    which no amount of re-decomposition resolves, so the automation must not re-arm that loop —
-    these stay in triage until a human resolves them.
-
-    A loop-broken task whose last block kind was ``capability``/``transient``/legacy-``None`` is
-    NOT excluded: those can be genuine scope/fanout problems (the class decomposition is meant to
-    fix), so they remain visible to this sweep."""
+    """Return task ids currently in the triage column."""
     with kbc.connect_closing() as conn:
         rows = kb.list_tasks(conn, status="triage", tenant=tenant, limit=1000)
-    return [
-        row.id for row in rows
-        if not ((row.block_recurrences or 0) >= kb.BLOCK_RECURRENCE_LIMIT and row.block_kind == "needs_input")
-    ]
-
-
-# ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
-# Names external plugins imported from this module before the Sep 2026 decomposition.
-# Internal code MUST NOT use these (scripts/check_compat_pointers.py fails CI if it does).
-# The whole block is removed by reverting the commit that added it.
-import json  # noqa: F401,E402
-import os  # noqa: F401,E402
-# ---- END PLUGIN-COMPAT ----
+    return [row.id for row in rows]

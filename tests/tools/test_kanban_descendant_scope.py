@@ -28,13 +28,6 @@ def _worker_board(tmp_path, monkeypatch):
         "HERMES_KANBAN_CLAIM_LOCK": task.claim_lock, "HOME": str(tmp_path),
     }.items():
         monkeypatch.setenv(key, value)
-    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
-    monkeypatch.delenv("HERMES_KANBAN_PIN_HOME", raising=False)
-    # Point the kanban HOME at the same tmp dir the board lives in, so the DB pin
-    # resolves UNDER it and the fork's stale-pin guard (kanban_db._pin_is_honored)
-    # honors it on the containment arm. Setting HERMES_KANBAN_PIN_HOME instead
-    # would exercise the intent-stamp escape hatch, which scrub_kanban_env
-    # deliberately strips from descendants — the opposite of what this asserts.
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
     return conn, own, foreign
 
@@ -81,7 +74,7 @@ def test_terminal_descendants_cannot_mutate_even_after_task_is_removed(tmp_path,
         outputs.append(proc.stdout)
     for output in outputs:
         row = json.loads(next(line.split("SCOPE_RESULT=", 1)[1] for line in output.splitlines() if "SCOPE_RESULT=" in line))
-        assert row["show"]["packet"]["identity"]["task_id"] == own, row
+        assert row["show"]["task"]["id"] == own, row
         assert not row["owner"] and row["default"] is None, row
         assert row["db"] == str(tmp_path / "assigned.db") and row["board"] == "default"
         assert all("error" in value for value in row["tools"]), row
@@ -114,3 +107,52 @@ def test_worker_cli_cannot_use_foreign_task_to_drop_run_scope(tmp_path, monkeypa
     assert not kb.list_attachments(conn, foreign)
     assert json.loads(kanban_tools._handle_complete({"task_id": own, "summary": "parent"}))["ok"]
     conn.close()
+
+
+def test_child_shell_can_write_a_kanban_board_outside_its_lineage_root(tmp_path, monkeypatch):
+    """The fence a delegate_task child inherits applies to ITS lineage's board, not to every Kanban
+    DB its shell touches: a repro run against a scratch HERMES_HOME got a silently read-only board
+    (``connect`` opened ``?mode=ro``; ``write_txn`` raised PermissionError). Real ``terminal``
+    ingress, real subprocess, real SQLite — the lineage board stays fenced in the same shell."""
+    from agent.delegation_context import delegated_child_context
+
+    lineage_home = tmp_path / "lineage"
+    scratch_home = tmp_path / "scratch"
+    for home in (lineage_home, scratch_home):
+        home.mkdir()
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(lineage_home))
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    for key in ("HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_TASK", "HERMES_KANBAN_HOME"):
+        monkeypatch.delenv(key, raising=False)
+    connect(kb.kanban_db_path()).close()  # the owner initializes the lineage board
+    script = tmp_path / "repro.py"
+    script.write_text(
+        "import os, sys, json\n"
+        f"sys.path.insert(0, {str(ROOT)!r})\n"
+        "from hermes_cli import kanban_db as kb\n"
+        "from hermes_cli.kanban_db_connect import connect\n"
+        "out = {'marker': os.environ.get('HERMES_DELEGATED_CHILD_CONTEXT')}\n"
+        "try:\n"
+        "    conn = connect(kb.kanban_db_path()); kb.create_task(conn, title='lineage'); out['lineage'] = 'WROTE'\n"
+        "except PermissionError as exc:\n"
+        "    out['lineage'] = 'fenced: ' + str(exc)\n"
+        f"os.environ['HERMES_HOME'] = {str(scratch_home)!r}\n"
+        "import hermes_constants; hermes_constants._default_hermes_root_memo = None\n"
+        "conn = connect(kb.kanban_db_path()); out['scratch'] = kb.create_task(conn, title='scratch')\n"
+        "print('SCOPE_RESULT=' + json.dumps(out))\n"
+    )
+    with delegated_child_context("child-repro"):
+        terminal = LocalEnvironment(cwd=str(tmp_path))
+        try:
+            result = terminal.execute(f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}")
+        finally:
+            terminal.cleanup()
+    output = result.get("output", "")
+    row = json.loads(next(line.split("SCOPE_RESULT=", 1)[1] for line in output.splitlines() if "SCOPE_RESULT=" in line))
+    assert row["marker"] and row["marker"] != "1", row
+    assert row["lineage"].startswith("fenced"), row
+    assert row["scratch"], row
+    scratch_conn = connect(scratch_home / "kanban.db")
+    assert kb.get_task(scratch_conn, row["scratch"]).title == "scratch"
+    scratch_conn.close()

@@ -4,7 +4,7 @@ import { type FC, useState } from 'react'
 import { Button } from '@/components/ui/button'
 import { Popover, PopoverAnchor, PopoverContent } from '@/components/ui/popover'
 import { triggerHaptic } from '@/lib/haptics'
-import { Plus } from '@/lib/icons'
+import { Copy, Plus } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 import { QUICK_REACTIONS } from '@/store/reactions'
 import type { MessageReaction } from '@/types/hermes'
@@ -92,11 +92,15 @@ const FullEmojiPicker: FC<{ onSelect: (emoji: string) => void }> = ({ onSelect }
 export const ReactionPicker: FC<{
   align?: 'end' | 'start'
   children: React.ReactNode
+  /** When set, the quick row ends with a copy action. A surface whose
+   *  right-click opens this picker instead of the app menu passes it, so
+   *  "Copy message" stays one right-click away there too. */
+  copyAction?: { label: string; onCopy: () => void }
   onOpenChange: (open: boolean) => void
   onSelect: (emoji: string) => void
   open: boolean
   selected?: string
-}> = ({ align = 'end', children, onOpenChange, onSelect, open, selected }) => {
+}> = ({ align = 'end', children, copyAction, onOpenChange, onSelect, open, selected }) => {
   const [expanded, setExpanded] = useState(false)
 
   return (
@@ -144,6 +148,20 @@ export const ReactionPicker: FC<{
             <Button aria-label="More emoji" onClick={() => setExpanded(true)} size="icon-sm" variant="ghost">
               <Plus />
             </Button>
+            {copyAction && (
+              <Button
+                aria-label={copyAction.label}
+                onClick={() => {
+                  triggerHaptic('selection')
+                  copyAction.onCopy()
+                }}
+                size="icon-sm"
+                title={copyAction.label}
+                variant="ghost"
+              >
+                <Copy />
+              </Button>
+            )}
           </>
         )}
       </PopoverContent>

@@ -2,15 +2,8 @@
 
 from __future__ import annotations
 
-from types import SimpleNamespace
-
 import pytest
 
-from agent.delegation_context import (
-    DELEGATED_CHILD_ENV_MARKER,
-    delegated_child_context,
-    non_dispatcher_owned_context,
-)
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
@@ -18,72 +11,11 @@ from agent.kanban_stop import (
 )
 
 
-_TERMINAL_VERBS = (
-    "kanban_complete",
-    "kanban_block",
-    "kanban_request_review",
-    "kanban_request_changes",
-)
-
-
 @pytest.fixture
 def clear_kanban_env(monkeypatch):
-    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE", DELEGATED_CHILD_ENV_MARKER):
+    for var in ("HERMES_KANBAN_TASK", "HERMES_KANBAN_STOP_NUDGE"):
         monkeypatch.delenv(var, raising=False)
     return monkeypatch
-
-
-# ── Ownership: HERMES_KANBAN_TASK is inherited, not proof of ownership ──────
-# A delegate_task child, a subprocess it spawns, and an in-process cron job all
-# see the dispatcher worker's task id while owning no board run. For them a
-# plain-text answer IS the terminal state; nudging one makes it chase board
-# tools the mutation guard (correctly) refuses and rewrite its finished work
-# into an apology.
-
-
-def test_no_nudge_in_delegated_child_context(clear_kanban_env):
-    """The in-process delegate_task child (ContextVar) is not a board worker."""
-    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_x")
-    assert kanban_stop_nudge_enabled() is True  # the worker itself still gets it
-
-    with delegated_child_context("child-session"):
-        assert kanban_stop_nudge_enabled() is False
-        assert build_kanban_stop_nudge(messages=[], attempts=0) is None
-
-    # Ownership is restored when the child context exits.
-    assert kanban_stop_nudge_enabled() is True
-
-
-def test_no_nudge_in_delegated_child_subprocess(clear_kanban_env):
-    """Lineage crosses fork via the env marker, so a child's subprocess is covered too."""
-    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_x")
-    clear_kanban_env.setenv(DELEGATED_CHILD_ENV_MARKER, "1")
-    assert kanban_stop_nudge_enabled() is False
-    assert build_kanban_stop_nudge(messages=[], attempts=0) is None
-
-
-def test_no_nudge_for_in_process_cron_job(clear_kanban_env):
-    """A cron job fired inside a worker inherits the env but owns no run."""
-    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_x")
-    with non_dispatcher_owned_context():
-        assert kanban_stop_nudge_enabled() is False
-        assert build_kanban_stop_nudge(messages=[], attempts=0) is None
-
-
-def test_ownership_probe_fails_open(clear_kanban_env):
-    """A raising delegation-context probe must not silently disarm the guard for real workers."""
-    import agent.delegation_context as delegation_context
-    from agent.kanban_stop import _is_dispatcher_owned_worker
-
-    def _boom():
-        raise RuntimeError("delegation context unavailable")
-
-    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_x")
-    clear_kanban_env.setattr(delegation_context, "is_dispatcher_owned_worker_context", _boom)
-    assert _is_dispatcher_owned_worker() is True
-    assert kanban_stop_nudge_enabled() is True
-
-
 
 
 def test_env_can_disable(clear_kanban_env):
@@ -91,6 +23,30 @@ def test_env_can_disable(clear_kanban_env):
     clear_kanban_env.setenv("HERMES_KANBAN_STOP_NUDGE", "0")
     assert kanban_stop_nudge_enabled() is False
     assert build_kanban_stop_nudge(messages=[]) is None
+
+
+def test_nudge_disabled_inside_delegated_child(clear_kanban_env):
+    from agent.delegation_context import delegated_child_context
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_parent")
+
+    assert kanban_stop_nudge_enabled() is True
+    with delegated_child_context():
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[]) is None
+    assert kanban_stop_nudge_enabled() is True
+
+
+def test_nudge_disabled_inside_non_dispatcher_context(clear_kanban_env):
+    from agent.delegation_context import non_dispatcher_owned_context
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_parent")
+
+    assert kanban_stop_nudge_enabled() is True
+    with non_dispatcher_owned_context():
+        assert kanban_stop_nudge_enabled() is False
+        assert build_kanban_stop_nudge(messages=[]) is None
+    assert kanban_stop_nudge_enabled() is True
 
 
 def test_nudge_when_no_terminal_tool(clear_kanban_env):
@@ -115,7 +71,6 @@ def test_nudge_when_no_terminal_tool(clear_kanban_env):
     assert "kanban_complete" in nudge
     assert "kanban_block" in nudge
     assert "t_46be8aa5" in nudge
-    assert "protocol violation" in nudge.lower() or "protocol" in nudge.lower()
 
 
 def test_no_nudge_after_kanban_complete(clear_kanban_env):
@@ -138,84 +93,70 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
-@pytest.mark.parametrize("verb", _TERMINAL_VERBS)
-def test_terminal_true_for_assistant_tool_calls_dict_shape(verb):
-    """Each of the four board-terminal verbs suppresses the guard (dict tool-call shape)."""
-    messages = [
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {"id": "1", "type": "function", "function": {"name": verb, "arguments": "{}"}}
-            ],
-        },
-    ]
-    assert session_called_kanban_terminal(messages) is True
-
-
-@pytest.mark.parametrize("verb", _TERMINAL_VERBS)
-def test_terminal_true_for_assistant_tool_calls_object_shape(verb):
-    """Each of the four board-terminal verbs suppresses the guard (object tool-call shape)."""
-    tool_call = SimpleNamespace(function=SimpleNamespace(name=verb))
-    messages = [
-        {"role": "assistant", "content": "", "tool_calls": [tool_call]},
-    ]
-    assert session_called_kanban_terminal(messages) is True
-
-
-@pytest.mark.parametrize("verb", _TERMINAL_VERBS)
-def test_terminal_true_for_tool_role_message(verb):
-    """A ``role: tool`` message named with each verb also suppresses the guard."""
-    messages = [
-        {"role": "tool", "name": verb, "tool_call_id": "1", "content": "ok"},
-    ]
-    assert session_called_kanban_terminal(messages) is True
-
-
-def test_terminal_false_for_non_terminal_verb():
-    """A worker that only commented (not a board-terminal action) still gets nudged."""
-    messages = [
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {"id": "1", "type": "function", "function": {"name": "kanban_comment", "arguments": "{}"}}
-            ],
-        },
-        {"role": "tool", "name": "kanban_comment", "tool_call_id": "1", "content": "noted"},
-    ]
-    assert session_called_kanban_terminal(messages) is False
-
-
-@pytest.mark.parametrize("verb", ["kanban_request_review", "kanban_request_changes"])
-def test_no_nudge_after_review_lane_handoff(clear_kanban_env, verb):
-    """build_kanban_stop_nudge returns None after a correct review-lane handoff."""
-    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
-    messages = [
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [
-                {"id": "1", "type": "function", "function": {"name": verb, "arguments": "{}"}}
-            ],
-        },
-        {"role": "tool", "name": verb, "tool_call_id": "1", "content": "ok"},
-    ]
-    assert build_kanban_stop_nudge(messages=messages) is None
-
-
-
-
-
-
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────
 # These tests verify the two layers compose correctly: the agent-side
 # nudge fires first (up to 2 attempts), and if the worker still exits
-# without a terminal call, the worker/CLI boundary parks it immediately: one
-# no-evidence recovery is allowed, while handoff evidence or the next clean
-# exit is blocked. See tests/hermes_cli/test_kanban_core_functionality.py for
-# the boundary and dispatcher-side streak tests.
+# without a terminal call, the dispatcher's bounded retry (streak of 3)
+# handles it.  See also tests/hermes_cli/test_kanban_core_functionality.py
+# for the dispatcher-side streak tests.
 
 
+@pytest.mark.parametrize(
+    "tool_name,who",
+    [
+        ("kanban_request_review", "build worker handing off for same-card review"),
+        ("kanban_request_changes", "review agent sending the card back"),
+        ("kanban_schedule", "worker parking the card on a timed wait"),
+    ],
+)
+def test_no_nudge_after_handoff_tool(clear_kanban_env, tool_name, who):
+    """Handoff tools end the worker's turn just like complete/block.
+
+    Both move the card out of ``running``, and the worker is told to call
+    them — goals.py's continuation/finalize prompts name
+    ``kanban_request_review``; the force-loaded sdlc-review skill names
+    ``kanban_request_changes``. Nudging afterwards asks a worker that did
+    the right thing to close a card it must not close.
+    """
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_handoff")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": tool_name, "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "name": tool_name, "tool_call_id": "1", "content": "ok"},
+    ]
+    assert session_called_kanban_terminal(messages) is True, who
+    assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_nudge_still_fires_for_non_terminal_kanban_tool(clear_kanban_env):
+    """Widening the set must not swallow the case the guard exists for."""
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_abc")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "Let me open the review next.",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "kanban_comment", "arguments": "{}"},
+                }
+            ],
+        },
+        {"role": "tool", "name": "kanban_comment", "tool_call_id": "1", "content": "ok"},
+    ]
+    assert session_called_kanban_terminal(messages) is False
+    nudge = build_kanban_stop_nudge(messages=messages)
+    assert nudge is not None
+    # The nudge offers every worker exit, not just close-out; a card that must go
+    # through review must never be steered to ``kanban_complete`` alone.
+    assert "kanban_request_review" in nudge and "kanban_block" in nudge

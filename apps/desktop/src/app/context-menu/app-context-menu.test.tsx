@@ -3,11 +3,11 @@ import { MemoryRouter } from 'react-router'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import { registerTerminalContextMenu } from '@/app/right-sidebar/terminal/terminal-context-menu'
+import { DirectiveContent } from '@/components/assistant-ui/directive-text'
 import { ContextMenu, ContextMenuTrigger, HERMES_CONTEXT_MENU_TRIGGER_ATTR } from '@/components/ui/context-menu'
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog'
-import { formatCombo } from '@/lib/keybinds/combo'
 import { $previewTabs, closeRightRail } from '@/store/preview'
-import { $connection, __setKnownHomeDirForTest } from '@/store/session'
+import { $connection } from '@/store/session'
 
 import { AppContextMenu } from './app-context-menu'
 import {
@@ -24,7 +24,6 @@ const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDeskt
 function installBridge(partial: Partial<Window['hermesDesktop']> = {}) {
   desktopWindow.hermesDesktop = {
     openExternal: vi.fn().mockResolvedValue(undefined),
-    revealPath: vi.fn().mockResolvedValue(true),
     writeClipboard: vi.fn().mockResolvedValue(undefined),
     ...partial
   } as unknown as Window['hermesDesktop']
@@ -55,7 +54,6 @@ afterEach(() => {
   vi.restoreAllMocks()
   document.body.innerHTML = ''
   delete desktopWindow.hermesDesktop
-  __setKnownHomeDirForTest('')
 })
 
 describe('resolveDomTarget', () => {
@@ -112,20 +110,18 @@ describe('resolveDomTarget', () => {
     // Text that is not a chat message offers no Copy message.
     expect(outside.messageText).toBe('')
   })
+
+  it('prefers the text a message root stamps over its rendered chrome', () => {
+    const host = attach(
+      '<div data-slot="aui_user-message-root" data-message-copy-text="  just the prompt  ">' +
+        '<span>just the prompt</span><span>🎉</span><time>9:41 AM</time></div>'
+    )
+
+    expect(resolveDomTarget(host.querySelector('span')).messageText).toBe('just the prompt')
+  })
 })
 
 describe('AppContextMenu', () => {
-  it('does not expose an upstream-update action from bare shell right-clicks', async () => {
-    installBridge()
-    mountMenu()
-    const host = attach('<div>empty shell</div>')
-
-    fireEvent.contextMenu(host)
-
-    expect(await screen.findByText('Settings')).toBeTruthy()
-    expect(screen.queryByText('Update Hermes')).toBeNull()
-  })
-
   it('opens the link menu on a chat link right-click', async () => {
     installBridge()
     mountMenu()
@@ -137,6 +133,23 @@ describe('AppContextMenu', () => {
     expect(screen.getByText('Open in external browser')).toBeTruthy()
     expect(screen.getByText('Copy URL')).toBeTruthy()
     expect(screen.queryByText('Copy resolved URL')).toBeNull()
+  })
+
+  // The url chip used to be a `<button>`: `resolveDomTarget` only knows
+  // `a[href]`, so the right-click fell through to the shell fallback menu.
+  it('offers the link verbs on a message url chip right-click', async () => {
+    installBridge()
+    mountMenu()
+    // The coordinator binds to window in the capture phase, so a second
+    // render alongside the menu is fine — same as a real transcript.
+    render(<DirectiveContent text="@url:`https://example.com/pr/1`" />)
+    const chip = document.querySelector('[data-slot="aui_directive-chip"]')!
+
+    fireEvent.contextMenu(chip)
+
+    expect(await screen.findByText('Open in in-app browser')).toBeTruthy()
+    expect(screen.getByText('Open in external browser')).toBeTruthy()
+    expect(screen.getByText('Copy URL')).toBeTruthy()
   })
 
   it('opens the in-app browser from the link menu', async () => {
@@ -190,186 +203,6 @@ describe('AppContextMenu', () => {
     await waitFor(() => expect(writeClipboard).toHaveBeenCalledWith('http://127.0.0.1:45173/'))
   })
 
-  // A bare path made clickable in chat (InlinePathLink) carries the raw path
-  // as its href. It names a file on the agent's machine, so the menu offers
-  // file verbs — preview, default app, reveal, copy path — not browser ones.
-  it('opens the file menu on a chat path link right-click', async () => {
-    installBridge()
-    mountMenu()
-    const host = attach('<a href="/Users/me/report.md">/Users/me/report.md</a>')
-
-    fireEvent.contextMenu(host.querySelector('a')!)
-
-    expect(await screen.findByText('Open in preview')).toBeTruthy()
-    expect(screen.getByText('Open with default app')).toBeTruthy()
-    expect(screen.getByText(/Reveal in Finder|Reveal in File Explorer|Open containing folder/)).toBeTruthy()
-    expect(screen.getByText('Copy path')).toBeTruthy()
-    expect(screen.queryByText('Open in in-app browser')).toBeNull()
-    expect(screen.queryByText('Copy URL')).toBeNull()
-  })
-
-  it('opens the preview pane from the file menu', async () => {
-    installBridge()
-    mountMenu()
-    const host = attach('<a href="/tmp/report.md">/tmp/report.md</a>')
-
-    fireEvent.contextMenu(host.querySelector('a')!)
-    fireEvent.click(await screen.findByText('Open in preview'))
-
-    await waitFor(() => {
-      const target = $previewTabs.get().at(-1)?.target
-
-      expect(target?.kind === 'file' && target.path).toBe('/tmp/report.md')
-    })
-  })
-
-  it('hands the file to the OS as a file:// URL and reveals the raw path', async () => {
-    const openExternal = vi.fn().mockResolvedValue(undefined)
-    const revealPath = vi.fn().mockResolvedValue(true)
-
-    installBridge({
-      openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'],
-      revealPath: revealPath as unknown as Window['hermesDesktop']['revealPath']
-    })
-    mountMenu()
-    const host = attach('<a href="/tmp/my report.md">/tmp/my report.md</a>')
-
-    fireEvent.contextMenu(host.querySelector('a')!)
-    fireEvent.click(await screen.findByText('Open with default app'))
-    await waitFor(() => expect(openExternal).toHaveBeenCalledWith('file:///tmp/my%20report.md'))
-
-    fireEvent.contextMenu(host.querySelector('a')!)
-    fireEvent.click(await screen.findByText(/Reveal in Finder|Reveal in File Explorer|Open containing folder/))
-    await waitFor(() => expect(revealPath).toHaveBeenCalledWith('/tmp/my report.md'))
-  })
-
-  it('copies the raw path from the file menu', async () => {
-    const writeClipboard = vi.fn().mockResolvedValue(undefined)
-
-    installBridge({ writeClipboard: writeClipboard as unknown as Window['hermesDesktop']['writeClipboard'] })
-    mountMenu()
-    const host = attach('<a href="~/todo.md">~/todo.md</a>')
-
-    fireEvent.contextMenu(host.querySelector('a')!)
-    fireEvent.click(await screen.findByText('Copy path'))
-
-    await waitFor(() => expect(writeClipboard).toHaveBeenCalledWith('~/todo.md'))
-  })
-
-  // Regression for #103951's round-2 follow-up: `~` must be expanded to a
-  // real path renderer-side BEFORE a `file:` URL is built for Open with
-  // default app, and Reveal must receive the same expanded path — not the
-  // literal `~/…` shell shorthand `shell.showItemInFolder` cannot expand.
-  it('expands ~/ to a usable path for both Open with default app and Reveal', async () => {
-    const openExternal = vi.fn().mockResolvedValue(undefined)
-    const revealPath = vi.fn().mockResolvedValue(true)
-
-    __setKnownHomeDirForTest('/home/rae')
-    installBridge({
-      openExternal: openExternal as unknown as Window['hermesDesktop']['openExternal'],
-      revealPath: revealPath as unknown as Window['hermesDesktop']['revealPath']
-    })
-    mountMenu()
-    const host = attach('<a href="~/todo.md">~/todo.md</a>')
-
-    fireEvent.contextMenu(host.querySelector('a')!)
-    fireEvent.click(await screen.findByText('Open with default app'))
-    await waitFor(() => expect(openExternal).toHaveBeenCalledWith('file:///home/rae/todo.md'))
-
-    fireEvent.contextMenu(host.querySelector('a')!)
-    fireEvent.click(await screen.findByText(/Reveal in Finder|Reveal in File Explorer|Open containing folder/))
-    await waitFor(() => expect(revealPath).toHaveBeenCalledWith('/home/rae/todo.md'))
-  })
-
-  // Regression for #103951's round-2 follow-up: a `file://` href must be
-  // percent-DECODED, not string-stripped, so Reveal and Copy path receive a
-  // real filesystem path for names with spaces/non-ASCII characters.
-  it('decodes a percent-encoded file:// href for Reveal and Copy path', async () => {
-    const revealPath = vi.fn().mockResolvedValue(true)
-    const writeClipboard = vi.fn().mockResolvedValue(undefined)
-
-    installBridge({
-      revealPath: revealPath as unknown as Window['hermesDesktop']['revealPath'],
-      writeClipboard: writeClipboard as unknown as Window['hermesDesktop']['writeClipboard']
-    })
-    mountMenu()
-    const host = attach(
-      '<a href="file:///tmp/my%20report.md">file:///tmp/my%20report.md</a>'
-    )
-
-    fireEvent.contextMenu(host.querySelector('a')!)
-    fireEvent.click(await screen.findByText(/Reveal in Finder|Reveal in File Explorer|Open containing folder/))
-    await waitFor(() => expect(revealPath).toHaveBeenCalledWith('/tmp/my report.md'))
-
-    fireEvent.contextMenu(host.querySelector('a')!)
-    fireEvent.click(await screen.findByText('Copy path'))
-    await waitFor(() => expect(writeClipboard).toHaveBeenCalledWith('/tmp/my report.md'))
-  })
-
-  // Reviewer round-2 defect 1: on a remote gateway, `~` must NOT be expanded
-  // with the LOCAL Electron host's home dir — that names a different
-  // machine's filesystem. Copy path is the only file verb remote mode
-  // offers, and it must stay portable: copy the literal `~/…` back.
-  it('does not expand ~ with the local home dir on a remote gateway', async () => {
-    const writeClipboard = vi.fn().mockResolvedValue(undefined)
-
-    $connection.set({ mode: 'remote' } as never)
-    __setKnownHomeDirForTest('/home/localuser')
-    installBridge({ writeClipboard: writeClipboard as unknown as Window['hermesDesktop']['writeClipboard'] })
-    mountMenu()
-    const host = attach('<a href="~/todo.md">~/todo.md</a>')
-
-    fireEvent.contextMenu(host.querySelector('a')!)
-    fireEvent.click(await screen.findByText('Copy path'))
-
-    await waitFor(() => expect(writeClipboard).toHaveBeenCalledWith('~/todo.md'))
-  })
-
-  // Reviewer round-2 defect 2: `file://~/todo.md` (a shape both linkify
-  // regexes match) must not resolve via `new URL(raw).pathname`, which
-  // discards the `~` host and yields a truncated, WRONG path (`/todo.md`).
-  // It must route through the tilde-expansion branch instead.
-  it('expands a file://~/… href to the home path, not a truncated one', async () => {
-    const revealPath = vi.fn().mockResolvedValue(true)
-
-    __setKnownHomeDirForTest('/home/rae')
-    installBridge({ revealPath: revealPath as unknown as Window['hermesDesktop']['revealPath'] })
-    mountMenu()
-    const host = attach('<a href="file://~/todo.md">file://~/todo.md</a>')
-
-    fireEvent.contextMenu(host.querySelector('a')!)
-    fireEvent.click(await screen.findByText(/Reveal in Finder|Reveal in File Explorer|Open containing folder/))
-
-    await waitFor(() => expect(revealPath).toHaveBeenCalledWith('/home/rae/todo.md'))
-  })
-
-  it('hides the local-only file verbs on a remote gateway', async () => {
-    $connection.set({ mode: 'remote' } as never)
-    installBridge()
-    mountMenu()
-    const host = attach('<a href="/srv/data/notes.txt">/srv/data/notes.txt</a>')
-
-    fireEvent.contextMenu(host.querySelector('a')!)
-
-    expect(await screen.findByText('Open in preview')).toBeTruthy()
-    expect(screen.getByText('Copy path')).toBeTruthy()
-    expect(screen.queryByText('Open with default app')).toBeNull()
-    expect(screen.queryByText(/Reveal in Finder|Reveal in File Explorer|Open containing folder/)).toBeNull()
-  })
-
-  it('hides native-only file verbs when the web bridge has no file-manager capability', async () => {
-    installBridge({ revealPath: undefined })
-    mountMenu()
-    const host = attach('<a href="/srv/data/notes.txt">/srv/data/notes.txt</a>')
-
-    fireEvent.contextMenu(host.querySelector('a')!)
-
-    expect(await screen.findByText('Open in preview')).toBeTruthy()
-    expect(screen.getByText('Copy path')).toBeTruthy()
-    expect(screen.queryByText('Open with default app')).toBeNull()
-    expect(screen.queryByText(/Reveal in Finder|Reveal in File Explorer|Open containing folder/)).toBeNull()
-  })
-
   it('opens the image menu with copy, address, and save', async () => {
     installBridge()
     mountMenu()
@@ -398,26 +231,6 @@ describe('AppContextMenu', () => {
 
     expect(await screen.findByText('Add to dictionary')).toBeTruthy()
     expect(screen.getByText('the')).toBeTruthy()
-  })
-
-  it('shows edit verbs without icons and with faded accelerators', async () => {
-    installBridge()
-    mountMenu()
-    const host = attach('<textarea></textarea>')
-
-    fireEvent.contextMenu(host.querySelector('textarea')!)
-
-    // formatCombo picks ⌘/Ctrl from the host running the test, exactly like
-    // the menu itself — so the assertion is platform-honest, not hardcoded.
-    const pasteItem = (await screen.findByText('Paste')).closest('[data-slot="dropdown-menu-item"]')!
-
-    expect(pasteItem.querySelector('[data-slot="dropdown-menu-shortcut"]')?.textContent).toBe(formatCombo('mod+v'))
-    expect(pasteItem.querySelector('.codicon')).toBeNull()
-
-    const selectAllItem = screen.getByText('Select all').closest('[data-slot="dropdown-menu-item"]')!
-
-    expect(selectAllItem.querySelector('[data-slot="dropdown-menu-shortcut"]')?.textContent).toBe(formatCombo('mod+a'))
-    expect(selectAllItem.querySelector('.codicon')).toBeNull()
   })
 
   it('runs edit verbs after the menu closed, with focus back on the editable', async () => {
@@ -537,22 +350,6 @@ describe('AppContextMenu', () => {
     expect(document.activeElement).toBe(textarea)
   })
 
-  it('splits select all into its own section under the edit verbs', async () => {
-    installBridge()
-    mountMenu()
-    const host = attach('<textarea>text</textarea>')
-
-    fireEvent.contextMenu(host.querySelector('textarea')!)
-
-    const selectAllItem = (await screen.findByText('Select all')).closest('[data-slot="dropdown-menu-item"]')!
-    const pasteItem = screen.getByText('Paste').closest('[data-slot="dropdown-menu-item"]')!
-
-    // Sections render as sibling `.contents` wrappers with the separator
-    // inside the later one — different wrappers = different sections.
-    expect(pasteItem.parentElement).not.toBe(selectAllItem.parentElement)
-    expect(selectAllItem.parentElement?.querySelector('[data-slot="dropdown-menu-separator"]')).not.toBeNull()
-  })
-
   it('grays out cut, copy, and select all in an empty field', async () => {
     installBridge()
     mountMenu()
@@ -610,38 +407,30 @@ describe('AppContextMenu', () => {
     expect(await screen.findByText('Settings')).toBeTruthy()
   })
 
-  it('prevents the native context menu when the Electron bridge is missing (web build)', async () => {
-    // No contextMenuEdit on the bridge — mirrors web-bridge-shim.ts, which
-    // deliberately omits it. In a plain browser tab "unprevented" IS
-    // Chromium's own context menu, so this DOM listener must suppress it or
-    // it paints on top of the app's own menu (the regression this guards).
+  it('offers Copy message on a chat message right-click and copies the whole message', async () => {
+    const writeClipboard = vi.fn().mockResolvedValue(undefined)
+
+    installBridge({ writeClipboard })
+    mountMenu()
+    const host = attach('<div data-slot="aui_assistant-message-content"><p>whole</p><p>reply</p></div>')
+
+    fireEvent.contextMenu(host.querySelector('p')!)
+    fireEvent.click(await screen.findByText('Copy message'))
+
+    await waitFor(() => expect(writeClipboard).toHaveBeenCalled())
+    expect(String(writeClipboard.mock.calls[0]?.[0])).toContain('whole')
+    expect(String(writeClipboard.mock.calls[0]?.[0])).toContain('reply')
+  })
+
+  it('does not offer Copy message on chrome outside any message', async () => {
     installBridge()
     mountMenu()
     const host = attach('<div><p>plain chrome</p></div>')
 
-    const event = fireEvent.contextMenu(host.querySelector('p')!)
+    fireEvent.contextMenu(host.querySelector('p')!)
 
-    expect(event).toBe(false) // fireEvent returns false when preventDefault() was called
-  })
-
-  it('does NOT prevent the native context menu when the Electron bridge is present', async () => {
-    // contextMenuEdit present — the real Electron preload bridge. Preventing
-    // default here would suppress the ONLY signal (Chromium's own
-    // main-process context-menu event) that carries spellcheck facts and
-    // image coordinates to `electron/main.ts`, since Electron never calls
-    // `Menu.popup` on it.
-    const contextMenuEdit = vi.fn().mockResolvedValue(undefined)
-
-    installBridge({ contextMenuEdit: contextMenuEdit as unknown as Window['hermesDesktop']['contextMenuEdit'] })
-    mountMenu()
-    const host = attach('<div><p>plain chrome</p></div>')
-
-    const event = fireEvent.contextMenu(host.querySelector('p')!)
-
-    expect(event).toBe(true) // fireEvent returns true when preventDefault() was NOT called
-    // The app's own menu still opens — stopPropagation and preventDefault
-    // are independent switches.
     expect(await screen.findByText('Settings')).toBeTruthy()
+    expect(screen.queryByText('Copy message')).toBeNull()
   })
 
   it('skips plain right-clicks inside a skip-marked surface, but not links in it', async () => {
@@ -657,6 +446,22 @@ describe('AppContextMenu', () => {
 
     fireEvent.contextMenu(host.querySelector('a')!)
     expect(await screen.findByText('Copy URL')).toBeTruthy()
+  })
+
+  it('lets editable targets inside a radix surface use the edit menu', async () => {
+    installBridge()
+    mountMenu()
+
+    const host = attach(
+      `<div data-zone-body="test" data-slot="context-menu-trigger"><textarea>draft text</textarea></div>`
+    )
+
+    const textarea = host.querySelector('textarea')!
+
+    fireEvent.contextMenu(textarea)
+
+    expect(await screen.findByText('Select all')).toBeTruthy()
+    expect(screen.getByText('Paste')).toBeTruthy()
   })
 
   it('leaves surfaces with their own radix menu alone', () => {
@@ -678,17 +483,16 @@ describe('AppContextMenu', () => {
     const unregister = registerTerminalContextMenu(host.querySelector('[data-terminal]')!, {
       getSelection: () => 'picked text',
       paste,
-      selectAll: vi.fn()
+      reload: vi.fn(),
+      selectAll: vi.fn(),
+      wordErase: null
     })
 
-    const event = fireEvent.contextMenu(host.querySelector('canvas')!)
+    fireEvent.contextMenu(host.querySelector('canvas')!)
 
     expect(await screen.findByText('Copy')).toBeTruthy()
     expect(screen.getByText('Paste')).toBeTruthy()
     expect(screen.getByText('Select all')).toBeTruthy()
-    // No contextMenuEdit on the bridge (web build stand-in) — the terminal
-    // branch must prevent the native menu too, not just the DOM branch.
-    expect(event).toBe(false)
     unregister()
   })
 
@@ -700,7 +504,9 @@ describe('AppContextMenu', () => {
     const unregister = registerTerminalContextMenu(host.querySelector('[data-terminal]')!, {
       getSelection: () => '',
       paste: null,
-      selectAll: vi.fn()
+      reload: vi.fn(),
+      selectAll: vi.fn(),
+      wordErase: null
     })
 
     fireEvent.contextMenu(host.querySelector('canvas')!)
@@ -742,23 +548,6 @@ describe('AppContextMenu guest (in-app browser)', () => {
 
     expect(await screen.findByText('Select all')).toBeTruthy()
     expect(screen.getByText('Inspect element')).toBeTruthy()
-    // The page verbs live on the browser bar only now.
-    expect(screen.queryByText('Copy page URL')).toBeNull()
-    expect(screen.queryByText('Open in browser')).toBeNull()
-    expect(screen.queryByText('Show preview console')).toBeNull()
-  })
-
-  it('draws a line between select all and inspect element', async () => {
-    installBridge()
-    mountMenu()
-
-    openGuestContextMenu(10, 10, guestParams(), guestHandle())
-
-    const selectAllItem = (await screen.findByText('Select all')).closest('[data-slot="dropdown-menu-item"]')!
-    const inspectItem = screen.getByText('Inspect element').closest('[data-slot="dropdown-menu-item"]')!
-
-    expect(selectAllItem.parentElement).not.toBe(inspectItem.parentElement)
-    expect(inspectItem.parentElement?.querySelector('[data-slot="dropdown-menu-separator"]')).not.toBeNull()
   })
 
   it('runs inspect element against the handle', async () => {
@@ -780,22 +569,7 @@ describe('AppContextMenu guest (in-app browser)', () => {
 
     expect(await screen.findByText('Open in in-app browser')).toBeTruthy()
     expect(screen.getByText('Copy URL')).toBeTruthy()
-    // Inspect element rides every guest menu; the bar-only verbs do not.
     expect(screen.getByText('Inspect element')).toBeTruthy()
-    expect(screen.queryByText('Copy page URL')).toBeNull()
-  })
-
-  it('keeps inspect element in guest editable menus', async () => {
-    installBridge()
-    mountMenu()
-
-    openGuestContextMenu(10, 10, guestParams({ isEditable: true }), guestHandle())
-
-    expect(await screen.findByText('Paste')).toBeTruthy()
-    expect(screen.getByText('Inspect element')).toBeTruthy()
-    expect(screen.queryByText('Copy page URL')).toBeNull()
-    expect(screen.queryByText('Open in browser')).toBeNull()
-    expect(screen.queryByText('Show preview console')).toBeNull()
   })
 
   it('grays out guest edit verbs from Chromium editFlags', async () => {
@@ -821,19 +595,6 @@ describe('AppContextMenu guest (in-app browser)', () => {
     expect(item('Copy').getAttribute('data-disabled')).not.toBeNull()
     expect(item('Select all').getAttribute('data-disabled')).not.toBeNull()
     expect(item('Paste').getAttribute('data-disabled')).toBeNull()
-  })
-
-  it('splits guest select all into its own section', async () => {
-    installBridge()
-    mountMenu()
-
-    openGuestContextMenu(10, 10, guestParams({ isEditable: true }), guestHandle())
-
-    const selectAllItem = (await screen.findByText('Select all')).closest('[data-slot="dropdown-menu-item"]')!
-    const pasteItem = screen.getByText('Paste').closest('[data-slot="dropdown-menu-item"]')!
-
-    expect(pasteItem.parentElement).not.toBe(selectAllItem.parentElement)
-    expect(selectAllItem.parentElement?.querySelector('[data-slot="dropdown-menu-separator"]')).not.toBeNull()
   })
 
   it('dispatches guest edit verbs a frame after the menu closes', async () => {

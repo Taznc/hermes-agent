@@ -285,50 +285,34 @@ describe('repoChangeKindForPath', () => {
     unsubscribe()
   })
 
-  it('matches a backslash-rooted win32 cwd against a forward-slash git path', () => {
-    // Reproduces the original bug: cwd arrives backslash-separated (a local
-    // Windows backend), git reports repo-root-relative paths with forward
-    // slashes, and the tree row's id is a path.join()'d backslash path. All
-    // three must resolve to the same lookup key.
-    $currentCwd.set('C:\\Users\\x\\proj')
+  it('maps changes across multiple probed CWDs independently of active session ownership', () => {
     $repoStatusByCwd.set({
-      'C:\\Users\\x\\proj': {
+      '/repo-a': {
         ...sampleStatus,
-        files: [{ path: 'src/a.ts', untracked: true } as HermesRepoStatus['files'][number]]
+        files: [{ path: 'src/file1.ts', untracked: false, conflicted: false } as HermesRepoStatus['files'][number]]
+      },
+      '/repo-b': {
+        ...otherStatus,
+        files: [{ path: 'src/file2.ts', untracked: true, conflicted: false } as HermesRepoStatus['files'][number]]
       }
     })
 
-    const row = repoChangeKindForPath('C:\\Users\\x\\proj\\src\\a.ts')
-
-    expect(row.get()).toBe('added')
+    expect(repoChangeKindForPath('/repo-a/src/file1.ts').get()).toBe('modified')
+    expect(repoChangeKindForPath('/repo-b/src/file2.ts').get()).toBe('added')
+    expect(repoChangeKindForPath('/repo-a/src/clean.ts').get()).toBeUndefined()
   })
 
-  it('matches regardless of drive-letter/segment case (NTFS case-insensitivity)', () => {
-    $currentCwd.set('c:\\users\\x\\proj')
-    $repoStatusByCwd.set({
-      'c:\\users\\x\\proj': {
-        ...sampleStatus,
-        files: [{ path: 'src/A.ts', untracked: true } as HermesRepoStatus['files'][number]]
-      }
-    })
-
-    // Tree row id spells the drive letter and casing differently than the cwd
-    // used to build the map — NTFS treats these as the same file.
-    const row = repoChangeKindForPath('C:\\Users\\x\\proj\\src\\A.ts')
-
-    expect(row.get()).toBe('added')
-  })
-
-  it('stays case-sensitive for POSIX paths', () => {
-    $currentCwd.set('/repo')
+  it('inherits added kind for nested files inside untracked directories', () => {
     $repoStatusByCwd.set({
       '/repo': {
         ...sampleStatus,
-        files: [{ path: 'src/a.ts', untracked: true } as HermesRepoStatus['files'][number]]
+        files: [{ path: 'brand_new_dir', untracked: true, conflicted: false } as HermesRepoStatus['files'][number]]
       }
     })
 
-    expect(repoChangeKindForPath('/repo/src/a.ts').get()).toBe('added')
-    expect(repoChangeKindForPath('/repo/src/A.ts').get()).toBeUndefined()
+    expect(repoChangeKindForPath('/repo/brand_new_dir').get()).toBe('added')
+    expect(repoChangeKindForPath('/repo/brand_new_dir/nested.ts').get()).toBe('added')
+    expect(repoChangeKindForPath('/repo/brand_new_dir/deep/nested/sub.ts').get()).toBe('added')
+    expect(repoChangeKindForPath('/repo/other_dir/file.ts').get()).toBeUndefined()
   })
 })

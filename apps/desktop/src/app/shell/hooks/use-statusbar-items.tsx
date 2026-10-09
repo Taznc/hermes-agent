@@ -1,22 +1,23 @@
 import { useStore } from '@nanostores/react'
-import { useEffect, useMemo, useState } from 'react'
+import { useCallback, useMemo } from 'react'
 import { useNavigate } from 'react-router'
 
 import { ConnectionSwitcher } from '@/app/chat/sidebar/connection-switcher'
+import { ProfileSwitcher } from '@/app/chat/sidebar/profile-dropdown-switcher'
 import type { CommandCenterSection } from '@/app/command-center'
-import { interactiveTerminalAvailable } from '@/app/right-sidebar/terminal/capability'
+import { toggleTerminalPane } from '@/app/right-sidebar/terminal/reveal-focus'
 import { useApprovalModeStatusbarItem } from '@/app/shell/approval-mode-menu'
-import { ContextUsagePanel } from '@/app/shell/context-usage-panel'
+import { ContextMeterDetail, ContextUsagePanel } from '@/app/shell/context-usage-panel'
 import { GatewayMenuPanel } from '@/app/shell/gateway-menu-panel'
 import { useContextBreakdown } from '@/app/shell/hooks/use-context-breakdown'
 import { useSystemResourcesStatusbarItem } from '@/app/shell/system-resources-statusbar'
-import { $paneVisible, togglePaneVisible } from '@/components/pane-shell/tree/store'
+import { $paneVisible } from '@/components/pane-shell/tree/store'
+import { Badge } from '@/components/ui/badge'
 import { Codicon } from '@/components/ui/codicon'
 import { GlyphSpinner } from '@/components/ui/glyph-spinner'
+import { useMemoizedStatusBarGatewayHealth } from '@/fork/statusbar-gateway-health' // >>> FORK ANCHOR: statusbar-health-memo <<<
 import { useI18n } from '@/i18n'
 import { displayPath, pathLeaf } from '@/lib/display-path'
-import { resolveForkBuildMarker } from '@/lib/fork-build-marker'
-import { statusBarGatewayHealth } from '@/lib/gateway-health-pill'
 import {
   Activity,
   AlertCircle,
@@ -24,18 +25,27 @@ import {
   Command,
   FolderOpen,
   Globe,
+  Hash,
   Layers3,
   Loader2,
   Terminal,
   Zap
 } from '@/lib/icons'
 import { type RuntimeReadinessResult } from '@/lib/runtime-readiness'
+import { resolveSessionTimerSince } from '@/lib/session-timer-since'
 import { cacheHitLabel, contextBarLabel, LiveDuration, tokensPerSecondLabel, usageContextLabel } from '@/lib/statusbar'
 import { useStoreSelector } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
-import { copyFilePath, revealFile } from '@/store/file-actions'
+import { resolveVersionStatus } from '@/lib/version-status'
+import type { ApprovalModeRequester } from '@/store/approval-mode'
+import { copyFilePath, revealFile, shouldOfferLocalReveal } from '@/store/file-actions'
+import { $freeTierStatus, FREE_TIER_MODEL } from '@/store/free-tier'
+import { openFreeTierSignIn } from '@/store/free-tier-sign-in'
+import { requestGatewayForProfile } from '@/store/gateway'
 import { revealFileInTree } from '@/store/layout'
+import { $onboardingGate, guidedOnboardingActive } from '@/store/onboarding-gate'
 import { $activeGatewayProfile } from '@/store/profile'
+import { $profileRailVisible } from '@/store/profile-rail-prefs'
 import { $projectTree, projectNameForCwd } from '@/store/projects'
 import {
   $activeSessionId,
@@ -46,16 +56,24 @@ import {
   $selectedStoredSessionId,
   $sessions,
   $sessionStartedAt,
+  $tileSessionFocusStartedAt,
   $turnStartedAt,
   idsShareLineage,
   sessionMatchesStoredId
 } from '@/store/session'
-import { $focusedRuntimeId, $focusedSessionState, $focusedStoredSessionId } from '@/store/session-states'
+import { $focusedStoredSessionId } from '@/store/session-focus'
+import { $focusedRuntimeId, $focusedSessionState, $sessionTiles, isSessionRemote } from '@/store/session-states'
 import { $statusbarHiddenIds } from '@/store/statusbar-prefs'
 import { $subagentsBySession, activeSubagentCount, failedSubagentCount } from '@/store/subagents'
 import { $gatewayRestarting } from '@/store/system-actions'
-import { $desktopVersion } from '@/store/updates'
-import { $webReloadPending, performWebReload } from '@/store/web-reload'
+import {
+  $backendUpdateApply,
+  $backendUpdateStatus,
+  $desktopVersion,
+  $updateApply,
+  $updateStatus,
+  openUpdateOverlayFor
+} from '@/store/updates'
 import type { StatusResponse, UsageStats } from '@/types/hermes'
 
 import { CRON_ROUTE, SETTINGS_ROUTE, WEBHOOKS_ROUTE } from '../../routes'
@@ -95,6 +113,7 @@ export function useStatusbarItems({
 }: StatusbarItemsOptions) {
   const { t } = useI18n()
   const copy = t.shell.statusbar
+  const freeTierCopy = t.freeTier
   const fileMenu = t.fileMenu
   const primaryActiveSessionId = useStore($activeSessionId)
   const activeGatewayProfile = useStore($activeGatewayProfile)
@@ -103,6 +122,7 @@ export function useStatusbarItems({
   // minimized zone, which lit the button for a pane the user couldn't see.
   const terminalShowing = useStore($paneVisible('terminal'))
   const sessionsShowing = useStore($paneVisible('sessions'))
+  const profileRailVisible = useStore($profileRailVisible)
   const botsShowing = useStore($paneVisible('hermes-bots:pane'))
   const primaryBusy = useStore($busy)
   // Draft / primary composer atom — used only while the focused surface is the
@@ -112,22 +132,43 @@ export function useStatusbarItems({
   const primaryUsage = useStore($currentUsage)
   const gatewayRestarting = useStore($gatewayRestarting)
   const primarySessionStartedAt = useStore($sessionStartedAt)
+  const tileSessionFocusStartedAt = useStore($tileSessionFocusStartedAt)
   const primaryTurnStartedAt = useStore($turnStartedAt)
 
   // The indicator must speak the same scope as the Spawn-tree panel it opens:
-  // every session's subagents, never background system actions. Only two
-  // COUNTS are read, so select scalars — a whole-map `useStore` re-ran this
-  // hook (rebuilding all ~9 statusbar items) on every subagent progress tick
-  // in ANY session, including background ones.
+  // running/queued from every session (never background system actions), plus
+  // terminal rows only for the session the user is in — the scope
+  // `subagentsForPanel` derives, so the count and the tree can never disagree
+  // and finished history from inactive sessions stops accumulating (#75505).
+  // Only two COUNTS are read, so select scalars — a whole-map `useStore` re-ran
+  // this hook (rebuilding all ~9 statusbar items) on every subagent progress
+  // tick in ANY session, including background ones.
   const subagentsRunning = useStoreSelector($subagentsBySession, bySession =>
     Object.values(bySession).reduce((sum, items) => sum + activeSubagentCount(items), 0)
   )
 
+  // Terminal rows only from the session the user is in — the panel drops other
+  // sessions' finished history (#75505), so the count the indicator shows must
+  // not resurrect it. Live running/queued rows stay cross-session above.
   const subagentsFailed = useStoreSelector($subagentsBySession, bySession =>
-    Object.values(bySession).reduce((sum, items) => sum + failedSubagentCount(items), 0)
+    Object.entries(bySession)
+      .filter(([sid]) => sid === primaryActiveSessionId)
+      .reduce((sum, [, items]) => sum + failedSubagentCount(items), 0)
   )
 
-
+  // Backend truth for the free-tier chip. Refreshed on the ambient status
+  // cadence (use-status-snapshot), never polled from here.
+  const freeTier = useStore($freeTierStatus)
+  // The chip is a standing invitation to sign in. During the guided first
+  // launch that invitation lives on the guide's own ready screen; a second
+  // one in the statusbar is a distraction from the chat they are in. The
+  // subscription is what makes the check reactive.
+  useStore($onboardingGate)
+  const guideOwnsSignIn = guidedOnboardingActive()
+  const updateStatus = useStore($updateStatus)
+  const updateApply = useStore($updateApply)
+  const backendUpdateStatus = useStore($backendUpdateStatus)
+  const backendUpdateApply = useStore($backendUpdateApply)
   const desktopVersion = useStore($desktopVersion)
   const connection = useStore($connection)
 
@@ -137,11 +178,19 @@ export function useStatusbarItems({
   // clicking into a tile makes the statusbar describe THAT session.
   const focusedStoredSessionId = useStore($focusedStoredSessionId)
   const focusedRuntimeId = useStore($focusedRuntimeId)
+  // Whether the FOCUSED session's workspace lives on another machine: a
+  // Connections-tagged tile on a remote gateway inside a local-primary window
+  // (and vice versa) is decided by the tile's owner route, falling back to the
+  // ambient connection only when no owner is known (#115167).
+  const focusedWorkspaceRemote = useStoreSelector($sessionTiles, () => isSessionRemote(focusedStoredSessionId))
   // `$focusedSessionState` is a projection of `$sessionStates`, which is
   // republished on EVERY message delta — tens of times a second during a turn.
   // Only the fields read here are selected, so an unchanged readout bails out
   // instead of rebuilding all ~9 statusbar items per token.
   const focusedBusy = useStoreSelector($focusedSessionState, state => Boolean(state?.busy))
+
+  const focusedRuntimeStartedAt = useStoreSelector($focusedSessionState, state => state?.runtimeStartedAt ?? null)
+
   const focusedTurnStartedAt = useStoreSelector($focusedSessionState, state => state?.turnStartedAt ?? null)
   // `usage` is an object, so it can't be compared as a scalar. It IS however
   // replaced wholesale rather than mutated, and only changes when the backend
@@ -168,10 +217,10 @@ export function useStatusbarItems({
 
   const turnStartedAt = primaryFocused ? primaryTurnStartedAt : focusedTurnStartedAt
 
-  // A tile's session-start + cold cwd come from its stored row (the cache only
-  // knows runtime state). Only these scalars are read off `$sessions`, so
-  // select them — a whole-list `useStore` re-ran the hook on every session-list
-  // write (title updates, poll refreshes, archives).
+  // A tile's stored row supplies the cold/fallback session-start and cwd when
+  // no focused runtime value is available. Only these scalars are read off
+  // `$sessions`, so select them — a whole-list `useStore` re-ran this hook on
+  // every session-list write (title updates, poll refreshes, archives).
   const focusedRowStartedAt = useStoreSelector($sessions, sessions =>
     focusedStoredSessionId
       ? (sessions.find(s => sessionMatchesStoredId(s, focusedStoredSessionId))?.started_at ?? null)
@@ -187,6 +236,17 @@ export function useStatusbarItems({
 
     return row?.cwd?.trim() || ''
   })
+
+  // Which backend the focused row runs on: a Connections-tagged row names its
+  // gateway; an untagged one is the window's primary. Decides whether the OS
+  // file manager on this computer can show its workspace at all.
+  const focusedRowConnectionId = useStoreSelector($sessions, sessions =>
+    focusedStoredSessionId
+      ? sessions.find(s => sessionMatchesStoredId(s, focusedStoredSessionId))?.connection_id?.trim() || ''
+      : ''
+  )
+
+  const offerLocalReveal = shouldOfferLocalReveal(focusedRowConnectionId, connection?.mode === 'remote')
 
   // Live runtime cwd is authoritative once it belongs to the focused chat
   // (agent can relocate mid-turn). Until then — cold tabs, mid-switch lag —
@@ -227,11 +287,13 @@ export function useStatusbarItems({
   const projectTree = useStore($projectTree)
   const projectName = useMemo(() => projectNameForCwd(currentCwd), [currentCwd, projectTree])
 
-  const sessionStartedAt = primaryFocused
-    ? primarySessionStartedAt
-    : focusedRowStartedAt
-      ? focusedRowStartedAt * 1000
-      : null
+  const sessionStartedAt = resolveSessionTimerSince({
+    focusedStoredSessionId,
+    primaryFocused,
+    primarySessionStartedAt,
+    tileFocus: tileSessionFocusStartedAt,
+    fallbackRuntimeStartedAt: focusedRuntimeStartedAt
+  })
 
   // The backend only knows a session's MEASURED occupancy once a turn has run
   // in this process, so a resumed conversation reports none and the gauge had
@@ -254,8 +316,8 @@ export function useStatusbarItems({
   // only before that), and it is keyed to the session it describes. The global
   // `$currentUsage` is neither — a resumed session reports no context fields,
   // and the store merges rather than replaces, so the PREVIOUS session's gauge
-  // numbers survive the switch. Mid-turn there's no breakdown by design and
-  // the streamed usage carries the gauge.
+  // numbers survive the switch. Mid-turn useContextBreakdown returns null (the
+  // snapshot is pre-turn), so the streamed usage carries the gauge.
   const gaugeUsage = useMemo<UsageStats>(
     () =>
       contextBreakdown
@@ -278,7 +340,15 @@ export function useStatusbarItems({
   const cacheHit = cacheHitLabel(currentUsage)
   const tokensPerSecond = tokensPerSecondLabel(currentUsage)
 
-  const approvalModeItem = useApprovalModeStatusbarItem(activeGatewayProfile, requestGateway)
+  // Dial the viewed profile directly: the ambient `requestGateway` is the
+  // session-routed dispatcher, which re-scopes `params.profile` to the FOCUSED
+  // session's owner — a profile other than the one this menu shows.
+  const requestApprovalModeGateway = useCallback<ApprovalModeRequester>(
+    (method, params) => requestGatewayForProfile(activeGatewayProfile, method, params),
+    [activeGatewayProfile]
+  )
+
+  const approvalModeItem = useApprovalModeStatusbarItem(activeGatewayProfile, requestApprovalModeGateway)
   const systemResourcesItem = useSystemResourcesStatusbarItem()
 
   const gatewayMenuContent = useMemo(
@@ -297,38 +367,26 @@ export function useStatusbarItems({
   const gatewayOpen = gatewayState === 'open'
   const gatewayConnecting = gatewayState === 'connecting'
 
-  const gatewayHealth = useMemo(
-    () =>
-      statusBarGatewayHealth({
-        connectionState: gatewayState,
-        copy: {
-          backend: copy.backend,
-          checking: copy.gatewayChecking,
-          connecting: copy.gatewayConnecting,
-          messagingDegraded: copy.messagingDegraded,
-          messagingStopped: copy.messagingStopped,
-          needsSetup: copy.gatewayNeedsSetup,
-          offline: copy.gatewayOffline,
-          ready: copy.gatewayReady,
-          restarting: copy.gatewayRestarting,
-          unavailable: copy.gatewayUnavailable
-        },
-        inferenceStatus,
-        messagingRunning: statusSnapshot?.gateway_running,
-        messagingState: statusSnapshot?.gateway_state,
-        platforms: statusSnapshot?.gateway_platforms,
-        restarting: gatewayRestarting
-      }),
-    [
-      gatewayState,
-      copy,
-      inferenceStatus,
-      statusSnapshot?.gateway_running,
-      statusSnapshot?.gateway_state,
-      statusSnapshot?.gateway_platforms,
-      gatewayRestarting
-    ]
-  )
+  const gatewayHealth = useMemoizedStatusBarGatewayHealth({
+    connectionState: gatewayState,
+    copy: {
+      backend: copy.backend,
+      checking: copy.gatewayChecking,
+      connecting: copy.gatewayConnecting,
+      messagingDegraded: copy.messagingDegraded,
+      messagingStopped: copy.messagingStopped,
+      needsSetup: copy.gatewayNeedsSetup,
+      offline: copy.gatewayOffline,
+      ready: copy.gatewayReady,
+      restarting: copy.gatewayRestarting,
+      unavailable: copy.gatewayUnavailable
+    },
+    inferenceStatus,
+    messagingRunning: statusSnapshot?.gateway_running,
+    messagingState: statusSnapshot?.gateway_state,
+    platforms: statusSnapshot?.gateway_platforms,
+    restarting: gatewayRestarting
+  })
 
   const inferenceReady = gatewayOpen && inferenceStatus?.ready === true && !gatewayHealth.degraded
   const gatewayDegraded = gatewayOpen || gatewayConnecting || gatewayHealth.degraded
@@ -339,206 +397,94 @@ export function useStatusbarItems({
       ? 'text-amber-600 hover:text-amber-600'
       : 'text-destructive hover:text-destructive'
 
-  // Unofficial/local build marker. Deliberately loud (amber, uppercase) and
-  // pinned leftmost: its whole job is to make "am I running my own build?"
-  // answerable at a glance, since a feature branch never bumps the version and
-  // About looks identical to a release. Renders nothing on official builds —
-  // see resolveForkBuildMarker for the rule.
-  const forkBuildItem = useMemo<StatusbarItem | null>(() => {
-    const marker = resolveForkBuildMarker(desktopVersion)
+  const clientVersionItem = useMemo<StatusbarItem>(() => {
+    const applying = updateApply.applying || updateApply.stage === 'restart'
 
-    if (!marker) {
-      return null
-    }
-
-    return {
-      className: 'px-2 -ml-1 font-semibold bg-amber-500 text-black hover:bg-amber-400',
-      icon: <AlertCircle className="size-3" />,
-      id: 'fork-build',
-      label: marker.label,
-      title: marker.title
-    }
-  }, [desktopVersion])
-
-  // Dev only: the main-process bundle was rebuilt after this process started.
-  // The renderer hot-reloads through Vite, but Electron cannot swap an
-  // already-evaluated main process, so an electron/ edit needs a relaunch. Show
-  // an explicit affordance rather than restarting under the user — losing an
-  // in-flight turn to an automatic restart is worse than a stale main process.
-  // Hidden entirely in packaged builds (`supported: false`).
-  const [devBundleStale, setDevBundleStale] = useState(false)
-
-  useEffect(() => {
-    let active = true
-
-    void window.hermesDesktop?.getDevMainBundleStale?.().then(res => {
-      if (active && res?.supported) {
-        setDevBundleStale(Boolean(res.stale))
-      }
+    const status = resolveVersionStatus({
+      applying,
+      applyMessage: updateApply.message,
+      behind: updateStatus?.behind ?? 0,
+      branch: updateStatus?.branch,
+      copy,
+      remote: connection?.mode === 'remote',
+      restarting: updateApply.stage === 'restart',
+      sha: updateStatus?.currentSha?.slice(0, 7) ?? null,
+      target: 'client',
+      updateAvailable: updateStatus?.updateAvailable,
+      version: desktopVersion?.appVersion
     })
 
-    const off = window.hermesDesktop?.onDevMainBundleStale?.(payload => {
-      if (active) {
-        setDevBundleStale(Boolean(payload?.stale))
-      }
+    return {
+      className: status.hasUpdate ? 'text-primary hover:text-primary' : undefined,
+      hidden: status.unknown,
+      icon: applying ? <Loader2 className="size-3 animate-spin" /> : <Hash className="size-3" />,
+      id: 'version-client',
+      label: status.label,
+      // Update state is not a preference: hiding it is how a user misses that
+      // their client is behind. Listed in the menu, but locked on.
+      lockedVisible: true,
+      onSelect: () => openUpdateOverlayFor('client'),
+      title: status.tooltip,
+      toggleLabel: copy.toggleVersion,
+      variant: 'action'
+    }
+  }, [
+    desktopVersion?.appVersion,
+    connection?.mode,
+    copy,
+    updateApply.applying,
+    updateApply.message,
+    updateApply.stage,
+    updateStatus?.behind,
+    updateStatus?.branch,
+    updateStatus?.currentSha,
+    updateStatus?.updateAvailable
+  ])
+
+  const backendVersionItem = useMemo<StatusbarItem | null>(() => {
+    if (connection?.mode !== 'remote') {
+      return null
+    }
+
+    const applying = backendUpdateApply.applying || backendUpdateApply.stage === 'restart'
+
+    const status = resolveVersionStatus({
+      applying,
+      applyMessage: backendUpdateApply.message,
+      behind: backendUpdateStatus?.behind ?? 0,
+      copy,
+      remote: true,
+      restarting: backendUpdateApply.stage === 'restart',
+      target: 'backend',
+      updateAvailable: backendUpdateStatus?.updateAvailable,
+      version: statusSnapshot?.version
     })
 
-    return () => {
-      active = false
-      off?.()
-    }
-  }, [])
-
-  const devRestartItem = useMemo<StatusbarItem | null>(() => {
-    if (!devBundleStale) {
-      return null
-    }
-
     return {
-      className: 'px-2 font-semibold bg-blue-600 text-white hover:bg-blue-500',
-      icon: <Loader2 className="size-3" />,
-      id: 'dev-restart',
-      label: 'Restart to apply',
-      onSelect: () => {
-        void window.hermesDesktop?.restartForDevBundle?.()
-      },
-      title:
-        'The Electron main-process bundle was rebuilt after this window started.\n' +
-        'Renderer changes are already live; main-process changes need a relaunch.\n' +
-        'Click to restart now.'
+      className: status.hasUpdate ? 'text-primary hover:text-primary' : undefined,
+      hidden: status.unknown,
+      icon: applying ? <Loader2 className="size-3 animate-spin" /> : <Hash className="size-3" />,
+      id: 'version-backend',
+      label: status.label,
+      lockedVisible: true,
+      onSelect: () => openUpdateOverlayFor('backend'),
+      title: status.tooltip,
+      toggleLabel: copy.toggleBackendVersion,
+      variant: 'action'
     }
-  }, [devBundleStale])
-
-  // Dev only: backend Python source (agent/ tui_gateway/ tools/ hermes_cli/)
-  // changed on disk after the running `hermes serve` child already imported
-  // it (Phase 2.9). Distinct from devRestartItem (the Electron main process)
-  // and from backendVersionItem/backendUpdateApply (a REMOTE backend's git
-  // update state) — this is specifically "your own local backend process is
-  // stale," worded to name the backend so it can't be confused with either.
-  // Never restarts automatically: only the explicit click here calls
-  // restartDevBackend(), same offer-don't-act contract as the main-process
-  // affordance above. Hidden entirely in packaged builds and whenever the
-  // primary backend is remote (`supported: false`).
-  const [devBackendStaleState, setDevBackendStaleState] = useState<
-    'fresh' | 'stale' | 'restarting' | 'failed' | null
-  >(null)
-
-  useEffect(() => {
-    let active = true
-
-    void window.hermesDesktop?.getDevBackendStale?.().then(res => {
-      if (active && res?.supported) {
-        setDevBackendStaleState(res.state)
-      }
-    })
-
-    const off = window.hermesDesktop?.onDevBackendStale?.(payload => {
-      if (active) {
-        setDevBackendStaleState(payload?.state ?? 'fresh')
-      }
-    })
-
-    return () => {
-      active = false
-      off?.()
-    }
-  }, [])
-
-  const devBackendRestartItem = useMemo<StatusbarItem | null>(() => {
-    if (!devBackendStaleState || devBackendStaleState === 'fresh') {
-      return null
-    }
-
-    const restarting = devBackendStaleState === 'restarting'
-    const failed = devBackendStaleState === 'failed'
-
-    return {
-      className: `px-2 font-semibold text-white ${failed ? 'bg-destructive hover:bg-destructive/90' : 'bg-blue-600 hover:bg-blue-500'}`,
-      icon: restarting ? <Loader2 className="size-3 animate-spin" /> : <Loader2 className="size-3" />,
-      id: 'dev-backend-restart',
-      label: restarting ? 'Restarting backend…' : failed ? 'Backend restart failed — retry' : 'Restart backend to apply',
-      onSelect: () => {
-        if (restarting) {
-          return
-        }
-
-        void window.hermesDesktop?.restartDevBackend?.()
-      },
-      title: failed
-        ? 'The backend restart failed. Click to try again.'
-        : 'Backend Python source (agent/, tui_gateway/, tools/, hermes_cli/) changed on disk\n' +
-          'after this window\'s Hermes backend process already imported it.\n' +
-          'The renderer stays connected; an in-flight turn is never interrupted automatically.\n' +
-          'Click to restart the backend now.'
-    }
-  }, [devBackendStaleState])
-
-  // Web build only: Vite's HMR client traps location.reload() into this flag
-  // instead of navigating (see src/web-bridge-shim.ts / src/store/web-reload.ts)
-  // so an edit never destroys in-progress work. Same blue affordance as
-  // devRestartItem, but labeled "Refresh" — always, never "Restart": the web
-  // build has no Electron main process to restart, and the renderer's other
-  // hard-reload trigger (the vite dev-server WS reconnecting, e.g. after the
-  // hermes-webdesktop-dev/-stable systemd unit itself restarts) funnels
-  // through the exact same trapped `location.reload()` call — there is no
-  // distinct "the underlying service restarted, you need more than a page
-  // reload" state to surface in this build. A plain reload is genuinely
-  // always sufficient here. Documented simplification, not an unmet
-  // requirement — see docs/web-ui-hard-refresh-diagnosis.md §3.
-  const webReloadPending = useStore($webReloadPending)
-  const isWebBuild = desktopVersion?.platform === 'web'
-
-  const webReloadItem = useMemo<StatusbarItem | null>(() => {
-    if (!isWebBuild || !webReloadPending) {
-      return null
-    }
-
-    return {
-      className: 'px-2 font-semibold bg-blue-600 text-white hover:bg-blue-500',
-      icon: <Loader2 className="size-3" />,
-      id: 'web-reload',
-      label: 'Refresh',
-      onSelect: () => {
-        performWebReload()
-      },
-      title:
-        'New code was built and the page would normally auto-reload.\n' +
-        'Reloading now discards nothing you have not already sent — click when ready.'
-    }
-  }, [isWebBuild, webReloadPending])
-
-  const connectionItem = useMemo<StatusbarItem | null>(() => {
-    if (connection?.mode !== 'remote' || !connection.remoteHost) {
-      return null
-    }
-
-    const ssh = connection.remoteKind === 'ssh'
-    const cloud = connection.remoteKind === 'cloud'
-
-    return {
-      className: cn(
-        'px-2 -ml-1 font-medium',
-        ssh ? 'bg-primary text-primary-foreground' : 'bg-accent text-accent-foreground'
-      ),
-      icon: <Terminal className="size-3" />,
-      id: 'connection',
-      label: ssh
-        ? copy.connectionSsh(connection.remoteHost)
-        : cloud
-          ? copy.connectionCloud(connection.remoteHost)
-          : copy.connectionRemote(connection.remoteHost),
-      // Label already names the host — no "click to manage" tip lecture.
-      to: `${SETTINGS_ROUTE}?tab=gateway`
-    }
-  }, [connection?.mode, connection?.remoteHost, connection?.remoteKind, copy])
+  }, [
+    connection?.mode,
+    statusSnapshot?.version,
+    backendUpdateStatus?.behind,
+    backendUpdateStatus?.updateAvailable,
+    backendUpdateApply.applying,
+    backendUpdateApply.message,
+    backendUpdateApply.stage,
+    copy
+  ])
 
   const coreLeftStatusbarItems = useMemo<readonly StatusbarItem[]>(
     () => [
-      ...(forkBuildItem ? [forkBuildItem] : []),
-      ...(devRestartItem ? [devRestartItem] : []),
-      ...(devBackendRestartItem ? [devBackendRestartItem] : []),
-      ...(webReloadItem ? [webReloadItem] : []),
-      ...(connectionItem ? [connectionItem] : []),
       {
         className: `w-7 justify-center px-0${commandCenterOpen ? ' bg-accent/55 text-foreground' : ''}`,
         icon: <Command className="size-3.5" />,
@@ -556,6 +502,14 @@ export function useStatusbarItems({
         id: 'gateway-switcher',
         lockedVisible: true,
         render: () => <StatusbarGatewaySwitcher />
+      },
+      {
+        // The rail's stand-in: the profile picker moves down here while the
+        // colored strip is hidden, so switching profiles always has a door.
+        hidden: !sessionsShowing || profileRailVisible,
+        id: 'profile-switcher',
+        lockedVisible: true,
+        render: () => <ProfileSwitcher compact />
       },
       {
         className: gatewayRestarting ? undefined : gatewayClassName,
@@ -578,6 +532,34 @@ export function useStatusbarItems({
         variant: 'menu'
       },
       {
+        // The model id is the quiet part; the sign-in is the action, so it is
+        // solid and set off by a gap instead of touching the label.
+        detail: (
+          <span className="inline-flex items-center gap-2">
+            <span className="font-mono text-[0.625rem] text-muted-foreground/70">
+              {freeTier?.model ?? FREE_TIER_MODEL}
+            </span>
+            {/* The class merger drops Badge's own leading-none behind the size's
+                font-size class, so the badge grows to the inherited 1.5 leading and
+                overhangs an 11px label. Restating it here keeps it 11.6px tall. */}
+            <Badge className="leading-none" size="xs" variant="solid">
+              {freeTierCopy.signIn}
+            </Badge>
+          </span>
+        ),
+        // Shown while a free-tier identity exists and the tier is on: it names the
+        // identity that carries the connectors (and inference when nothing else
+        // does), and it is the persistent way in to the sign-in.
+        hidden: !freeTier?.available || guideOwnsSignIn,
+        icon: <Codicon name="account" size="0.75rem" />,
+        id: 'free-tier',
+        label: freeTierCopy.providerName,
+        onSelect: () => openFreeTierSignIn(),
+        title: freeTierCopy.statusLabel(freeTier?.model ?? FREE_TIER_MODEL),
+        toggleLabel: copy.toggleFreeTier,
+        variant: 'action'
+      },
+      {
         hidden: !currentCwd,
         icon: <FolderOpen className="size-3" />,
         id: 'workspace-cwd',
@@ -593,12 +575,20 @@ export function useStatusbarItems({
                 onSelect: () => void copyFilePath(currentCwd),
                 title: displayPath(currentCwd)
               },
-              {
-                id: 'reveal-workspace-finder',
-                label: fileMenu.revealFileManager,
-                onSelect: () => void revealFile(currentCwd),
-                title: displayPath(currentCwd)
-              },
+              // The OS file manager needs the local filesystem; a remote
+              // backend's workspace is not on this computer (the sidebar
+              // trees already hide reveal the same way), and a row tagged
+              // with another gateway is never local either.
+              ...(focusedWorkspaceRemote || !offerLocalReveal
+                ? []
+                : [
+                    {
+                      id: 'reveal-workspace-finder',
+                      label: fileMenu.revealFileManager,
+                      onSelect: () => void revealFile(currentCwd),
+                      title: displayPath(currentCwd)
+                    }
+                  ]),
               {
                 id: 'reveal-workspace-sidebar',
                 label: fileMenu.revealInSidebar,
@@ -658,16 +648,17 @@ export function useStatusbarItems({
       agentsOpen,
       botsShowing,
       commandCenterOpen,
-      connectionItem,
-      devRestartItem,
-      devBackendRestartItem,
-      webReloadItem,
-      forkBuildItem,
       copy,
       currentCwd,
+      focusedWorkspaceRemote,
+      freeTierCopy,
       fileMenu.copyPath,
       fileMenu.revealFileManager,
       fileMenu.revealInSidebar,
+      offerLocalReveal,
+      freeTier?.available,
+      freeTier?.model,
+      guideOwnsSignIn,
       gatewayMenuContent,
       gatewayClassName,
       gatewayHealth,
@@ -675,6 +666,7 @@ export function useStatusbarItems({
       inferenceReady,
       inferenceStatus?.reason,
       openAgents,
+      profileRailVisible,
       projectName,
       sessionsShowing,
       subagentsFailed,
@@ -695,7 +687,9 @@ export function useStatusbarItems({
         variant: 'text'
       },
       {
-        detail: contextBar || undefined,
+        detail: contextBar ? (
+          <ContextMeterDetail bar={contextBar} compressions={currentUsage.compressions} />
+        ) : undefined,
         // Never self-hide: the user opted this item in (it's hidden-by-
         // default), so an empty label must render as a waiting placeholder,
         // not a vanished item — an enabled-but-invisible toggle reads as
@@ -732,7 +726,8 @@ export function useStatusbarItems({
         detail: <LiveDuration since={sessionStartedAt} />,
         hidden: !sessionStartedAt,
         id: 'session-timer',
-        label: copy.session,
+        label: copy.focusedSince,
+        title: copy.focusedSinceTitle,
         toggleLabel: copy.toggleSessionTimer,
         variant: 'text'
       },
@@ -745,25 +740,30 @@ export function useStatusbarItems({
       {
         actionId: 'view.showTerminal',
         className: `w-7 justify-center px-0${terminalShowing ? ' bg-accent/55 text-foreground' : ''}`,
-        hidden: !chatOpen || !interactiveTerminalAvailable(),
+        hidden: !chatOpen,
         icon: <Terminal className="size-3.5" />,
         id: 'terminal',
-        onSelect: () => togglePaneVisible('terminal'),
+        onSelect: () => toggleTerminalPane(),
         title: terminalShowing ? copy.hideTerminal : copy.showTerminal,
         toggleLabel: copy.toggleTerminal,
         variant: 'action'
-      }
+      },
+      clientVersionItem,
+      ...(backendVersionItem ? [backendVersionItem] : [])
     ],
     [
       approvalModeItem,
+      backendVersionItem,
       busy,
       cacheHit,
       chatOpen,
+      clientVersionItem,
       contextBar,
       contextBreakdown,
       contextBreakdownLoading,
       contextUsage,
       copy,
+      currentUsage.compressions,
       gaugeUsage,
       sessionStartedAt,
       gatewayState,

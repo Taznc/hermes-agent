@@ -42,6 +42,18 @@ def _reason(help: str):
     return _arg("--reason", help=help)
 
 
+def _nonnegative_int(value: str) -> int:
+    """argparse type for retention days: a negative window builds a future cutoff
+    that matches every row, so reject it at the CLI boundary before any sweep."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be an integer") from exc
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("retention days must be >= 0 (0 disables that sweep)")
+    return parsed
+
+
 def _run_state_args(type_help: str):
     return (
         _arg("--state-type", choices=("status", "outcome"), help=f"With --state-name: {type_help}"),
@@ -70,14 +82,7 @@ _TASK_ID = _arg("task_id")
 _TASK_IDS = _arg("task_ids", nargs="+")
 _SLUG = _arg("slug")
 _TENANT = _arg("--tenant", help="Tenant namespace")
-_PRIORITY = _arg(
-    "--priority", type=int, default=0,
-    help=(
-        "Dispatch-order tiebreaker (not capacity/preemption). "
-        "critical=2, high=1, normal=0 (default), low=-1. Other "
-        "integers are accepted and keep their relative order."
-    ),
-)
+_PRIORITY = _arg("--priority", type=int, default=0, help="Priority tiebreaker")
 _RECLAIM_REASON = _reason("Human-readable reason (recorded on the reclaimed event)")
 _NOTIFY_TARGET = (
     _arg("--platform", required=True),
@@ -117,26 +122,6 @@ _BOARD_SPECS = [
         _SLUG,
         _arg("path", nargs="?", help="Absolute path to use as default workdir. Omit to clear."),
     ], help="Set the default workspace path for tasks on a board"),
-    _cmd("set-land-target", [
-        _SLUG,
-        _arg("target", nargs="?", metavar="REMOTE/BRANCH",
-             help="Landing target as <remote>/<branch> (e.g. origin/dev). Omit to clear."),
-    ], help="Set the target `hermes kanban land` merges approved cards into",
-       description=(
-           "`hermes kanban land` NEVER infers a remote — a repository with both a fork and an "
-           "upstream configured has no safe default. This records the one explicit target for "
-           "the board; without it (and without --target) landing refuses."
-       )),
-    _cmd("set-land-verify", [
-        _SLUG,
-        _arg("command", nargs="?",
-             help="Shell command re-run against the exact commit before landing. Omit to clear."),
-    ], help="Set the pre-land verification command for a board",
-       description=(
-           "Run in a throwaway checkout of the exact commit being landed; a non-zero exit "
-           "refuses the landing. When unset, landing instead requires a verification receipt "
-           "on the approval run naming that same commit."
-       )),
     _cmd("export", [
         _arg("slug", nargs="?", help="Board to export (default: the current board)"),
         _arg("-o", "--output", help="Archive path (default: ./<slug>.tar.gz)"),
@@ -175,10 +160,15 @@ _SPECS = [
     _cmd("create", [
         _arg("title", help="Task title"),
         _arg("--body", help="Optional opening post"),
+        _arg("--body-file", metavar="PATH",
+             help="Read the opening post from a file ('-' = stdin), so bodies with embedded "
+                  "newlines or flag-like lines survive shell quoting. "
+                  "Mutually exclusive with --body."),
         _arg("--assignee", help="Profile name to assign"),
         _arg("--parent", action="append", default=[], help="Parent task id (repeatable)"),
-        _arg("--workspace", default="scratch",
-             help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch)"),
+        _arg("--workspace",
+             help="scratch | worktree | worktree:<path> | dir:<path> (default: scratch; "
+                  "an explicit 'scratch' also opts out of a project-scoped board's project)"),
         _arg("--branch", help="Branch name for worktree tasks, e.g. wt/t6-wire"),
         _arg("--project",
              help="Link to a project (id or slug). Anchors the task's "
@@ -188,12 +178,6 @@ _SPECS = [
         _PRIORITY,
         _arg("--triage", action="store_true",
              help="Park in triage — a specifier will flesh out the spec and promote to todo"),
-        _arg("--idea", action="store_true", dest="idea",
-             help="Park in the inert Idea lane (rough wishlist capture). No automation ever "
-                  "touches it and --assignee is optional. Refine it with `kanban refine`."),
-        _arg("--roadmap", action="store_true", dest="roadmap",
-             help="Park in the inert Roadmap lane (hashed out with the operator, still not "
-                  "authorized to execute). Authorize it later with `kanban spawn`."),
         _arg("--idempotency-key",
              help="Dedup key. If a non-archived task with this key exists, "
                   "its id is returned instead of creating a duplicate."),
@@ -219,15 +203,6 @@ _SPECS = [
         _arg("--provider", dest="provider_override",
              help="Provider the --model belongs to (passed as --provider <name> to "
                   "the worker). Requires --model."),
-        _arg("--reasoning", dest="reasoning_effort", metavar="LEVEL",
-             help="Pin the worker's thinking depth for this task (passed as --reasoning <level>), "
-                  "independent of --model. Accepts minimal, low, medium, high, xhigh, max, ultra, or "
-                  "'none' to disable thinking; an invalid level is rejected at filing time. Omit to "
-                  "inherit the profile's own agent.reasoning_effort."),
-        _arg("--policy-force", action="store_true",
-             help="Operator-only exception to the unattended model policy; requires --policy-force-reason."),
-        _arg("--policy-force-reason", metavar="REASON",
-             help="Durable justification recorded with --policy-force and bound to this profile/route."),
         _arg("--completion-contract", metavar="CONTRACT",
              help="local-only (default), OWNER/REPO for publication, or exact GitHub PR URL; required CI gates done."),
         _arg("--goal", action="store_true", dest="goal_mode",
@@ -239,9 +214,9 @@ _SPECS = [
         _arg("--goal-max-turns", type=int, metavar="N", dest="goal_max_turns",
              help="Turn budget for --goal workers (default 20). Ignored without --goal."),
         _arg("--initial-status", choices=sorted(kb.VALID_INITIAL_STATUSES), default="running",
-             help="Initial card status. Use 'blocked' only for an immediate human-ops "
-                  "gate (R3); parent-gated work should use --parent normally so it "
-                  "starts in todo and auto-promotes."),
+             help="Initial card status. Use 'blocked' for cards "
+                  "that require immediate human ops (R3 gate) "
+                  "to skip the brief running-to-blocked transition."),
         _json_flag(help="Emit JSON output"),
     ], help="Create a new task"),
     _cmd("swarm", [
@@ -273,25 +248,15 @@ _SPECS = [
     ], aliases=["ls"], help="List tasks"),
     _cmd("show", [_TASK_ID, _json_flag(), *_run_state_args("filter listed runs by task_runs column")],
          help="Show a task with comments + events"),
-    _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)"),
-                    _json_flag(help="Emit a machine-readable JSON error on refusal")],
+    _cmd("assign", [_TASK_ID, _arg("profile", help="Profile name (or 'none' to unassign)")],
          help="Assign or reassign a task"),
     _cmd("set-model", [
         _TASK_ID,
-        _arg("model", nargs="?", help="Model to pin the worker to (or 'none' to clear the override). "
-                                     "Omit entirely if you only want to set --reasoning."),
+        _arg("model", nargs="?", help="Model to pin the worker to (or 'none' to clear the override)"),
         _arg("--provider",
              help="Provider the model belongs to (worker is spawned with "
                   "--provider <name>). Cleared together with the model."),
-        _arg("--reasoning", dest="reasoning_effort", metavar="LEVEL",
-             help="Set (or clear) the task's reasoning effort, independent of the model/provider "
-                  "override: any valid level plus 'none' (thinking off); 'clear'/'default' falls back "
-                  "to the profile's own agent.reasoning_effort. Omit to leave it untouched."),
-        _arg("--policy-force", action="store_true",
-             help="Operator-only policy exception; requires --policy-force-reason."),
-        _arg("--policy-force-reason", metavar="REASON",
-             help="Durable exception reason bound to the current profile and exact route."),
-    ], help="Set or clear a task's model/provider override and/or reasoning effort (takes effect on the next dispatch)"),
+    ], help="Set or clear a task's model/provider override (takes effect on the next dispatch)"),
     _cmd("reclaim", [_TASK_ID, _RECLAIM_REASON], help="Release an active worker claim on a running task"),
     _cmd("reassign", [
         _TASK_ID,
@@ -301,7 +266,7 @@ _SPECS = [
         _RECLAIM_REASON,
     ], help="Reassign a task to a different profile, optionally reclaiming first"),
     _cmd("diagnostics", [
-        _arg("--severity", choices=["info", "warning", "error", "critical"],
+        _arg("--severity", choices=["warning", "error", "critical"],
              help="Only show diagnostics at or above this severity"),
         _arg("--task", help="Only show diagnostics for one task id"),
         _json_flag(help="Emit JSON (structured) instead of the default human table"),
@@ -335,12 +300,18 @@ _SPECS = [
         _arg("--metadata",
              help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                   '"tests_run": 12}\'). Stored on the closing run.'),
+        _arg("--force", action="store_true",
+             help="Override the live-claim guard: complete a running, claimed task "
+                  "even without owning its run (closes the worker's run)."),
     ], help="Mark one or more tasks done"),
     _cmd("edit", [
         _TASK_ID,
-        _arg("--result", required=True, help="Backfilled task result text for a done task"),
+        _arg("--title", help="Replace the task title"),
+        _arg("--body", help="Replace the task body"),
+        _arg("--priority", type=int, help="Replace the task priority"),
+        _arg("--result", help="Backfilled task result text for a done task"),
         *_STEP_HANDOFF,
-    ], help="Edit recovery fields on an already-completed task"),
+    ], help="Edit task fields or recovery fields on an already-completed task"),
     _cmd("block", [
         _TASK_ID,
         _arg("reason", nargs="*", help="Reason (also appended as a comment)"),
@@ -357,27 +328,10 @@ _SPECS = [
         _arg("reason", nargs="*", help="Reason/timing note (also appended as a comment)"),
         _bulk_ids("schedule"),
     ], help="Park one or more tasks in Scheduled (waiting on time, not human input)"),
-    _cmd("hold", [
-        _TASK_ID,
-        _arg("reason", nargs="*", help="Reason/note (also appended as a comment)"),
-        _bulk_ids("hold"),
-    ], help="Shelve one or more tasks in On Hold (a deliberate human pause, not a block or a schedule)"),
     _cmd("unblock", [
         _reason("Optional reason/note — recorded as a comment before unblocking. Quote multi-word reasons."),
         _TASK_IDS,
     ], help="Return blocked/scheduled tasks to ready, or todo while parents remain open"),
-    _cmd("unhold", [
-        _reason("Optional reason/note — recorded as a comment before unholding. Quote multi-word reasons."),
-        _TASK_IDS,
-    ], help="Take one or more tasks off On Hold, returning them to ready (or todo while parents remain open)"),
-    _cmd("refine", [_TASK_IDS], help="Promote wishlist cards from the Idea lane to the Roadmap lane"),
-    _cmd("demote", [_TASK_IDS], help="Send Roadmap cards back to the Idea lane"),
-    _cmd("spawn", [
-        _TASK_IDS,
-        _arg("--to", choices=sorted(kb.ROADMAP_SPAWN_TARGETS), default="triage",
-             help="Where the card lands (default: triage, so auto-decompose can re-specify or "
-                  "split it first; --to ready opts out)"),
-    ], help="Authorize Roadmap cards to execute, landing them in triage (default) or ready"),
     _cmd("request-review", [
         _TASK_ID,
         _arg("--summary", help="What was implemented and how it was verified — shown to the reviewer."),
@@ -385,35 +339,8 @@ _SPECS = [
         _arg("--metadata", help="JSON object with structured reviewer handoff facts."),
         _arg("--force", action="store_true",
              help="Override the live-claim guard: move a running, claimed "
-                  "task to review even without owning its run (clears the worker's claim). "
-                  "Does NOT skip the mergeability preflight."),
-    ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block",
-       description=(
-           "Refuses when the task's worktree cannot merge the board's `land_target`: a "
-           "reviewer cannot adjudicate a branch they cannot merge, and this door is gated "
-           "exactly like the `kanban_request_review` tool. The refusal names the "
-           "conflicting paths and the two commands that fix them, and the task is left "
-           "untouched. The check is skipped when the board has no land_target, the "
-           "workspace is not a git worktree, or git cannot answer; turn it off entirely "
-           "with `kanban.require_mergeable_for_review: false` in config.yaml. Also refuses "
-           "a rework handoff (the card has a changes_requested round since its last "
-           "completion) whose --metadata lacks rework_items=[{item, evidence}], one entry "
-           "per reviewer item (count-checked when the reason is numbered); off switch "
-           "`kanban.require_rework_items_for_review: false`."
-       )),
-    _cmd("approve", [
-        _TASK_ID,
-        _arg("--sha", metavar="COMMIT",
-             help="The reviewed commit. Defaults to the task worktree's HEAD."),
-        _reason("Optional approval note recorded on the run and the event."),
-    ], help="Reviewer verdict: approve the active review, preserving the card for landing",
-       description=(
-           "Records an explicit approval bound to the exact commit reviewed, and leaves the "
-           "card in the review column awaiting `hermes kanban land`. It deliberately does "
-           "NOT complete the card: completion reaps the task worktree, and that tree — plus "
-           "the pushed branch — is the evidence landing re-verifies before it merges. Use "
-           "`hermes kanban complete` instead when a card's life genuinely ends at review."
-       )),
+                  "task to review even without owning its run (clears the worker's claim)."),
+    ], help="Move a task to 'review' (implementation done, awaiting review) — NOT a block"),
     _cmd("request-changes", [_TASK_ID, _arg("reason", nargs="+", help="Concrete changes required before re-review")],
          help="Reviewer verdict: return the active review run to its implementer"),
     _cmd("reopen-review", [
@@ -424,7 +351,6 @@ _SPECS = [
         _TASK_ID,
         _arg("reason", nargs="*", help="Audit-trail reason (recorded on the task_events row)"),
         _bulk_ids("promote"),
-        _arg("--force", action="store_true", help="Promote even if parent dependencies are not yet done/archived"),
         _arg("--dry-run", action="store_true", help="Validate the promotion without mutating state"),
         _arg("--json", dest="json", action="store_true", help="Emit machine-readable JSON result"),
     ], help="Manually move one or more todo/blocked tasks to ready (recovery path)"),
@@ -437,14 +363,6 @@ _SPECS = [
     _cmd("dispatch", [
         _arg("--dry-run", action="store_true", help="Don't actually spawn processes; just print what would happen"),
         _arg("--max", type=int, help="Cap number of spawns this pass"),
-        _arg("--pause", nargs="*", metavar="NOTE",
-             help="Stop this board claiming/spawning new workers (running workers are "
-                  "untouched) so it can drain before a maintenance restart; optional NOTE "
-                  "is recorded on the pause. Clear it with --resume-circuit."),
-        _arg("--resume-circuit", action="store_true",
-             help="Clear this board's dispatch pause after operator recovery and exit"),
-        _arg("--circuit-status", action="store_true",
-             help="Show this board's rate-limit or manual dispatch-safety state and exit"),
         _arg("--failure-limit", type=int, default=kbd.DEFAULT_FAILURE_LIMIT,
              help=f"Auto-block a task after this many consecutive non-success attempts "
                   f"(spawn_failed, timed_out, or crashed; default: {kbd.DEFAULT_FAILURE_LIMIT})"),
@@ -477,6 +395,10 @@ _SPECS = [
              help="Originating source chat_type, recorded so the active-wake delivery "
                   "modes resolve the operator's real session. Omit to leave an "
                   "existing sub unchanged (new subs default to 'dm')."),
+        _arg("--parent-chat-id",
+             help="Parent channel ID for a thread or forum post, used for multiplex profile routing."),
+        _arg("--guild-id",
+             help="Discord guild ID, used for multiplex profile routing."),
         _arg("--notifier-profile",
              help="Profile gateway that owns/delivers this subscription (default: active profile)"),
         # choices: single source of truth shared with the DB/watcher enum.
@@ -512,31 +434,11 @@ _SPECS = [
               "routed to specialist profiles by description. Falls back "
               "to specify-style single-task promotion when the task "
               "doesn't benefit from fan-out. Uses auxiliary.kanban_decomposer."),
-    _cmd("land", [
-        _TASK_IDS,
-        _arg("--target", metavar="REMOTE/BRANCH",
-             help="Merge target as <remote>/<branch>. Overrides the board's land_target; "
-                  "required when the board has none."),
-        _arg("--dry-run", action="store_true",
-             help="Report the verdict for each task and change nothing (not even a fetch)"),
-        _json_flag(help="Emit one JSON object per task with its verdict and reason"),
-    ], help="Land approved review(s): verified merge to the configured target, then close",
-       description=(
-           "Attended, fail-closed landing. For each task it requires an explicit reviewer "
-           "approval verdict, no live worker, satisfied dependencies, a clean and pushed task "
-           "branch on the target's own remote, and verification evidence for that exact "
-           "commit. It then re-reads the target from the remote, merges in a throwaway "
-           "worktree, pushes WITHOUT force, and re-reads the remote to prove the content is "
-           "reachable (or patch-equivalent, so a squash-merged card is recognised as already "
-           "landed). Only after that read-back does it record the receipt, complete and "
-           "archive the card, and hand off to the existing safe worktree cleanup. Any gate "
-           "that cannot be proven refuses with a reason code; there is no override flag. "
-           "Batch mode isolates failures — one refusal never affects another task."
-       )),
     _cmd("gc", [
-        _arg("--event-retention-days", type=int, default=30,
-             help="Delete task_events older than N days for terminal tasks (default: 30)"),
-        _arg("--log-retention-days", type=int, default=30, help="Delete worker log files older than N days (default: 30)"),
+        _arg("--event-retention-days", type=_nonnegative_int, default=30,
+             help="Delete task_events older than N days for terminal tasks (default: 30; 0 disables)"),
+        _arg("--log-retention-days", type=_nonnegative_int, default=30,
+             help="Delete worker log files older than N days (default: 30; 0 disables)"),
     ], help="Garbage-collect archived-task workspaces, old events, and old logs"),
     _cmd("repair", [_json_flag(help="Emit the repair report as JSON")],
          help="Check kanban.db integrity and auto-repair index-only corruption",
@@ -560,8 +462,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         description="Durable SQLite-backed task board shared across Hermes profiles. "
                     "Tasks are claimed atomically, can depend on other tasks, and "
                     "are executed by a named profile in an isolated workspace. "
-                    "See https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban "
-                    "or docs/hermes-kanban-v1-spec.pdf for the full design.",
+                    "See https://hermes-agent.nousresearch.com/docs/user-guide/features/kanban.",
     )
     # --board scopes every subcommand to one board's DB; when omitted the
     # resolution is HERMES_KANBAN_BOARD, then the persisted current-board
@@ -572,5 +473,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                     "HERMES_KANBAN_BOARD env var). Use `hermes kanban boards "
                                     "list` to see all boards.")
     _add_commands(kanban_parser.add_subparsers(dest="kanban_action"), _SPECS)
+    # >>> FORK ANCHOR: anthropic-weekly-cli <<<
+    from hermes_fork.kanban.weekly_usage import add_parser as _weekly_parser
+    _weekly_parser(next(a for a in kanban_parser._actions if isinstance(a, argparse._SubParsersAction)))
+    # <<< FORK ANCHOR >>>
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser

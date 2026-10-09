@@ -1,16 +1,16 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import type { ClientSessionState } from '@/app/types'
 import {
   $selectedStoredSessionId,
+  $sessions,
   _resetSessionOwnerHintsForTests,
   setActiveSessionId,
   setSessionOwnerHint
 } from '@/store/session'
 
+import { stampSecondaryProfileOwner } from './session-event-provenance'
 import {
   $sessionOwnerHoldRevision,
-  $sessionStates,
   $sessionTiles,
   _resetSessionOwnerHoldsForTests,
   foregroundSessionScopes,
@@ -27,59 +27,13 @@ import {
 // it, or a bounded TTL expires. Nothing latches.
 
 afterEach(() => {
-  $sessionStates.set({})
   $sessionTiles.set([])
+  $sessions.set([])
   setActiveSessionId(null)
   $selectedStoredSessionId.set(null)
   _resetSessionOwnerHoldsForTests()
   _resetSessionOwnerHintsForTests({ storage: true })
   vi.useRealTimers()
-})
-
-describe('foregroundSessionScopes: exact selected resume ownership', () => {
-  const owner = { connectionId: 'b', profile: 'desktop-alias', targetProfile: 'analyst' }
-
-  const resumedState = {
-    storedSessionId: 'resumed',
-    ownerRoute: { ...owner, profile: 'analyst' }
-  } as ClientSessionState
-
-  it('pins the captured selected route before state publication, hands off to resumed state, and releases on selection change', () => {
-    setSessionOwnerHint('resumed', owner)
-    $selectedStoredSessionId.set('resumed')
-    expect(foregroundSessionScopes()).toEqual(new Set(['conn:b::desktop-alias']))
-    setActiveSessionId('rt-resumed')
-    $sessionStates.set({ 'rt-resumed': resumedState })
-    expect(foregroundSessionScopes()).toEqual(new Set(['conn:b::desktop-alias']))
-    // A hint can be absent; the exact owner stamped by resume is also proof.
-    _resetSessionOwnerHintsForTests({ storage: true })
-    expect(foregroundSessionScopes()).toEqual(new Set(['conn:b::analyst']))
-    $selectedStoredSessionId.set('different')
-    expect(foregroundSessionScopes()).toEqual(new Set())
-    $selectedStoredSessionId.set(null)
-    expect(foregroundSessionScopes()).toEqual(new Set())
-  })
-
-  it('rejects unknown and foreign state rather than deriving an ambient or all-cache keep-set', () => {
-    setActiveSessionId('rt-resumed')
-    $selectedStoredSessionId.set('different')
-    $sessionStates.set({ 'rt-resumed': resumedState, background: resumedState })
-    expect(foregroundSessionScopes()).toEqual(new Set())
-    $selectedStoredSessionId.set('resumed')
-    $sessionStates.set({ 'rt-resumed': { ...resumedState, ownerRoute: undefined } })
-    expect(foregroundSessionScopes()).toEqual(new Set())
-    // A newer captured route wins over a colliding old runtime's owner.
-    setSessionOwnerHint('resumed', { connectionId: 'c', profile: 'analyst' })
-    $sessionStates.set({ 'rt-resumed': resumedState })
-    recordSessionEventScope({ connectionId: 'b', profile: 'analyst', session_id: 'rt-resumed' })
-    expect(foregroundSessionScopes()).toEqual(new Set(['conn:c::analyst']))
-    _resetSessionOwnerHintsForTests({ storage: true })
-    setSessionOwnerHint('resumed', owner)
-    setSessionOwnerHint('resumed', { connectionId: 'c', profile: 'analyst' })
-    $sessionStates.set({})
-    setActiveSessionId('rt-unknown')
-    expect(foregroundSessionScopes()).toEqual(new Set())
-  })
 })
 
 describe('foregroundSessionScopes: owner hold across the create → foreground gap', () => {
@@ -179,5 +133,40 @@ describe('foregroundSessionScopes: owner hold across the create → foreground g
     holdSessionOwnerUntilForeground('stored-legacy', 'research')
 
     expect(foregroundSessionScopes()).toEqual(new Set(['research']))
+  })
+
+  it('names the local secondary profile when a foreground session is active on it (#121865)', () => {
+    const event = stampSecondaryProfileOwner({ session_id: 'rt-jody' } as never, 'jody')
+    recordSessionEventScope(event)
+    setActiveSessionId('rt-jody')
+
+    expect(foregroundSessionScopes()).toEqual(new Set(['jody']))
+  })
+
+  it('names the local secondary profile for an active session whose owner is known before events arrive (#121865)', () => {
+    $sessions.set([{ id: 'stored-jody', profile: 'jody' }] as never)
+    $selectedStoredSessionId.set('stored-jody')
+    setActiveSessionId('rt-jody-idle')
+
+    expect(foregroundSessionScopes()).toEqual(new Set(['jody']))
+  })
+
+  it('names the local secondary profile for an active session whose hint was stamped at open (#121865)', () => {
+    setSessionOwnerHint('stored-hinted', { connectionId: 'local', mode: 'local' as const, profile: 'jody' })
+    $selectedStoredSessionId.set('stored-hinted')
+    setActiveSessionId('rt-hinted-idle')
+
+    expect(foregroundSessionScopes()).toEqual(new Set(['conn:local::jody']))
+  })
+
+  it('does not name unrelated secondary profiles when another session is active (#121865)', () => {
+    $sessions.set([
+      { id: 'stored-jody', profile: 'jody' },
+      { id: 'stored-other', profile: 'unrelated' }
+    ] as never)
+    $selectedStoredSessionId.set('stored-jody')
+    setActiveSessionId('rt-jody')
+
+    expect(foregroundSessionScopes()).toEqual(new Set(['jody']))
   })
 })

@@ -111,10 +111,41 @@ def test_add_list_get_delete_attachment(kanban_home, tmp_path):
         conn.close()
 
 
+
 def test_delete_attachment_missing_returns_none(kanban_home):
     conn = kbc.connect()
     try:
         assert kb.delete_attachment(conn, 999999) is None
+    finally:
+        conn.close()
+
+
+def test_delete_attachment_keeps_blob_referenced_by_another_row(kanban_home):
+    conn = kbc.connect()
+    try:
+        task_id = _make_task(conn)
+        blob = kb.task_attachments_dir(task_id) / "shared.txt"
+        blob.parent.mkdir(parents=True, exist_ok=True)
+        blob.write_bytes(b"shared attachment")
+
+        first_id = kb.add_attachment(
+            conn,
+            task_id,
+            filename="first.txt",
+            stored_path=str(blob),
+            size=blob.stat().st_size,
+        )
+        second_id = kb.add_attachment(
+            conn,
+            task_id,
+            filename="second.txt",
+            stored_path=str(blob),
+            size=blob.stat().st_size,
+        )
+
+        assert kb.delete_attachment(conn, first_id) is not None
+        assert blob.exists(), "a surviving attachment row must keep its shared blob"
+        assert kb.get_attachment(conn, second_id) is not None
     finally:
         conn.close()
 
@@ -227,85 +258,6 @@ def test_download_unknown_attachment_404(client):
 
 
 # ---------------------------------------------------------------------------
-# GET /attachments/{id}/data-url — inline base64 rendering (#cae4c2ba)
-# ---------------------------------------------------------------------------
-
-
-def test_attachment_data_url_roundtrip(client):
-    task_id = _create_task_via_api(client)
-    png_bytes = b"\x89PNG\r\n\x1a\nfake-png-body"
-
-    r = client.post(
-        f"/api/plugins/kanban/tasks/{task_id}/attachments",
-        files={"file": ("pic.png", png_bytes, "image/png")},
-    )
-    assert r.status_code == 200, r.text
-    att_id = r.json()["attachment"]["id"]
-
-    r = client.get(f"/api/plugins/kanban/attachments/{att_id}/data-url")
-    assert r.status_code == 200, r.text
-    body = r.json()
-    assert body["content_type"] == "image/png"
-    assert body["size"] == len(png_bytes)
-
-    import base64
-
-    prefix = "data:image/png;base64,"
-    assert body["data_url"].startswith(prefix)
-    assert base64.b64decode(body["data_url"][len(prefix):]) == png_bytes
-
-
-def test_attachment_data_url_unknown_attachment_404(client):
-    r = client.get("/api/plugins/kanban/attachments/424242/data-url")
-    assert r.status_code == 404
-
-
-def test_attachment_data_url_missing_file_on_disk_404(client):
-    """DB row present but the blob was deleted out from under it (or never
-    written) must 404 gracefully, never crash (#cae4c2ba: broken/missing
-    images handled gracefully)."""
-    task_id = _create_task_via_api(client)
-    r = client.post(
-        f"/api/plugins/kanban/tasks/{task_id}/attachments",
-        files={"file": ("pic.png", b"x", "image/png")},
-    )
-    att_id = r.json()["attachment"]["id"]
-
-    conn = kbc.connect()
-    try:
-        att = kb.get_attachment(conn, att_id)
-        Path(att.stored_path).unlink()
-    finally:
-        conn.close()
-
-    r = client.get(f"/api/plugins/kanban/attachments/{att_id}/data-url")
-    assert r.status_code == 404
-
-
-def test_attachment_data_url_oversized_returns_413(client):
-    task_id = _create_task_via_api(client)
-    r = client.post(
-        f"/api/plugins/kanban/tasks/{task_id}/attachments",
-        files={"file": ("pic.png", b"x", "image/png")},
-    )
-    att_id = r.json()["attachment"]["id"]
-
-    conn = kbc.connect()
-    try:
-        att = kb.get_attachment(conn, att_id)
-        # Overwrite the on-disk blob past the inline-render cap without
-        # actually writing 12MB of test data over the wire.
-        with open(att.stored_path, "wb") as f:
-            f.seek(13 * 1024 * 1024)
-            f.write(b"\0")
-    finally:
-        conn.close()
-
-    r = client.get(f"/api/plugins/kanban/attachments/{att_id}/data-url")
-    assert r.status_code == 413
-
-
-# ---------------------------------------------------------------------------
 # Shared helper — store_attachment_bytes (used by dashboard + tool + CLI)
 # ---------------------------------------------------------------------------
 
@@ -371,5 +323,3 @@ def test_cli_attach_attachments_and_rm(kanban_home, tmp_path):
         assert kb.list_attachments(conn, task_id) == []
     finally:
         conn.close()
-
-

@@ -21,6 +21,7 @@ import { CopyButton } from '@/components/ui/copy-button'
 import { Input } from '@/components/ui/input'
 import { PaneStripGlyph } from '@/components/ui/pane-tab'
 import { useI18n } from '@/i18n'
+import { isSubmitEnter } from '@/lib/ime'
 import { ANNOTATE_BLUE } from '@/lib/preview-annotate'
 import { cn } from '@/lib/utils'
 
@@ -33,22 +34,18 @@ interface PreviewBrowserBarProps {
   devToolsOpen: boolean
   loading: boolean
   onBack: () => void
+  /** The pane's Close — the one visible way out of a full-width Browser. */
+  onClose?: () => void
   onFlushComments?: () => void
   onForward: () => void
   onNavigate: (url: string) => void
   onOpenExternal?: () => void
   onPopIn?: () => void
   onPopOut?: () => void
-  /** Omitted where there is no guest: the page lives in a real browser tab,
-   *  which reloads itself; a reload button here would act on nothing. */
-  onReload?: () => void
+  onReload: () => void
   onToggleAnnotate?: () => void
-  /** Omitted where there is no guest to read a console from (the web build):
-   *  the panel it toggles is fed by the webview's `console-message` event, so
-   *  the button would be a control over nothing. */
-  onToggleConsole?: () => void
-  /** Omitted for the same reason — DevTools is `webview.openDevTools()`. */
-  onToggleDevTools?: () => void
+  onToggleConsole: () => void
+  onToggleDevTools: () => void
   /** The page's CURRENT address (it moves as the user navigates), not the
    *  target the tab was opened with. */
   url: string
@@ -108,6 +105,7 @@ export function PreviewBrowserBar({
   devToolsOpen,
   loading,
   onBack,
+  onClose,
   onFlushComments,
   onForward,
   onNavigate,
@@ -164,13 +162,11 @@ export function PreviewBrowserBar({
         label={copy.goForward}
         onSelect={onForward}
       />
-      {onReload ? (
-        <PaneStripGlyph
-          icon={<Codicon name="refresh" size="0.8125rem" spinning={loading} />}
-          label={copy.reload}
-          onSelect={onReload}
-        />
-      ) : null}
+      <PaneStripGlyph
+        icon={<Codicon name="refresh" size="0.8125rem" spinning={loading} />}
+        label={copy.reload}
+        onSelect={onReload}
+      />
       {/* The copy control lives INSIDE the field, on its right edge — the
           same pre-faded inline icon code blocks use, not a toolbar button.
           It copies what the field shows: on a remote gateway, that is the
@@ -199,7 +195,7 @@ export function PreviewBrowserBar({
             event.currentTarget.select()
           }}
           onKeyDown={event => {
-            if (event.key === 'Enter') {
+            if (isSubmitEnter(event)) {
               commit(event.currentTarget.value)
               event.currentTarget.blur()
             }
@@ -269,22 +265,24 @@ export function PreviewBrowserBar({
           onSelect={onOpenExternal}
         />
       ) : null}
-      {onToggleConsole ? (
-        <PaneStripGlyph
-          active={consoleOpen}
-          icon={<Codicon name="terminal" size="0.8125rem" />}
-          label={consoleOpen ? copy.hideConsole : copy.showConsole}
-          onSelect={onToggleConsole}
-        />
-      ) : null}
-      {onToggleDevTools ? (
-        <PaneStripGlyph
-          active={devToolsOpen}
-          icon={<Codicon name="bug" size="0.8125rem" />}
-          label={devToolsOpen ? copy.hideDevTools : copy.openDevTools}
-          onSelect={onToggleDevTools}
-        />
-      ) : null}
+      <PaneStripGlyph
+        active={consoleOpen}
+        icon={<Codicon name="terminal" size="0.8125rem" />}
+        label={consoleOpen ? copy.hideConsole : copy.showConsole}
+        onSelect={onToggleConsole}
+      />
+      <PaneStripGlyph
+        active={devToolsOpen}
+        icon={<Codicon name="bug" size="0.8125rem" />}
+        label={devToolsOpen ? copy.hideDevTools : copy.openDevTools}
+        onSelect={onToggleDevTools}
+      />
+      {/* The last glyph is the way OUT: a Browser that filled the layout has
+          no strip ✕ in reach, and the only other close is asking the agent
+          (#92500). Same verb the tab carries — the pane routes it. */}
+      {onClose && (
+        <PaneStripGlyph icon={<Codicon name="close" size="0.8125rem" />} label={t.common.close} onSelect={onClose} />
+      )}
     </div>
   )
 }

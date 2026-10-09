@@ -23,6 +23,30 @@ describe('profile-scoped approval mode cache', () => {
     expect(approvalModeForProfile('default')).toBe('manual')
   })
 
+  it('scopes reads and writes to the named profile so a non-launch profile is not misrouted', async () => {
+    const readWork = vi.fn(async () => ({ value: 'off' }))
+    await syncApprovalModeForProfile(readWork, 'work')
+    expect(readWork).toHaveBeenCalledWith('config.get', { key: 'approvals.mode', profile: 'work' })
+
+    const writeWork = vi.fn(async () => ({ value: 'manual' }))
+    await setApprovalModeForProfile(writeWork, 'work', 'manual')
+    expect(writeWork).toHaveBeenCalledWith('config.set', {
+      key: 'approvals.mode',
+      value: 'manual',
+      profile: 'work'
+    })
+  })
+
+  it('omits the profile param for a blank profile so the backend keeps its launch scope', async () => {
+    const request = vi.fn(async () => ({ value: 'smart' }))
+    await syncApprovalModeForProfile(request, '   ')
+    expect(request).toHaveBeenCalledWith('config.get', { key: 'approvals.mode' })
+
+    const write = vi.fn(async () => ({ value: 'off' }))
+    await setApprovalModeForProfile(write, '', 'off')
+    expect(write).toHaveBeenCalledWith('config.set', { key: 'approvals.mode', value: 'off' })
+  })
+
   it('keeps profile values isolated', async () => {
     await syncApprovalModeForProfile(
       vi.fn(async () => ({ value: 'manual' })),
@@ -36,29 +60,6 @@ describe('profile-scoped approval mode cache', () => {
     expect(approvalModeForProfile('work')).toBe('manual')
     expect(approvalModeForProfile('personal')).toBe('off')
     expect(approvalModeForProfile('default')).toBe('smart')
-  })
-
-  it('asks the backend for the SAME profile it caches under', async () => {
-    // Regression: approval mode is profile-scoped config and one backend
-    // serves every profile, so an unscoped read answered for whichever
-    // profile launched that backend. A profile configured `smart` therefore
-    // settled to the launch profile's `manual` right after session start.
-    const request = vi.fn(async () => ({ value: 'smart' }))
-    await syncApprovalModeForProfile(request, 'work')
-
-    expect(request).toHaveBeenCalledWith('config.get', { key: 'approvals.mode', profile: 'work' })
-
-    // A mode change during the session must write back to that same profile,
-    // or the next sync reverts the menu and another profile's policy changed.
-    const write = vi.fn(async () => ({ value: 'off' }))
-    await setApprovalModeForProfile(write, 'work', 'off')
-
-    expect(write).toHaveBeenCalledWith('config.set', {
-      key: 'approvals.mode',
-      profile: 'work',
-      value: 'off'
-    })
-    expect(approvalModeForProfile('work')).toBe('off')
   })
 
   it('rolls consecutive failed writes back to the last authoritative value', async () => {

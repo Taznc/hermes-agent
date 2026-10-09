@@ -50,10 +50,7 @@ export function getToolsetModels(
 
   return window.hermesDesktop.api<ToolsetModelsResponse>({
     ...capabilityScoped(profile),
-    path: `/api/tools/toolsets/${encodeURIComponent(name)}/models${suffix}`,
-    // Live model listing against the provider — well past the 30s default
-    // fetch timeout.
-    timeoutMs: 60_000
+    path: `/api/tools/toolsets/${encodeURIComponent(name)}/models${suffix}`
   })
 }
 
@@ -112,16 +109,19 @@ export function runToolsetPostSetup(
   })
 }
 
-export function getTerminalBackends(): Promise<TerminalBackendsResponse> {
-  return hermesApi<TerminalBackendsResponse>({
-    ...profileScoped(),
+export function getTerminalBackends(profile?: ProfileScope): Promise<TerminalBackendsResponse> {
+  return window.hermesDesktop.api<TerminalBackendsResponse>({
+    ...capabilityScoped(profile),
     path: '/api/tools/terminal/backends'
   })
 }
 
-export function selectTerminalBackend(backend: string): Promise<{ ok: boolean; backend: string }> {
-  return hermesApi<{ ok: boolean; backend: string }>({
-    ...profileScoped(),
+export function selectTerminalBackend(
+  backend: string,
+  profile?: ProfileScope
+): Promise<{ ok: boolean; backend: string }> {
+  return window.hermesDesktop.api<{ ok: boolean; backend: string }>({
+    ...capabilityScoped(profile),
     path: '/api/tools/terminal/backend',
     method: 'PUT',
     body: { backend }

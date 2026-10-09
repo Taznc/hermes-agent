@@ -36,7 +36,6 @@ For Hermes profile lanes, the dispatcher's `_default_spawn` runs `hermes -p <ass
 |---|---|
 | `HERMES_KANBAN_TASK` | the task id the worker is operating on |
 | `HERMES_KANBAN_DB` | absolute path to the per-board SQLite file |
-| `HERMES_KANBAN_PIN_HOME` | the kanban home those pins are valid under (a probe/test that re-declares a different `HERMES_HOME` gets its own sandbox instead of the live board) |
 | `HERMES_KANBAN_BOARD` | board slug |
 | `HERMES_KANBAN_WORKSPACES_ROOT` | root of the board's workspace tree |
 | `HERMES_KANBAN_WORKSPACE` | absolute path to *this* task's workspace |
@@ -56,6 +55,9 @@ children remain fenced even when a script removes the inherited task ID: CLI and
 tool mutations are rejected, rather than treating that script as an orchestrator.
 Board/database routing and workspace paths are retained. Descendants can read an
 existing board without running schema migrations; its owner must initialize it.
+The fence is scoped to the lineage's board root (the marker's value is that root, plus the
+dispatcher-pinned `HERMES_KANBAN_DB`): a descendant that works against a different Kanban
+home — a test or reproduction under a scratch `HERMES_HOME` — gets a normal read-write board.
 
 The dispatcher explicitly grants a newly assigned worker its own scope. The managed
 Hermes-tools MCP endpoint can likewise act for its supervising worker, while the
@@ -130,8 +132,8 @@ So lane authors don't have to reimplement these:
 - **Crashed worker** — a worker whose host-local PID has vanished is detected by `detect_crashed_workers` and reaped; the task increments `consecutive_failures` and may auto-block when the breaker trips.
 - **Run-level retry** — when a task is retried (post-block, post-crash, post-reclaim), the worker can use the `expected_run_id` parameter on terminating tools to fail fast if its own run was already superseded.
 - **Per-task max runtime** — `task.max_runtime_seconds` hard-caps wall-clock time per run, regardless of PID liveness. Catches genuinely-deadlocked workers that the live-PID extension would otherwise keep running.
-- **Stranded-task detection** — a ready task whose assignee never produces a claim within `kanban.stranded_threshold_seconds` (default 30 min) shows up in `hermes kanban diagnostics` as a `stranded_in_ready` warning. Severity escalates to error at 2x the threshold and critical at 6x. Catches typo'd assignees, deleted profiles, and down external worker pools in one signal — identity-agnostic, no per-board allowlist to curate. Suppressed while the dispatcher's own respawn guard (below) is holding the task — a guarded card is not a stranded one and needs a different fix.
-- **Respawn guard visibility** — a ready/review task the dispatcher deliberately declines to (re)spawn (`blocker_auth`, `recent_success`, `rate_limit_cooldown`, `active_pr`) surfaces as a `respawn_guarded` warning naming the reason, instead of presenting as an unexplained `stranded_in_ready` case. `active_pr` only fires for a GitHub PR URL posted by the task's OWN assignee whose owner/repo matches the task's own repo (when resolvable) — an unrelated PR link (prior art, "see also") never guards.
+- **Stranded-task detection** — a ready task whose assignee never produces a claim within `kanban.stranded_threshold_seconds` (default 30 min) shows up in `hermes kanban diagnostics` as a `stranded_in_ready` warning. Severity escalates to error at 2x the threshold and critical at 6x. Catches typo'd assignees, deleted profiles, and down external worker pools in one signal — identity-agnostic, no per-board allowlist to curate.
+- **Running with open parents** — a `running` card whose direct parent is not `done`/`archived` (the parent reopened mid-run, or the link predates the running-child refusal) shows a `running_with_open_parents` warning: the dependency gate is not serialising the two runs and `kanban_complete` will be refused until the parent finishes. Read-only; suggests `hermes kanban unlink`.
 - **Legacy review dependency deadlock** — a parent sticky-blocked with `review-required:` while one or more direct children remain dependency-gated in `todo` produces an immediate `review_dependency_deadlock` error. The diagnostic is read-only: it suggests completing the finished phase or unlinking the incorrect edge but never removes a user block automatically.
 
 ## Related
