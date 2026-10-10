@@ -2404,6 +2404,10 @@ def cmd_update(args):
     from hermes_cli.update_owning_install import retarget_to_owning_install
 
     retarget_to_owning_install(PROJECT_ROOT)
+    # >>> FORK ANCHOR: update-pin <<<
+    from hermes_fork.update_pin import enforce_update_pin
+    enforce_update_pin(args, PROJECT_ROOT)
+    # <<< FORK ANCHOR >>>
     if _update_preflight_handled(args):
         return
     gateway_mode = getattr(args, "gateway", False)

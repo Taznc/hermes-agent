@@ -396,6 +396,10 @@ def check_for_updates(*, install_root: Path | None = None, home: Path | None = N
     config = require_readable_config_before_write(home / "config.yaml")
     if passive and (config.get("updates") or {}).get("check") is False:
         return {**result, "reason": "disabled"}
+    # >>> FORK ANCHOR: update-pin-check <<<
+    from hermes_fork.update_pin import pinned_check_target
+    branch, channel = pinned_check_target(root, branch, channel, git=git)
+    # <<< FORK ANCHOR >>>
     channel = resolve_update_channel(config, root) if channel is None else validate_name(channel)
     co = _read_checkout(root, git, embedded)
     desktop_config = _read_json(branch_config_path) if branch_config_path else None

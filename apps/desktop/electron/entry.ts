@@ -9,6 +9,11 @@ import { readDesktopLaunchConfig } from './renderer-heap-flags'
 import { wslgLaunchArgs } from './wslg-launch'
 import { spawnWslgLaunch } from './wslg-launch-process'
 
+// >>> FORK ANCHOR: desktop-env-lockdown <<<
+const { lockDesktopEnv } = await import('./fork/env-lockdown')
+lockDesktopEnv(process.env, app.isPackaged)
+// <<< FORK ANCHOR >>>
+
 function configuredElectronFlags(env: NodeJS.ProcessEnv): string[] {
   // Resolve the home exactly like main.ts does, through the shared resolver:
   // HERMES_DATA_DIR_SUFFIX channel installs and profiles/-rooted HERMES_HOME
