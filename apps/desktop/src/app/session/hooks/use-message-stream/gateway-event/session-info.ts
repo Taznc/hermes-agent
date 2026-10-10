@@ -1,3 +1,5 @@
+// >>> FORK ANCHOR: stale-interrupt-release <<<
+import { releaseStoppedTurnLatch } from '@/fork/stale-interrupt'
 import { finalizeInterruptedMessages } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { modelOptionsQueryKey } from '@/lib/model-options'
@@ -169,6 +171,8 @@ export function handleSessionInfoEvent(ctx: GatewayEventContext): boolean {
     // not used as a timeout-like guess, so genuine compaction stays visible.
     if (sessionId && payload?.running === false) {
       reconcileSessionCompacting(sessionId, 'terminal')
+      // >>> FORK ANCHOR: stale-interrupt-release <<<
+      releaseStoppedTurnLatch(sessionId, updateSessionState)
     }
 
     // The backend stamps model/provider (as strings) on EVERY session.info,
