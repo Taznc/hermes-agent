@@ -133,6 +133,14 @@ def _install_gateway_seams(server) -> None:
             raise
         logger.exception("config cache adapter failed to install; retaining upstream raw config handling")
 
+    try:
+        from hermes_fork.gateway.session_surface import install as install_session_surface
+        install_session_surface(server)
+    except Exception:
+        if _contracts.STRICT:
+            raise
+        logger.exception("resume surface fix failed to install; resumes fall back to the process env")
+
 
 def _rpc_handler(method: ForkMethod):
     def handle(rid, params: dict) -> dict:
