@@ -4,7 +4,7 @@ mcp 2.x validates the raw ``tools/list`` result with pydantic in lax mode, which
 
 * fail-open: a coercible non-bool ``readOnlyHint`` (``"yes"``, ``"true"``, ``1``, ``1.0``) parses as
   ``True``. After parsing it looks exactly like an honest ``True``, so a tool on a ``trust: untrusted``
-  server skips the approval gate (``hermes_fork.mcp_hints.read_only_hint`` only sees the parsed value);
+  server skips the approval gate (``tools.mcp_tool_registration._annotation_read_only_hint`` only sees the parsed value);
 * availability: an uncoercible value (``""``, ``2``, ``[1]``, ``{}``) in any annotation field, a
   non-string ``title``, or a non-object ``annotations`` raises ``ValidationError`` for the WHOLE list.
   The server never connects (parked after the retry budget) and a post-connect refresh fails.

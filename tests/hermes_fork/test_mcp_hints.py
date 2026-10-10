@@ -1,5 +1,6 @@
-"""mcp 2.x readOnlyHint reading (upstream #121042, T2 anchor: ``mcp-read-only-hint`` in
-``tools.mcp_tool_registration._annotation_read_only_hint``).
+"""mcp 2.x readOnlyHint reading (upstream #121042; fixed upstream in ca398ea39e, fork anchor
+``mcp-read-only-hint`` retired at the 2026-10-09 sync). Kept as a regression contract on
+``tools.mcp_tool_registration._annotation_read_only_hint``.
 
 Under mcp 2.0.0 ``mcp.types.Tool.annotations`` is a ``ToolAnnotations`` pydantic model whose
 only accessible attribute is snake_case ``read_only_hint`` — the SDK does not expose a

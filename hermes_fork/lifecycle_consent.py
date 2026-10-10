@@ -323,9 +323,6 @@ def _decide(command: str, desc: str) -> dict:
     is_dangerous, _key, other = _det().detect_dangerous_command(command)
     if is_dangerous and other != desc:
         findings.append(other)
-    tirith = A._tirith_scan(command)
-    if tirith.get("action") in {"block", "warn"}:
-        findings.append(A._format_tirith_description(tirith))
     description = "; ".join(findings) + " [lifecycle: one-shot approval only]"
     # The per-request nonce key keeps two identical prompts from coalescing, so each run needs its
     # own approval.

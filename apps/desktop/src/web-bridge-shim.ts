@@ -1249,6 +1249,9 @@ const shim = {
   openExternal: async (url: string) => {
     window.open(url, '_blank', 'noopener,noreferrer')
   },
+  // Uninstall settings call this unguarded for a win32 managed install; a tab cannot open
+  // ms-settings: on the server's host, so it is inert rather than a TypeError.
+  openAppsSettings: async () => {},
   // writeClipboard deliberately OMITTED → installClipboardShim early-returns,
   // native navigator.clipboard stays in charge.
   readClipboard: async () => {
