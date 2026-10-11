@@ -5,7 +5,7 @@ process holding the ``serve`` host lock when it looks like a dead session's orph
 with no recorded spawner, reparented to init, older than 180 s and claimed by no Desktop SSH lock.
 Every system-level service matches that shape: systemd is PID 1, so its MainPID has ppid 1 and was
 never spawned by a Hermes session. On this fork's host two units share ``HERMES_HOME``
-(``hermes-dashboard-next`` and ``hermes-webdesktop-next-backend``), so whichever restarts second
+(``hermes-dashboard`` and ``hermes-webdesktop-backend``), so whichever restarts second
 SIGTERMs the other. The victim exits cleanly, ``Restart=on-failure`` ignores it, and the web
 Desktop stays down (2026-10-07 02:05 and 2026-10-08 00:57 UTC).
 

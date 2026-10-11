@@ -4,12 +4,12 @@ Reached from ONE upstream line: the ``dispatcher-standby`` FORK ANCHOR at the
 top of ``gateway.kanban_watchers.GatewayKanbanWatchersMixin._kanban_dispatcher_watcher``.
 The upstream body after that anchor (and ``_kanban_dispatcher_boot``) is
 unreachable while the anchor is present; it is kept as the reference this module
-ports. Upstream-sync owner: when a ``next`` <- ``upstream/main`` merge touches
+ports. Upstream-sync owner: when a ``dev`` <- ``upstream/main`` merge touches
 ``gateway/kanban_watchers.py`` or ``gateway/kanban_watchers_dispatcher.py``,
 diff that dispatcher body and port behaviour changes here.
 ``test_anchor_routes_watcher_to_fork_runtime`` proves the anchor is live.
 
-What this changes relative to upstream ``next``:
+What this changes relative to the upstream baseline:
 
 * Standby instead of permanent exit. Upstream returns forever when another
   gateway holds the machine-global ``<kanban_home>/kanban/.dispatcher.lock``, so
@@ -52,7 +52,7 @@ names the writing watcher run. A reader must check ``pid`` is alive and
 ``written_at`` is fresh: a crashed leader leaves its last record until a
 standby promotes and overwrites it.
 
-Ported from frozen ``dev`` f6cfcb0bb8 (standby) and 7175e94c81 (telemetry),
+Ported from legacy fork f6cfcb0bb8 (standby) and 7175e94c81 (telemetry),
 re-implemented at T1 instead of inline. Not ported: dev's per-tick live settings
 reload (``_reload_dispatcher_settings``) and the gateway.heartbeat integration;
 both need further upstream anchors.

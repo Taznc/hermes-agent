@@ -2,7 +2,7 @@
 
 The startup pruner (``hermes_cli.worktree_ops._prune_stale_worktrees``, run by ``hermes``/TUI
 launch and the cron tick) reaps clean, fully-pushed trees under ``<repo>/.worktrees/``. A served
-or hand-managed checkout looks exactly like that (the 2026-09-27 incident removed a served ``next``
+or hand-managed checkout looks exactly like that (the 2026-09-27 incident removed a served fork
 tree with every guard passing). This module adds ownership on top of upstream's gates:
 
 * Creation marks: ``hermes -w`` (``_setup_worktree``) and subagent worktrees write
@@ -39,7 +39,7 @@ PRUNE_OWNER_FILE = "hermes-prune-owner.json"
 # Branch prefixes Hermes itself mints for scratch worktrees under ``.worktrees/``:
 # ``hermes/`` (``hermes -w``), ``hermes-subagent/`` (subagent isolation), ``wt/`` (kanban
 # default) and ``pr-`` (review checkouts). The pruner requires BOTH this prefix and a creation
-# marker. A tree on anything else — a trunk such as ``main``/``next``, a user's feature branch, a
+# marker. A tree on anything else — a trunk such as ``main``/``dev``, a user's feature branch, a
 # detached HEAD — was not created by Hermes for scratch use: preserved, never guessed.
 HERMES_OWNED_BRANCH_PREFIXES = ("hermes/", "hermes-subagent/", "wt/", "pr-")
 

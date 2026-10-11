@@ -1,7 +1,7 @@
 """``hermes_fork.supervised_owner``: the host-owner reclaim rung spares systemd-supervised backends.
 
-Regression for 2026-10-08 00:57 UTC: a restarted ``hermes-dashboard-next`` reaped the ~2 h old
-``hermes-webdesktop-next-backend`` (null spawner, ppid 1, no SSH lock) through
+Regression for 2026-10-08 00:57 UTC: a restarted dashboard reaped the ~2 h old
+web-desktop backend (null spawner, ppid 1, no SSH lock) through
 ``reap_orphaned_backend_owner``, and the backend stayed down.
 """
 
@@ -54,14 +54,14 @@ def _reap(entry, *, unit):
 
 
 def test_spares_null_spawner_owner_supervised_by_systemd():
-    result, kills = _reap(_entry(555, 1000.0), unit="hermes-webdesktop-next-backend.service")
+    result, kills = _reap(_entry(555, 1000.0), unit="hermes-webdesktop-backend.service")
     assert (result, kills) == (None, [])
 
 
 def test_spares_dead_spawner_owner_supervised_by_systemd():
     # A dead recorded spawner doesn't matter: systemd still owns the process.
     result, kills = _reap(_entry(555, 1000.0, spawner_pid=700, spawner_create=7.0),
-                          unit="hermes-dashboard-next.service")
+                          unit="hermes-dashboard.service")
     assert (result, kills) == (None, [])
 
 

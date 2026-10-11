@@ -54,7 +54,7 @@ def test_anchor_is_the_registered_entry_point(server):
 def test_server_import_registers_fork_ping_with_a_contract(server):
     assert "fork.ping" in server._methods
     contract = registry.METHODS["fork.ping"]
-    assert contract.result.model_validate({"ok": True, "branch": "next"})
+    assert contract.result.model_validate({"ok": True, "branch": "dev"})
     # The anchor keeps the catalog whole: no fork method without a contract, no orphan contract.
     fork_names = {n for n in server._methods if n.startswith(fork_gateway.FORK_PREFIX)}
     assert fork_names == {n for n in registry.METHODS if n.startswith(fork_gateway.FORK_PREFIX)}
@@ -62,7 +62,7 @@ def test_server_import_registers_fork_ping_with_a_contract(server):
 
 def test_fork_ping_round_trips_through_dispatch(server):
     resp = server.dispatch({"jsonrpc": "2.0", "id": 7, "method": "fork.ping", "params": {}})
-    assert resp == {"jsonrpc": "2.0", "id": 7, "result": {"ok": True, "branch": "next"}}
+    assert resp == {"jsonrpc": "2.0", "id": 7, "result": {"ok": True, "branch": "dev"}}
 
 
 def test_fork_ping_contract_is_enforced_at_admission(server):

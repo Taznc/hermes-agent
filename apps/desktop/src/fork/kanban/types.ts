@@ -52,7 +52,7 @@ export interface ResolvedLink {
   missing: boolean
 }
 
-/** Dev's wishlist lanes. `next` has no roadmap lanes (C03 `roadmap-sync`
+/** Dev's wishlist lanes. `dev` has no roadmap lanes (C03 `roadmap-sync`
  *  covers them out of tree), but a card that carries one of these statuses
  *  must still never read as gating anything, so the constant stays. */
 export const ROADMAP_LANES = ['idea', 'roadmap'] as const

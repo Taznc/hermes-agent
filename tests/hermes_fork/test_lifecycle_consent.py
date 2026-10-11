@@ -19,9 +19,9 @@ from tools import approval_context as ctx
 from tools import approval_gateway_wait as wait_mod
 
 SK = "lifecycle-test"
-RESTART = "systemctl --user restart hermes-gateway-next"
+RESTART = "systemctl --user restart hermes-gateway"
 LIFECYCLE = [
-    RESTART, "sudo systemctl stop nginx", "systemctl reload nginx", "systemctl --user kill hermes-gateway-next",
+    RESTART, "sudo systemctl stop nginx", "systemctl reload nginx", "systemctl --user kill hermes-gateway",
     "service nginx restart", "hermes gateway restart", "reboot", "sudo reboot", "shutdown -h now",
     "systemctl reboot", "init 6", "bash -c 'systemctl --user stop x'", "systemctl re\"start\" x",
     "sudo -u root reboot", "su -c 'systemctl restart x'", "echo $(systemctl restart x)",

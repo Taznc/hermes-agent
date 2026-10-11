@@ -1,6 +1,6 @@
 """Fork-owned review routing at dispatch admission (tier T1, see FORK.md).
 
-Upstream ``next`` has two review-loop gaps this module closes:
+Upstream has two review-loop gaps this module closes:
 
 * A first ``request_review`` without ``reviewer=`` leaves the card on its
   implementer, so the review lane spawns the implementer to review its own
@@ -55,8 +55,8 @@ only per-tick pre-lane seam instead: the ``start-budget`` anchor
 after reclaim/promotion and before lanes are enumerated, so a returned card
 dispatches in the same tick and no new upstream anchor is needed. All settings
 default off, so
-without config upstream behaviour is unchanged. Ported from the frozen
-``dev`` branch (``kanban_db_dispatch.py`` ``_changes_requested_state`` /
+without config upstream behaviour is unchanged. Ported from the legacy
+fork branch (``kanban_db_dispatch.py`` ``_changes_requested_state`` /
 ``_apply_rework_escalation`` / ``_apply_review_round_cap`` /
 ``_apply_default_reviewer``, c2276ae2ea), re-implemented against next's seams.
 """

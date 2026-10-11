@@ -18,7 +18,7 @@ this receipt check; the two configuration switches are independent.
 explicit operator override and bypasses the gate, as it bypasses the live-claim
 fence. Off by default, so upstream behaviour is unchanged.
 
-Ported from the frozen ``dev`` branch (``tools/kanban_tools_review_gate.py``,
+Ported from the legacy fork branch (``tools/kanban_tools_review_gate.py``,
 feb4981922), which gated the tool handler only.
 """
 

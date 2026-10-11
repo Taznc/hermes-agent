@@ -209,7 +209,7 @@ export function focusSets(graph: DependencyGraph, key: string): { upstream: Set<
   }
 }
 
-/** Every key reachable from `start` by walking `next` — BFS, so a cycle
+/** Every key reachable from `start` by walking `dev` — BFS, so a cycle
  *  terminates (each key is enqueued once) and `start` itself only appears if
  *  the walk loops back onto it; callers strip it. */
 function reachable(graph: DependencyGraph, start: string, next: (graph: DependencyGraph, key: string) => readonly string[]): Set<string> {
