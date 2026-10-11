@@ -1,11 +1,11 @@
-# FORK.md — Taznc/hermes-agent `next` branch rules
+# FORK.md — Taznc/hermes-agent `dev` branch rules
 
 This file is fork-owned (does not exist upstream; zero merge cost). It is the
 project-level contract for every agent and human working on this branch.
 Read it before editing. `AGENTS.md` (upstream's) still applies for code shape,
 testing, and area routing — this file adds the fork's constraints on top.
 
-Control-plane docs with the full rationale: `~/projects/hermes/docs/next-branch-policy.md`
+Control-plane docs with the full rationale: `~/projects/hermes/docs/fork-branch-policy.md`
 and `~/projects/hermes/docs/feature-ledger.md`.
 
 ## Branch model
@@ -13,11 +13,10 @@ and `~/projects/hermes/docs/feature-ledger.md`.
 | Branch | Role |
 |---|---|
 | `main` | Pure mirror of `upstream/main`. Never receives fork commits. |
-| `next` | The fork. Merge-based (never rebased). Weekly `upstream/main` merge. |
-| `dev` | Frozen. Read-only port source. Never merge `dev` into `next`. |
+| `dev` | The sole fork branch. Merge-based (never rebased). Weekly `upstream/main` merge. |
 
-Landing: feature branch → review → merge into `next`. Direct pushes to
-`next` are for the automated sync and verified merges only.
+Landing: feature branch → review → merge into `dev`. Direct pushes to
+`dev` are for the automated sync and verified merges only.
 
 ## Tiers — declare one per card; never exceed it
 
@@ -48,8 +47,8 @@ If it's *almost* a plugin but the plugin system can't do one part, consider a
 `host.fork.*` (T1 module + T2 anchor), with the feature shipped as a plugin on
 top. Use one when a second feature would likely use it or inlining would touch
 busy upstream files. Existing hooks and SDK methods never change, so public
-plugins keep working on `next`. Register it as an X-row in the ledger's Part C.
-Full rules: `next-branch-policy.md` § Fork extension points.
+plugins keep working on `dev`. Register it as an X-row in the ledger's Part C.
+Full rules: `fork-branch-policy.md` § Fork extension points.
 
 ## Hard rules
 
@@ -60,14 +59,20 @@ Full rules: `next-branch-policy.md` § Fork extension points.
 - **Generated files** (lockfiles, catalogs, snapshots) go in their **own commit** so a sync conflict is "re-run the generator", not a manual merge.
 - Editing an upstream file that already carries fork lines? Reduce the delta or keep it flat. `scripts/fork-budget.sh` (control plane) fails the pre-review gate if it grows.
 
-## Before any feature work — the prior-art gate (mandatory, report-back)
+## Before building OR recommending any command, mechanism or procedure — the prior-art gate
 
 Reinventing something upstream already ships, is reviewing, or has rejected is
 the most expensive mistake on this fork: it costs the build, the review, AND a
 permanent merge conflict. So this is a **gate, not a suggestion**: it runs for
-every feature request — from a card or from chat — before any design or code,
+every build or recommendation — from a card or from chat — before suggesting
+a command, mechanism or procedure, or designing or coding,
 and its result is reported to the user before proceeding.
 
+0. **Built-ins/config first, verified on the target code.** Run `hermes --help`
+   and `hermes <cmd> --help` where relevant; inspect current config and docs.
+   Never recommend from memory. A fork-only `kanban dispatch --pause` was
+   recommended while upstream `hermes pause` already existed: verify the
+   supported built-in before proposing a fork mechanism.
 1. **Ledger.** `~/projects/hermes/docs/feature-ledger.md`. If listed, follow its
    Decision (PORT / WAIT / DROP) and tier.
 2. **Upstream shipped?** `git log upstream/main --grep="<keyword>" --oneline`,
@@ -84,15 +89,15 @@ and its result is reported to the user before proceeding.
 5. **Extension seam?** Can it be a plugin / skill / MCP / desktop-plugin
    (T0)? Check `plugins/AGENTS.md`, `HERMES_PLUGIN_HOOKS`, the desktop
    contribution areas (`ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREA`).
-6. **Codebase-memory** project `home-hermes-projects-hermes-hermes-agent-next`
-   for architecture/callers before broad reading;
-   `home-hermes-projects-hermes-hermes-agent-dev` is the read-only `dev` index.
+6. **Codebase-memory** project `home-hermes-projects-hermes-hermes-agent-dev`
+   for architecture/callers before broad reading.
    Never `index_repository` from a worktree.
 
 **Report-back format** (in chat, or as the first comment on a card):
 
 ```
 Prior art — <feature>
+  built-ins: <target revision + help/config/docs checked; supported command | no built-in>
   ledger:    <id + decision | not listed>
   upstream:  <shipped in <sha/PR> | open PR #N (<title>, <age>) | rejected PR #N: <reason> | none found (queries: ...)>
   dev:       <commits/paths | none>
@@ -105,14 +110,14 @@ its body or first comment is not ready to work.
 
 ## Verification (what "done" means)
 
-- Python: `scripts/run_tests.sh <paths derived from the diff>` — never bare `pytest`. Judge against the `next` baseline, not zero.
+- Python: `scripts/run_tests.sh <paths derived from the diff>` — never bare `pytest`. Judge against the `dev` baseline, not zero.
 - Desktop: `cd apps/desktop && npm run typecheck && npm run lint && npx vitest run <paths>`. Fresh worktrees have no `node_modules` — `npm install` first.
 - Budget: `~/projects/hermes/scripts/fork-budget.sh` must not report growth for the touched files.
 - The completion summary quotes the **command and its output**, not "tests pass".
 
 ## Environment
 
-- Checkout: `~/projects/hermes/hermes-agent-next` (branch `next`, served at :5177, backend :9220, `HERMES_HOME=~/.hermes-next`). Protected by `git-tree-guard`: work in `.worktrees/<task>` or a Kanban workspace, land by merge.
-- Runtime python: `~/.hermes-next-runtime/venv/bin/python`.
-- Kanban board: `hermes-next`. Profiles: `coder` (Opus, judgment/T2+/keystones), `coder-lite` (Sonnet, bounded T0/T1 with explicit criteria), `reviewer` + `debugger` (Codex Sol), `orchestrator` (Sonnet).
+- Checkout: `~/projects/hermes/hermes-agent-dev` (branch `dev`, `HERMES_HOME=~/.hermes`). Services run from immutable releases (`~/.hermes-releases/current` via `hermes-deploy`), renderer :5177 / backend :9220, not the checkout. Protected by `git-tree-guard`: work in `.worktrees/<task>` or a Kanban workspace, land by merge.
+- Runtime python: `~/.hermes-runtime/venv/bin/python`.
+- Kanban board: `hermes-dev`. Profiles: `coder` (Opus, judgment/T2+/keystones), `coder-lite` (Sonnet, bounded T0/T1 with explicit criteria), `reviewer` + `debugger` (Codex Sol), `orchestrator` (Sonnet).
 - Remotes: `origin` = Taznc/hermes-agent (yours), `upstream` = NousResearch/hermes-agent (read-only). Always name the remote when reporting branch actions.

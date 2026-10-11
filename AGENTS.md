@@ -8,7 +8,7 @@ and every root-to-area chain at 30k, so it loads whole on 128k+ models: long for
 **Never give up on the right solution.**
 
 <!-- >>> FORK ANCHOR: fork-md <<< -->
-**This is the Taznc fork (`next` branch).** Read `FORK.md` first: tiers, hard rules, the feature ledger, and what "done" means here.
+**This is the Taznc fork (`dev` branch).** Read `FORK.md` first: tiers, hard rules, the feature ledger, and what "done" means here.
 <!-- <<< FORK ANCHOR >>> -->
 
 ## What Hermes Is
@@ -170,4 +170,4 @@ Every former god file is a **facade** (public entry points + the names other pac
 | `hermes_platform/` | `hermes_platform/AGENTS.md` | host facts, resolvers |
 
 Long-form background: `website/docs/developer-guide/`. Workflow rules (PR/issue/review/salvage
-process) live in the `hermes-agent-dev` skill, not here.
+process) live in the `hermes-agent` skill, not here.
