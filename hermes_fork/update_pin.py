@@ -22,6 +22,8 @@ variables. On a pinned install:
   ``insteadOf`` rewriting) to the pinned repository;
 * git-config and repository-location environment overrides are stripped from
   the update process so they cannot redirect its fetch;
+* ``origin``'s fetch refspecs are extended to cover the pinned branch when a
+  ``--single-branch`` clone left them mapping only another branch;
 * update-availability checks (CLI banner, Desktop) report against the pin.
 
 An install with no ``hermes-fork.updateBranch`` behaves exactly like upstream.
@@ -142,6 +144,47 @@ def effective_origin_url(root: Path, *, git: str = "git") -> Optional[str]:
     return _git(Path(root), "ls-remote", "--get-url", "origin", git=git)
 
 
+def refspec_covers_branch(refspec: str, remote: str, branch: str) -> bool:
+    """Whether one ``remote.<remote>.fetch`` value maps ``refs/heads/<branch>`` to its tracking ref.
+
+    Handles exact and single-``*`` glob refspecs; negative (``^``) and
+    destination-less refspecs never write a tracking ref, so they don't count.
+    """
+    spec = refspec.strip().lstrip("+")
+    if spec.startswith("^") or ":" not in spec:
+        return False
+    src, dst = spec.split(":", 1)
+    source, want = f"refs/heads/{branch}", f"refs/remotes/{remote}/{branch}"
+    if "*" not in src:
+        return src == source and dst == want
+    head, _, tail = src.partition("*")
+    if "*" not in dst or not (source.startswith(head) and source.endswith(tail)
+                              and len(source) >= len(head) + len(tail)):
+        return False
+    return dst.replace("*", source[len(head):len(source) - len(tail)], 1) == want
+
+
+def ensure_branch_fetch_refspec(root: Path, branch: str, *, git: str = "git") -> bool:
+    """Add ``origin``'s fetch refspec for ``branch`` when none covers it; True if one was added.
+
+    A ``--single-branch`` clone fetches only its first branch, so ``refs/remotes/origin/<pin>``
+    is never written by a plain fetch and ``git switch --track origin/<pin>`` fails after it
+    has already rewritten the tree. Reads and writes only the repository's own config file.
+    """
+    cfg = _repo_config_file(Path(root), git=git)
+    if cfg is None or not _git(Path(root), "config", "--file", str(cfg), "--get", "remote.origin.url", git=git):
+        return False
+    current = _git(Path(root), "config", "--file", str(cfg), "--get-all", "remote.origin.fetch", git=git) or ""
+    if any(refspec_covers_branch(line, "origin", branch) for line in current.splitlines()):
+        return False
+    refspec = f"+refs/heads/{branch}:refs/remotes/origin/{branch}"
+    if _git(Path(root), "config", "--file", str(cfg), "--add", "remote.origin.fetch", refspec, git=git) is None:
+        print(f"⚠ Could not add {refspec} to remote.origin.fetch; origin/{branch} may not be tracked.")
+        return False
+    print(f"→ Added {refspec} to remote.origin.fetch so origin/{branch} is fetched and trackable")
+    return True
+
+
 def _refuse(message: str) -> NoReturn:
     print(f"✗ Update refused (fork update pin): {message}", file=sys.stderr)
     print(f"  Pin: git config {BRANCH_KEY} / {ORIGIN_KEY} in this install's checkout.", file=sys.stderr)
@@ -178,6 +221,7 @@ def enforce_update_pin(args, project_root: Path, *, git: str = "git") -> Optiona
         if normalize_repo_url(actual) != normalize_repo_url(pin.origin):
             _refuse(f"origin resolves to {actual}, not the pinned {pin.origin}.")
 
+    ensure_branch_fetch_refspec(Path(project_root), pin.branch, git=git)
     args.branch = pin.branch
     print(f"→ Update pinned to {pin.origin or 'origin'} @ {pin.branch}")
     return pin
