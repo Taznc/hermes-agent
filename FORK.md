@@ -89,9 +89,9 @@ and its result is reported to the user before proceeding.
 5. **Extension seam?** Can it be a plugin / skill / MCP / desktop-plugin
    (T0)? Check `plugins/AGENTS.md`, `HERMES_PLUGIN_HOOKS`, the desktop
    contribution areas (`ROUTES_AREA`, `SIDEBAR_NAV_AREA`, `STATUSBAR_AREA`).
-6. **Codebase-memory** project `home-hermes-projects-hermes-hermes-agent-dev`
-   for architecture/callers before broad reading.
-   Never `index_repository` from a worktree.
+6. **Codebase-memory:** use `list_projects` to select the current base-checkout
+   index for architecture/callers before broad reading. Verify its root and
+   branch; never `index_repository` from an agent worktree.
 
 **Report-back format** (in chat, or as the first comment on a card):
 

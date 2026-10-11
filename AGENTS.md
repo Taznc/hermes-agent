@@ -170,4 +170,4 @@ Every former god file is a **facade** (public entry points + the names other pac
 | `hermes_platform/` | `hermes_platform/AGENTS.md` | host facts, resolvers |
 
 Long-form background: `website/docs/developer-guide/`. Workflow rules (PR/issue/review/salvage
-process) live in the `hermes-agent` skill, not here.
+process) live in the `hermes-agent-dev` skill, not here.
