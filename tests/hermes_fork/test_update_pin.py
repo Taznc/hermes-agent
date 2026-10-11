@@ -198,6 +198,157 @@ def test_update_check_reports_against_the_pin(remote_pair, tmp_path: Path) -> No
     assert "channel" not in pinned
 
 
+DEV_REFSPEC = "+refs/heads/dev:refs/remotes/origin/dev"
+
+
+@pytest.fixture()
+def single_branch_install(tmp_path: Path) -> tuple[str, Path]:
+    """The Mac's shape: a treeless single-branch clone of ``main`` whose origin also has ``dev``.
+
+    ``remote.origin.fetch`` maps only main, so a plain fetch never writes
+    ``refs/remotes/origin/dev`` and ``git switch --track origin/dev`` fails half-way.
+    Returns ``(origin_url, clone)``.
+    """
+    bare = tmp_path / "origin.git"
+    _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(bare))
+    _git(bare, "config", "uploadpack.allowFilter", "true")
+    seed = tmp_path / "seed"
+    _git(tmp_path, "clone", "-q", str(bare), str(seed))
+    for k, v in (("user.email", "t@example.com"), ("user.name", "t")):
+        _git(seed, "config", k, v)
+    (seed / "a.txt").write_text("base\n", encoding="utf-8")
+    _git(seed, "add", "a.txt")
+    _git(seed, "commit", "-q", "-m", "base")
+    _git(seed, "push", "-q", "origin", "HEAD:main")
+    (seed / "fork.txt").write_text("fork work\n", encoding="utf-8")
+    _git(seed, "add", "fork.txt")
+    _git(seed, "commit", "-q", "-m", "fork work")
+    _git(seed, "push", "-q", "origin", "HEAD:dev")
+    url = f"file://{bare}"
+    clone = tmp_path / "install"
+    _git(tmp_path, "clone", "-q", "--single-branch", "-b", "main", "--filter=tree:0", url, str(clone))
+    assert _git(clone, "config", "--get-all", "remote.origin.fetch") == \
+        "+refs/heads/main:refs/remotes/origin/main"
+    return url, clone
+
+
+def _fetch_refspecs(root: Path) -> list[str]:
+    return _git(root, "config", "--get-all", "remote.origin.fetch").splitlines()
+
+
+def _has_ref(root: Path, ref: str) -> bool:
+    return subprocess.run(["git", "-C", str(root), "rev-parse", "-q", "--verify", ref],
+                          capture_output=True).returncode == 0
+
+
+def test_pin_adds_fetch_refspec_for_single_branch_clone(single_branch_install, capsys) -> None:
+    url, clone = single_branch_install
+    _pin(clone, origin=url)
+    _git(clone, "fetch", "-q", "origin")
+    assert not _has_ref(clone, "refs/remotes/origin/dev")
+
+    up.enforce_update_pin(_args(), clone)
+
+    assert _fetch_refspecs(clone) == ["+refs/heads/main:refs/remotes/origin/main", DEV_REFSPEC]
+    out = capsys.readouterr().out
+    assert sum("remote.origin.fetch" in line for line in out.splitlines()) == 1
+    _git(clone, "fetch", "-q", "origin")
+    assert _has_ref(clone, "refs/remotes/origin/dev")
+    # The Mac's half-failed step now completes: tracking can be set up from origin/dev.
+    _git(clone, "branch", "--track", "dev", "origin/dev")
+    assert _git(clone, "config", "branch.dev.merge") == "refs/heads/dev"
+
+
+def test_pin_does_not_duplicate_a_covering_refspec(remote_pair, capsys) -> None:
+    _, clone = remote_pair
+    before = _fetch_refspecs(clone)
+    assert before == ["+refs/heads/*:refs/remotes/origin/*"]
+    _pin(clone, origin=None)
+    up.enforce_update_pin(_args(), clone)
+    up.enforce_update_pin(_args(), clone)
+    assert _fetch_refspecs(clone) == before
+    assert "remote.origin.fetch" not in capsys.readouterr().out
+
+
+def test_added_refspec_is_not_duplicated_on_rerun(single_branch_install) -> None:
+    url, clone = single_branch_install
+    _pin(clone, origin=url)
+    up.enforce_update_pin(_args(), clone)
+    up.enforce_update_pin(_args(), clone)
+    assert _fetch_refspecs(clone).count(DEV_REFSPEC) == 1
+
+
+def test_unpinned_install_config_is_unchanged(single_branch_install) -> None:
+    _, clone = single_branch_install
+    config = clone / ".git" / "config"
+    before = config.read_bytes()
+    assert up.enforce_update_pin(_args(), clone) is None
+    assert config.read_bytes() == before
+
+
+@pytest.mark.parametrize(("refspec", "covered"), [
+    ("+refs/heads/*:refs/remotes/origin/*", True),
+    ("refs/heads/*:refs/remotes/origin/*", True),
+    ("+refs/heads/dev:refs/remotes/origin/dev", True),
+    ("+refs/heads/de*:refs/remotes/origin/de*", True),
+    ("+refs/heads/main:refs/remotes/origin/main", False),
+    ("+refs/heads/dev:refs/remotes/mirror/dev", False),
+    ("+refs/heads/*:refs/remotes/other/*", False),
+    ("refs/heads/dev", False),
+    ("^refs/heads/dev", False),
+])
+def test_refspec_coverage(refspec: str, covered: bool) -> None:
+    assert up.refspec_covers_branch(refspec, "origin", "dev") is covered
+
+
+def test_parked_single_branch_install_switches_to_the_pin(single_branch_install, monkeypatch, capsys) -> None:
+    """End to end: a clean treeless single-branch clone parked on main, pinned to dev.
+
+    A bare ``hermes update`` must land the checkout on the pinned branch with no
+    "CODE UPDATE SKIPPED" (``updates.auto_switch_parked_branch`` defaults to true).
+    """
+    import hermes_cli.config as hermes_config
+    import hermes_cli.main as main_mod
+    import hermes_cli.main_install_repair as install_repair
+    import hermes_cli.main_web_build as web_build
+    import hermes_cli.update_cmd as update_cmd
+    import hermes_cli.update_owning_install as owning
+
+    url, clone = single_branch_install
+    _pin(clone, origin=url)
+    monkeypatch.setattr(hermes_config, "load_config", dict)
+    monkeypatch.setattr(main_mod, "PROJECT_ROOT", clone)
+    monkeypatch.setattr(owning, "retarget_to_owning_install", lambda _root: None)
+    monkeypatch.setattr(main_mod, "_is_windows", lambda: False)
+    monkeypatch.setattr(install_repair, "_is_windows", lambda: False)
+    monkeypatch.setattr(update_cmd, "_is_fork", lambda *a, **k: False)
+    monkeypatch.setattr(update_cmd, "_discard_lockfile_churn", lambda *a, **k: None)
+    monkeypatch.setattr(update_cmd, "_normalize_managed_eol", lambda *a, **k: None)
+    monkeypatch.setattr(main_mod, "_clear_bytecode_cache", lambda *a, **k: 0)
+    monkeypatch.setattr(main_mod, "_record_bytecode_fingerprint", lambda *a, **k: None)
+    monkeypatch.setattr(web_build, "_record_bytecode_fingerprint", lambda *a, **k: None)
+    monkeypatch.setattr(main_mod, "_run_pre_update_backup", lambda *a, **k: None)
+    monkeypatch.setattr(main_mod, "_pause_windows_gateways_for_update", lambda: None)
+    monkeypatch.setattr(main_mod, "_resume_windows_gateways_after_update", lambda *a, **k: None)
+
+    class _StopFlow(Exception):
+        pass
+
+    monkeypatch.setattr(update_cmd, "_complete_source_update",
+                        lambda *a, **k: (_ for _ in ()).throw(_StopFlow()))
+    args = argparse.Namespace(branch=None, channel=None, set_channel=None, yes=False,
+                              force=False, force_venv=False)
+    with pytest.raises(_StopFlow):
+        main_mod.cmd_update(args)
+
+    out = capsys.readouterr().out
+    assert "CODE UPDATE SKIPPED" not in out
+    assert _git(clone, "rev-parse", "--abbrev-ref", "HEAD") == "dev"
+    assert _git(clone, "rev-parse", "HEAD") == _git(clone, "rev-parse", "refs/remotes/origin/dev")
+    assert _git(clone, "status", "--porcelain") == ""
+    assert (clone / "fork.txt").exists()
+
+
 def test_cmd_update_enforces_the_pin(repo: Path, monkeypatch) -> None:
     """``hermes update`` (every surface funnels through cmd_update) honours the pin."""
     import hermes_cli.main as main_mod
