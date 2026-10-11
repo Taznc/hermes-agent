@@ -26,7 +26,7 @@ are untrusted even when a notifier exists.
 
 Post-drain restarts: the dev-era Kanban post-drain service restart
 (``kanban.post_drain.service_restart_allowlist`` and its PTY consent prompt, t_f58cc7f8) is absent on
-``next`` and is deliberately not ported, because its consent could be forged (``env -u
+``dev`` and is deliberately not ported, because its consent could be forged (``env -u
 HERMES_KANBAN_TASK`` + a PTY + typing "yes"). A dispatcher-driven restart has no trusted channel, so
 this gate would deny it anyway.
 

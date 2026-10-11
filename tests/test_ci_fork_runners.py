@@ -2,7 +2,7 @@
 
 F30 PORT (ledger). dev's tests/test_ci_fork_runners.py (1bf34bc4f1,
 89d7c365aa) proved the pattern on a smaller, since-diverged set of
-workflow files; `next`'s workflow tree has grown (docker.yml matrices,
+workflow files; `dev`'s workflow tree has grown (docker.yml matrices,
 desktop-bundled-release.yml, windows-bundle-sdk.yml, windows-venv-e2e.yml,
 e2e-desktop-core.yml did not exist in dev's original set), so this
 re-derives coverage from a live sweep of every workflow file rather than
@@ -95,9 +95,9 @@ def test_windows_bundle_sdk_matrix_array_has_fork_fallback():
     assert runners == [expected, expected]
 
 
-def test_ci_yaml_baselines_push_on_next():
+def test_ci_yaml_baselines_push_on_dev():
     document = _load(WORKFLOWS / "ci.yaml")
-    assert document["on"]["push"]["branches"] == ["main", "next"]
+    assert document["on"]["push"]["branches"] == ["main", "dev"]
 
 
 def test_no_other_workflow_uses_an_unconditional_paid_runner():

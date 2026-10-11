@@ -8,7 +8,7 @@ and every root-to-area chain at 30k, so it loads whole on 128k+ models: long for
 **Never give up on the right solution.**
 
 <!-- >>> FORK ANCHOR: fork-md <<< -->
-**This is the Taznc fork (`next` branch).** Read `FORK.md` first: tiers, hard rules, the feature ledger, and what "done" means here.
+**This is the Taznc fork (`dev` branch).** Read `FORK.md` first: tiers, hard rules, the feature ledger, and what "done" means here.
 <!-- <<< FORK ANCHOR >>> -->
 
 ## What Hermes Is

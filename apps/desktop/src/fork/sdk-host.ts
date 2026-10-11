@@ -25,7 +25,7 @@ installCompactionWatermarkChip()
 
 /**
  * `host.fork` — the fork's namespaced, versioned Desktop plugin capabilities
- * (ledger Part C; rules: next-branch-policy.md § Fork extension points).
+ * (ledger Part C; rules: fork-branch-policy.md § Fork extension points).
  * Nothing here is flat on `host`, so an upstream method of the same name can
  * never collide. Plugins feature-detect: `host.fork?.sessions?.version >= 1`.
  */

@@ -1,4 +1,4 @@
-"""Fork-owned Python code for the Taznc ``next`` branch (tier T1, see FORK.md).
+"""Fork-owned Python code for the Taznc ``dev`` branch (tier T1, see FORK.md).
 
 Upstream modules call into this package ONLY at lines marked
 ``# >>> FORK ANCHOR: <name> <<<``; this package may import upstream modules freely.

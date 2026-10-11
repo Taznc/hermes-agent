@@ -108,20 +108,20 @@ def test_subdirectory_of_repo_yields_repo_name(isolated):
 
 
 def test_worktree_gitfile_resolves_to_main_repo_name(isolated):
-    main = _repo(isolated.work / "hermes-agent-next")
+    main = _repo(isolated.work / "hermes-agent-dev")
     wt = _worktree(main, main / ".worktrees" / "t_123", "t_123")
-    assert ws.agent_workspace(_agent(cwd=str(wt)), ON) == "hermes-agent-next"
+    assert ws.agent_workspace(_agent(cwd=str(wt)), ON) == "hermes-agent-dev"
     inner = wt / "agent"
     inner.mkdir()
-    assert ws.agent_workspace(_agent(cwd=str(inner)), ON) == "hermes-agent-next"
+    assert ws.agent_workspace(_agent(cwd=str(inner)), ON) == "hermes-agent-dev"
 
 
 def test_kanban_workspace_under_hermes_home_prefers_main_repo(isolated):
     """``$HERMES_HOME/kanban/boards/<board>/workspaces/<task>`` holds a worktree .git file:
     the main repo's name wins over the HERMES_HOME exclusion."""
-    main = _repo(isolated.work / "hermes-agent-next")
+    main = _repo(isolated.work / "hermes-agent-dev")
     wt = _worktree(main, isolated.hermes_home / "kanban" / "boards" / "b" / "workspaces" / "task-9", "task-9")
-    assert ws.agent_workspace(_agent(cwd=str(wt)), ON) == "hermes-agent-next"
+    assert ws.agent_workspace(_agent(cwd=str(wt)), ON) == "hermes-agent-dev"
 
 
 def test_plain_git_dir_under_hermes_home_is_not_a_workspace(isolated):

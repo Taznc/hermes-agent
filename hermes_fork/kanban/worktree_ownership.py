@@ -1,6 +1,6 @@
 """Kanban worktree ownership: a task may only tear down a worktree it created (tier T1, see FORK.md).
 
-Incident 2026-09-27: archiving a card whose ``workspace_path`` pointed at the served ``next``
+Incident 2026-09-27: archiving a card whose ``workspace_path`` pointed at the served fork
 checkout ran ``git worktree remove`` on it. Every upstream guard passed (not the main checkout,
 clean, fully pushed). Ownership is now proven by a git-admin marker (``hermes-kanban-owner.json``
 in the worktree's private git dir, outside the working tree) that only dispatch-time creation
@@ -75,7 +75,7 @@ def worktree_owned_by_task(task_id: str, path: Path, branch_name: Optional[str])
     """Whether the checkout at ``path`` is on the branch the task owns AND carries its marker.
 
     A worktree task's ``workspace_path`` is a *request*, not proof of ownership: a caller can point
-    it at a checkout that existed before the task did (the served ``next`` tree, a sibling task's
+    it at a checkout that existed before the task did (the served ``dev`` tree, a sibling task's
     worktree, a user's feature branch). Anything else is preserved with a WARNING naming both
     branches. A detached HEAD is never ours."""
     owned = task_owned_branch(task_id, branch_name)

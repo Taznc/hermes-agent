@@ -20,4 +20,4 @@ class ForkPingResult(Result):
 @fork_method("fork.ping", params=ForkPingParams, result=ForkPingResult,
              doc="Fork gateway liveness probe; answers only on builds carrying hermes_fork.")
 def _(params: dict) -> dict:
-    return {"ok": True, "branch": "next"}
+    return {"ok": True, "branch": "dev"}

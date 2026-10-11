@@ -2,7 +2,7 @@
 
 Moved out of tests/hermes_cli/test_kanban_worktree_teardown.py and tests/tools/test_kanban_tools.py
 (t_a8d56f3d). Incident 2026-09-27: a task created with ``workspace_kind='worktree'`` and
-``workspace_path`` pointing at the SERVED checkout of branch ``next`` (itself a linked worktree of
+``workspace_path`` pointing at the SERVED checkout of branch ``dev`` (itself a linked worktree of
 the main repo) was archived 13s later; that ran ``git worktree remove`` on the tree — every
 upstream guard passed (not the main checkout, clean, fully pushed) — and the live services lost
 their source. Nothing checked that the tree was the task's own.
@@ -68,7 +68,7 @@ def _branch_exists(repo: Path, branch: str) -> bool:
 
 
 def _served_worktree(repo: Path, name: str, branch: str) -> Path:
-    """A linked worktree on a long-lived, fully-pushed branch (like a served ``next``)."""
+    """A linked worktree on a long-lived, fully-pushed branch (like a served ``dev``)."""
     _git("-C", str(repo), "branch", branch, "HEAD")
     _git("-C", str(repo), "push", "origin", branch)
     target = repo.parent / name
@@ -94,7 +94,7 @@ def test_public_entry_points_route_through_the_guard(kanban_home: Path, repo: Pa
     """``resolve_workspace`` / ``_cleanup_workspace`` (the upstream public paths) reach the fork
     replacements: resolving marks the new tree and cleanup removes it, while cleanup of a row that
     points at a foreign checkout leaves that checkout alone."""
-    served = _served_worktree(repo, "served-public", "next")
+    served = _served_worktree(repo, "served-public", "dev")
     with kbc.connect_closing() as conn:
         own_tid = kb.create_task(conn, title="own", assignee="worker", workspace_kind="worktree",
                                  workspace_path=str(repo / ".worktrees" / "public-new"))
@@ -105,7 +105,7 @@ def test_public_entry_points_route_through_the_guard(kanban_home: Path, repo: Pa
         foreign_tid = kb.create_task(conn, title="foreign", assignee="worker")
         with kb.write_txn(conn):
             conn.execute("UPDATE tasks SET workspace_kind='worktree', workspace_path=?, branch_name=? "
-                         "WHERE id=?", (str(served), "next", foreign_tid))
+                         "WHERE id=?", (str(served), "dev", foreign_tid))
             conn.execute("UPDATE tasks SET branch_name=? WHERE id=?", (f"wt/{own_tid}", own_tid))
         kbw._cleanup_workspace(conn, foreign_tid)
         assert served.is_dir()
@@ -119,17 +119,17 @@ def test_public_entry_points_route_through_the_guard(kanban_home: Path, repo: Pa
 def test_worktree_on_foreign_branch_preserved_when_task_has_no_branch(
     repo: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """The incident shape: branch_name None -> owned branch is wt/<id>, the tree is on ``next`` ->
+    """The incident shape: branch_name None -> owned branch is wt/<id>, the tree is on ``dev`` ->
     preserved, WARNING names both branches."""
-    served = _served_worktree(repo, "served-next", "next")
+    served = _served_worktree(repo, "served-dev", "dev")
     with caplog.at_level("WARNING", logger="hermes_cli.kanban_db"):
         kbw._cleanup_worktree_workspace("t_0b571cee", str(served), None)
     assert served.is_dir(), "a clean, pushed tree on another branch must survive archive"
     assert (served / "README.md").exists()
-    assert _branch_exists(repo, "next")
+    assert _branch_exists(repo, "dev")
     assert f"worktree {served.resolve()}" in _git("-C", str(repo), "worktree", "list", "--porcelain")
     msg = "\n".join(r.getMessage() for r in caplog.records if r.levelname == "WARNING")
-    assert "next" in msg and "wt/t_0b571cee" in msg, msg
+    assert "dev" in msg and "wt/t_0b571cee" in msg, msg
 
 
 def test_worktree_on_foreign_branch_preserved_when_task_names_another_branch(repo: Path) -> None:
@@ -187,17 +187,17 @@ def test_only_the_default_task_branch_is_deleted(repo: Path) -> None:
 def test_ownership_rechecked_right_before_removal(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """The checkout switches branch between the first ownership check and ``git worktree remove``."""
     wt = _make_worktree(repo, "t_bbbb0004")
-    _git("-C", str(repo), "branch", "next", "HEAD")
+    _git("-C", str(repo), "branch", "dev", "HEAD")
     real_release = kbw.release_lsp_clients
 
     def switch_then_release(path: str) -> None:
-        _git("-C", str(wt), "switch", "next")
+        _git("-C", str(wt), "switch", "dev")
         real_release(path)
 
     monkeypatch.setattr(kbw, "release_lsp_clients", switch_then_release)
     kbw._cleanup_worktree_workspace("t_bbbb0004", str(wt), None)
     assert wt.is_dir()
-    assert _git("-C", str(wt), "symbolic-ref", "--short", "HEAD").strip() == "next"
+    assert _git("-C", str(wt), "symbolic-ref", "--short", "HEAD").strip() == "dev"
 
 
 def test_marker_lives_in_git_admin_dir_not_the_working_tree(repo: Path) -> None:
@@ -215,7 +215,7 @@ def test_archive_task_preserves_served_checkout_on_other_branch(kanban_home: Pat
     """End-to-end replay of the incident through archive_task -> _cleanup_workspace. The DB row is
     written directly (as the incident row was) to bypass the creation-time guard and prove the
     cleanup guard alone is sufficient."""
-    served = _served_worktree(repo, "served-next-e2e", "next")
+    served = _served_worktree(repo, "served-dev-e2e", "dev")
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="chat-created", assignee="worker")
         with kb.write_txn(conn):
@@ -226,15 +226,15 @@ def test_archive_task_preserves_served_checkout_on_other_branch(kanban_home: Pat
         assert kb.archive_task(conn, tid)
     assert served.is_dir()
     assert (served / "README.md").exists()
-    assert _branch_exists(repo, "next")
+    assert _branch_exists(repo, "dev")
 
 
 def test_legacy_row_claiming_served_branch_cannot_reap_it(kanban_home: Path, repo: Path) -> None:
-    served = _served_worktree(repo, "served-claimed", "next")
+    served = _served_worktree(repo, "served-claimed", "dev")
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="legacy", assignee="worker")
         with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET workspace_kind='worktree', workspace_path=?, branch_name='next' WHERE id=?",
+            conn.execute("UPDATE tasks SET workspace_kind='worktree', workspace_path=?, branch_name='dev' WHERE id=?",
                          (str(served), tid))
         assert kb.archive_task(conn, tid)
     assert served.is_dir()
@@ -258,7 +258,7 @@ def test_own_marked_checkout_is_reused(repo: Path) -> None:
 
 
 def test_legacy_dispatch_does_not_adopt_foreign_checkout(kanban_home: Path, repo: Path) -> None:
-    served = _served_worktree(repo, "served-legacy", "next")
+    served = _served_worktree(repo, "served-legacy", "dev")
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="legacy", assignee="worker")
         with kb.write_txn(conn):
@@ -374,20 +374,20 @@ def test_dispatch_resumes_legacy_canonical_worktree_only_after_a_prior_worker(
 
 
 def test_create_task_rejects_worktree_path_on_foreign_branch(kanban_home: Path, repo: Path) -> None:
-    served = _served_worktree(repo, "served-next-create", "next")
+    served = _served_worktree(repo, "served-dev-create", "dev")
     with kbc.connect_closing() as conn:
         with pytest.raises(ValueError) as excinfo:
             kb.create_task(conn, title="x", assignee="worker",
                            workspace_kind="worktree", workspace_path=str(served))
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     msg = str(excinfo.value)
-    assert "next" in msg
+    assert "dev" in msg
     assert ".worktrees" in msg  # tells the caller to pass a NEW path under <repo>/.worktrees/
     assert served.is_dir()
 
 
 def test_create_task_rejects_foreign_checkout_even_with_other_branch_name(kanban_home: Path, repo: Path) -> None:
-    served = _served_worktree(repo, "served-next-create2", "next")
+    served = _served_worktree(repo, "served-dev-create2", "dev")
     with kbc.connect_closing() as conn:
         with pytest.raises(ValueError):
             kb.create_task(conn, title="x", assignee="worker", workspace_kind="worktree",
@@ -420,7 +420,7 @@ def test_create_task_allows_new_path_and_repo_root_anchor(kanban_home: Path, rep
 
 
 def test_create_task_ignores_non_worktree_kinds(kanban_home: Path, repo: Path) -> None:
-    served = _served_worktree(repo, "served-dir-kind", "next")
+    served = _served_worktree(repo, "served-dir-kind", "dev")
     with kbc.connect_closing() as conn:
         tid = kb.create_task(conn, title="dir", assignee="w", workspace_kind="dir", workspace_path=str(served))
         assert kb.get_task(conn, tid).workspace_path == str(served)
@@ -470,9 +470,9 @@ def test_kanban_create_tool_refuses_worktree_path_on_foreign_checkout(
     (project / "README.md").write_text("x\n")
     git("add", "README.md", cwd=project)
     git("commit", "-q", "-m", "init", cwd=project)
-    git("branch", "next", cwd=project)
-    served = tmp_path / "repo-next"
-    git("worktree", "add", str(served), "next", cwd=project)
+    git("branch", "dev", cwd=project)
+    served = tmp_path / "repo-dev"
+    git("worktree", "add", str(served), "dev", cwd=project)
 
     out = json.loads(kt._handle_create({
         "title": "port X", "assignee": "coder",
@@ -480,7 +480,7 @@ def test_kanban_create_tool_refuses_worktree_path_on_foreign_checkout(
     }))
     assert out.get("ok") is not True, out
     err = out.get("error") or json.dumps(out)
-    assert "next" in err and ".worktrees" in err, err
+    assert "dev" in err and ".worktrees" in err, err
     assert served.is_dir() and (served / "README.md").exists()
     conn = kbc.connect()
     try:

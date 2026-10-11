@@ -17,7 +17,7 @@ Run from this checkout, using an isolated scratch HOME:
 ```sh
 mkdir -p "$TMPDIR/archive-backend-home"
 HOME="$TMPDIR/archive-backend-home" \
-HERMES_PYTHON=/home/hermes/.hermes-next/installs/5116e94174e0c2f0/test-environment/gen-1d8d78a28c324721a014eb024cc24162/venv/bin/python \
+HERMES_PYTHON=/home/hermes/.hermes/installs/5116e94174e0c2f0/test-environment/gen-1d8d78a28c324721a014eb024cc24162/venv/bin/python \
 bash scripts/run_tests.sh -j 4 --file-timeout 120 --file-retries 0 \
   tests/hermes_fork/test_session_archive_protection.py \
   tests/hermes_fork/test_session_archive_liveness.py \
@@ -66,7 +66,7 @@ An earlier suite invoked with the inherited serving HOME failed only the existin
 
 ## Parent-owned budget reconciliation
 
-Do not edit fork-budget-next.json in this task. Register the new fork-owned `hermes_fork/session_archive/` tree, `hermes_fork/gateway/methods_session_archive.py`, seven new `tests/hermes_fork/test_session_archive_*.py` files, and the existing fork gateway registry/test changes. Eight upstream anchor sites have checkout-local deltas <=5 lines:
+Do not edit fork-budget.json in this task. Register the new fork-owned `hermes_fork/session_archive/` tree, `hermes_fork/gateway/methods_session_archive.py`, seven new `tests/hermes_fork/test_session_archive_*.py` files, and the existing fork gateway registry/test changes. Eight upstream anchor sites have checkout-local deltas <=5 lines:
 
 - session-archive-messaging-guard: gateway/platforms/api_server.py (4)
 - session-archive-api-work: gateway/platforms/api_server_runs.py (3)

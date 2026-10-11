@@ -99,14 +99,14 @@ def test_cli_reexports_reach_the_fork_functions(git_repo):
 
 def test_tree_on_trunk_branch_never_reaped(git_repo):
     import cli
-    served = _mk_on(git_repo, "served-next", branch="next")
+    served = _mk_on(git_repo, "served-dev", branch="dev")
     assert not worktree_ops._worktree_is_dirty(str(served), str(git_repo))
     assert not worktree_ops._worktree_has_unpushed_commits(str(served)), (
         "precondition: every upstream gate passes — only ownership can save this tree"
     )
     cli._prune_stale_worktrees(str(git_repo))
     assert served.exists() and (served / "README.md").exists()
-    assert "next" in subprocess.run(["git", "branch", "--list", "next"], cwd=git_repo,
+    assert "dev" in subprocess.run(["git", "branch", "--list", "dev"], cwd=git_repo,
                                     capture_output=True, text=True).stdout
 
 
@@ -201,14 +201,14 @@ def test_reap_rechecks_branch_after_classification(git_repo):
     prune.mark_prune_owned_worktree(str(wt), "hermes/hermes-race")
     # Classification approved the original branch; before serial mutation the checkout changed
     # to a served (fully pushed) branch.
-    subprocess.run(["git", "branch", "next", "HEAD"], cwd=git_repo, check=True, capture_output=True)
-    subprocess.run(["git", "switch", "next"], cwd=wt, check=True, capture_output=True)
+    subprocess.run(["git", "branch", "dev", "HEAD"], cwd=git_repo, check=True, capture_output=True)
+    subprocess.run(["git", "switch", "dev"], cwd=wt, check=True, capture_output=True)
     worktree_ops._reap_prune_verdicts(str(git_repo), [(wt, 0, True, "reap", None)], 1)
-    assert wt.exists() and prune.worktree_symbolic_branch(str(wt)) == "next"
+    assert wt.exists() and prune.worktree_symbolic_branch(str(wt)) == "dev"
 
 
 def test_foreign_verdict_reported_when_stale(git_repo):
-    wt = _mk_on(git_repo, "served", branch="next")
+    wt = _mk_on(git_repo, "served", branch="dev")
     verdicts = worktree_ops._classify_prune_candidates(str(git_repo), [(wt, 0, True)])
     assert verdicts == [(wt, 0, True, prune.FOREIGN_VERDICT, None)]
     preserved, kept = worktree_ops._reap_prune_verdicts(str(git_repo), verdicts, 1)
@@ -217,8 +217,8 @@ def test_foreign_verdict_reported_when_stale(git_repo):
 
 
 def test_ownership_predicate(git_repo):
-    served = _mk_on(git_repo, "pred-next", branch="next")
-    assert prune.worktree_on_hermes_owned_branch(str(served)) == (False, "next")
+    served = _mk_on(git_repo, "pred-dev", branch="dev")
+    assert prune.worktree_on_hermes_owned_branch(str(served)) == (False, "dev")
     detached = _mk_on(git_repo, "pred-detached", detach=True)
     assert prune.worktree_on_hermes_owned_branch(str(detached)) == (False, None)
     mine = _mk_on(git_repo, "pred-wt", branch="wt/pred")

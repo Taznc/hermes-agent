@@ -1,6 +1,6 @@
 """A provider quota wall at worker startup must requeue the card, not burn its retry budget.
 
-Live incident (hermes-next board, t_60a5bf65 runs 176/177, 2026-10-03): the Anthropic pool
+Live incident (fork board, t_60a5bf65 runs 176/177, 2026-10-03): the Anthropic pool
 had benched every key for claude-sonnet-5. ``_anthropic_token_or_raise`` raised the
 rate-limit-tagged AuthError (b55a022916), ``chat()`` returned None before any turn ran, and
 the dispatcher-spawned ``chat -q`` worker (the NON-quiet path) exited 1 because that exit

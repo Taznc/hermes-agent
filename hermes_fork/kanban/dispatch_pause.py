@@ -1,6 +1,6 @@
 """Per-board Kanban dispatch pause (tier T1, see FORK.md).
 
-Upstream ``next`` has ONE pause: the global emergency stop (``hermes pause`` /
+Upstream has ONE pause: the global emergency stop (``hermes pause`` /
 ``/pause``, ``agent/estop.py``). It halts cron, new gateway turns and the
 dispatcher on every board together. Operators also need a narrower switch:
 stop claiming new Kanban work on one board, or on every board, so running

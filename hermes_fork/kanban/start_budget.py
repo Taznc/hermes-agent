@@ -1,6 +1,6 @@
 """Rolling per-board worker start budget at dispatch admission (tier T1, see FORK.md).
 
-Upstream ``next`` caps how many workers run at once (``max_spawn``,
+Upstream caps how many workers run at once (``max_spawn``,
 ``max_in_progress``, ``max_in_progress_per_profile``) but not how many it
 STARTS over time. A card that crashes, completes, or gets reclaimed quickly
 frees its slot, and the next tick fills it again, so a bad batch can burn
@@ -33,7 +33,7 @@ on ``next_eligible_at`` so a tick loop does not write an event every interval,
 and are reported in ``DispatchResult.respawn_guarded`` as ``start_budget`` so
 the dispatcher-stuck warning and ``hermes kanban dispatch`` name the reason.
 
-Re-implemented from the frozen ``dev`` branch (``hermes_fork/kanban/
+Re-implemented from the legacy fork branch (``hermes_fork/kanban/
 config_defaults.py`` ``dispatch_start_budget`` and ``dispatch_concurrency.py``
 ``_recent_dispatch_start_window``, fee0106a45), minus dev's JSON pause
 sentinel, which next has no reader for.
