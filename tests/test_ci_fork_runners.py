@@ -37,7 +37,7 @@ def _iter_strings(value):
 @pytest.mark.parametrize(
     "filename,large,standard",
     [
-        ("tests.yml", "ubuntu-latest-96-core", "ubuntu-latest"),
+        ("tests.yml", "ubuntu-latest-32-core", "ubuntu-latest"),
         ("tests-os.yml", "windows-latest-32-core", "windows-latest"),
         ("tests-os.yml", "windows-latest-32-arm-core", "windows-11-arm"),
         ("js-tests.yml", "ubuntu-latest-32-core", "ubuntu-latest"),
@@ -100,13 +100,40 @@ def test_ci_yaml_baselines_push_on_dev():
     assert document["on"]["push"]["branches"] == ["main", "dev"]
 
 
+def _jobs_with_repo_gate(text: str):
+    """Yield (job_text, gated) per job. gated = the job-level `if:` requires
+    `github.repository == 'NousResearch/...'` (no top-level `||` escape), so
+    the job never queues on a fork and its paid runner label is unreachable."""
+    import re
+
+    for block in re.split(r"(?m)^(?=  [\w.-]+:\s*$)", text.split("\njobs:", 1)[-1]):
+        match = re.search(r"(?m)^    if:\s*(.+)$", block)
+        condition = match.group(1) if match else ""
+        depth, top_level_or = 0, False
+        for index, char in enumerate(condition):
+            depth += (char == "(") - (char == ")")
+            top_level_or = top_level_or or (depth == 0 and condition.startswith("||", index))
+        gated = "github.repository == 'NousResearch/" in condition and not top_level_or
+        yield block, gated
+
+
 def test_no_other_workflow_uses_an_unconditional_paid_runner():
     import re
 
+    paid = re.compile(r"\s*(runs-on|runner):.*-\d+-(?:arm-)?core")
     for path in WORKFLOWS.glob("*.yml"):
-        for line in path.read_text().splitlines():
-            stripped = line.strip()
-            if stripped.startswith("#"):
+        for block, gated in _jobs_with_repo_gate(path.read_text()):
+            if gated:
                 continue
-            if re.match(r"\s*(runs-on|runner):.*-\d+-(?:arm-)?core", line):
-                assert OWNER in line, f"Unconditional paid runner: {path.name}: {line}"
+            for line in block.splitlines():
+                if line.strip().startswith("#"):
+                    continue
+                if paid.match(line):
+                    assert OWNER in line, f"Unconditional paid runner: {path.name}: {line}"
+
+
+def test_repo_gate_exemption_is_not_fooled_by_an_or_escape():
+    ungated = "jobs:\n  a:\n    if: github.repository == 'NousResearch/x' || github.event_name == 'push'\n"
+    gated = "jobs:\n  a:\n    if: ${{ !cancelled() && github.repository == 'NousResearch/x' && (a || b) }}\n"
+    assert [g for _, g in _jobs_with_repo_gate(ungated)][-1] is False
+    assert [g for _, g in _jobs_with_repo_gate(gated)][-1] is True
