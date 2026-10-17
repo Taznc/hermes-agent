@@ -91,11 +91,32 @@ def _mailbox_blockers(home, ids):
     return []
 
 
+def _admission_blockers(conn, ids):
+    """Upstream's durable session FIFO (Bot Chat deliveries, queued prompts, automation, managed
+    workers) replaced the mailbox as the place pending input waits; same states as
+    ``hermes_state_mutation_guards.require_idle``."""
+    present = {row[0] for row in conn.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('session_admissions','worker_executions')")}
+    marks = ",".join("?" * len(ids))
+    if not ids:
+        return []
+    if "session_admissions" in present and conn.execute(
+        f"SELECT 1 FROM session_admissions WHERE target_session_id IN ({marks}) "
+        "AND status IN ('queued','started','unknown') LIMIT 1", tuple(ids)).fetchone():
+        return ["pending_session_admission"]
+    if "worker_executions" in present and conn.execute(
+        f"SELECT 1 FROM worker_executions WHERE session_id IN ({marks}) "
+        "AND status IN ('registered','running','unknown') LIMIT 1", tuple(ids)).fetchone():
+        return ["managed_worker_execution"]
+    return []
+
+
 def blockers(db, ids, conn):
     home = Path(db.db_path).resolve().parent
     try:
         return (
             _async_blockers(conn, ids)
+            + _admission_blockers(conn, ids)
             + _process_blockers(db, home, ids)
             + _mailbox_blockers(home, ids)
         )

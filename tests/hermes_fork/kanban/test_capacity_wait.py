@@ -267,7 +267,8 @@ def test_dead_worker_is_not_capacity_wait_its_slot_is_reclaimed(board):
     dead = subprocess.Popen([sys.executable, "-c", "pass"])
     dead.wait(10)
     w1 = conn.execute("SELECT id FROM tasks WHERE title='w1'").fetchone()[0]
-    kbd._set_worker_pid(conn, w1, dead.pid)
+    # _set_worker_pid only publishes a claim's FIRST launcher; swap the live one for the dead pid.
+    conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = NULL WHERE id = ?", (dead.pid, w1))
     conn.execute("UPDATE tasks SET started_at = started_at - 3600 WHERE id = ?", (w1,))  # past launch grace
     conn.commit()
     res = _tick(conn, cfg)

@@ -38,19 +38,32 @@ def test_plugin_ui_waiting_request_blocks_idle_parent(db, monkeypatch):
 
 
 def test_mailbox_queued_work_blocks_without_running_parent(db):
-    from tools.bot_live_delivery import deliver_to_live_owner, read_delivery_result
+    """A Bot Chat delivery now waits in upstream's durable session FIFO, not a mailbox file."""
+    import hermes_state_runtime as rt
 
-    home = db.db_path.parent
-    owner = {
-        "profile_home": str(home.resolve()),
-        "session_id": "parent",
-        "live_session_id": "old-live",
-        "lease_id": "lease-test",
-    }
-    ticket = deliver_to_live_owner(home, owner, "pending work")
+    epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+    rt.admit_session_input(db, epoch=epoch, principal_id="owner", session_id="parent",
+                           request_id="bot:" + "a" * 32, payload={"text": "pending work"})
+    with pytest.raises(ValueError, match="pending_session_admission"):
+        db.set_session_archived("parent", True)
+    assert not db.get_session("parent")["archived"]
+
+
+def test_legacy_mailbox_record_still_blocks(db):
+    import json
+
+    from tools.bot_live_delivery import _root
+
+    root = _root(db.db_path.parent)
+    root.mkdir(parents=True, exist_ok=True)
+    did = "b" * 32
+    owner = {"profile_home": str(db.db_path.parent.resolve()), "session_id": "parent",
+             "live_session_id": "old-live", "lease_id": "lease-test"}
+    (root / (did + ".json")).write_text(json.dumps(
+        {"id": did, "delivery_id": did, "status": "queued", "session_id": "parent", "owner": owner,
+         "created_at": 1, "sequence": 1, "message": "pending work"}), encoding="utf-8")
     with pytest.raises(ValueError, match="pending_mailbox_delivery"):
         db.set_session_archived("parent", True)
-    assert read_delivery_result(home, ticket["delivery_id"])["status"] == "queued"
 
 
 def test_rpc_foreign_live_id_cannot_redirect_or_block_requested_profile(

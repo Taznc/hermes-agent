@@ -4,8 +4,6 @@ import os
 import threading
 
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
 
 from hermes_state import SessionDB
 
@@ -19,11 +17,25 @@ def db(tmp_path):
     database.close()
 
 
-def test_compound_patch_rechecks_after_work_starts_on_other_connection(db, monkeypatch):
-    from hermes_cli.web_routers import sessions
-    from hermes_fork.session_archive import archive_blockers
+_COMPOUND = {"title": "changed", "archived": True, "hidden": True, "pinned": True, "unread": True}
 
-    monkeypatch.setattr(sessions, "_with_db", lambda profile, fn, **kwargs: fn(db))
+
+def _authority_patch(db, payload, request_id):
+    """Upstream's one metadata seam: REST, the gateway owner and the offline store all land here."""
+    import hermes_state_runtime as rt
+
+    epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+    return rt.mutate_runtime_session(
+        db, epoch=epoch, principal_id="human", session_id="parent", request_id=request_id,
+        expected_revision=db.get_session("parent")["runtime_revision"], operation="sidebar",
+        payload=payload,
+    )
+
+
+def test_compound_patch_rechecks_after_work_starts_on_other_connection(db, monkeypatch):
+    from hermes_fork.session_archive import archive_blockers
+    from hermes_state_runtime import RuntimeStoreError
+
     assert archive_blockers(db, "parent") == []
     second = SessionDB(db.db_path)
     reached_write, admitted = threading.Event(), threading.Event()
@@ -46,26 +58,16 @@ def test_compound_patch_rechecks_after_work_starts_on_other_connection(db, monke
         assert admitted.wait(5)
         return execute(fn, **kwargs)
 
+    _authority_patch(db, {"title": "original"}, "warm")  # epoch + receipt tables exist
     monkeypatch.setattr(db, "_execute_write", delayed_execute)
     worker = threading.Thread(target=producer)
     worker.start()
-    app = FastAPI()
-    app.include_router(sessions.manage_router)
     try:
-        with TestClient(app) as client:
-            response = client.patch(
-                "/api/sessions/parent",
-                json={
-                    "title": "changed",
-                    "archived": True,
-                    "hidden": True,
-                    "pinned": True,
-                    "unread": True,
-                },
-            )
+        with pytest.raises(RuntimeStoreError) as refused:
+            _authority_patch(db, _COMPOUND, "race")
         worker.join(5)
         assert not worker.is_alive() and not errors
-        assert response.status_code == 409
+        assert refused.value.reason == "session_archive_blocked"
         row = db.get_session("parent")
         assert row["title"] == "original"
         assert not row["archived"] and not row["hidden"] and not row["pinned"]
@@ -76,33 +78,16 @@ def test_compound_patch_rechecks_after_work_starts_on_other_connection(db, monke
         second.close()
 
 
-def test_rest_idle_compound_patch_success_and_busy_unarchive(db, monkeypatch):
-    from hermes_cli.web_routers import sessions
-
-    monkeypatch.setattr(sessions, "_with_db", lambda profile, fn, **kwargs: fn(db))
-    app = FastAPI()
-    app.include_router(sessions.manage_router)
-    with TestClient(app) as client:
-        response = client.patch(
-            "/api/sessions/parent",
-            json={
-                "title": "changed",
-                "archived": True,
-                "hidden": True,
-                "pinned": True,
-                "unread": True,
-            },
-        )
-        assert response.status_code == 200, response.text
-        row = db.get_session("parent")
-        assert row["title"] == "changed" and row["archived"] and row["pinned"]
-        assert not row["hidden"] and row["last_read_at"] == 0
-        assert db.try_acquire_session_turn_lease(
-            "parent", f"pid={os.getpid()}:turn=unarchive"
-        )
-        response = client.patch("/api/sessions/parent", json={"archived": False})
-        assert response.status_code == 200
-        assert not db.get_session("parent")["archived"]
+def test_rest_idle_compound_patch_success_and_busy_unarchive(db):
+    result = _authority_patch(db, _COMPOUND, "compound")
+    assert result["archived"] is True
+    row = db.get_session("parent")
+    assert row["title"] == "changed" and row["archived"] and row["pinned"]
+    assert row["last_read_at"] == 0
+    assert db.try_acquire_session_turn_lease("parent", f"pid={os.getpid()}:turn=unarchive")
+    # Unarchiving a busy session is never refused.
+    assert _authority_patch(db, {"archived": False}, "unarchive")["archived"] is False
+    assert not db.get_session("parent")["archived"]
 
 
 def test_retention_skips_busy_and_continues(db):
