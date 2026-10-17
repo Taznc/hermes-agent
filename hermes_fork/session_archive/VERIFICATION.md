@@ -70,7 +70,7 @@ Do not edit fork-budget.json in this task. Register the new fork-owned `hermes_f
 
 - session-archive-messaging-guard: gateway/platforms/api_server.py (4)
 - session-archive-api-work: gateway/platforms/api_server_runs.py (3)
-- session-archive-rest-guard: hermes_cli/web_routers/sessions.py (4)
+- session-archive-authority-guard: hermes_state_runtime.py (5) — replaced session-archive-rest-guard (hermes_cli/web_routers/sessions.py) in the 2026-10-17 sync, when upstream routed every REST/owner/offline metadata edit through `mutate_runtime_session`
 - session-archive-retention-guard: hermes_state_maintenance.py (3)
 - session-archive-storage-guard: hermes_state_sessions.py (4)
 - session-archive-subagent-owner: tools/delegate_tool_registry.py (3)

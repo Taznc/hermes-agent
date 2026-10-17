@@ -4,7 +4,9 @@
 ANCHOR in ``_default_spawn``. Incident t_f05dab8d: a worker whose workspace was
 a mid-merge Hermes checkout (conflict markers in ``hermes_state_sessions.py``)
 died twice before its first tool call with "invalid decimal literal", because
-``python -m hermes_cli.main`` puts the cwd (= workspace) first on ``sys.path``.
+``python -m <module>`` puts the cwd (= workspace) first on ``sys.path``. Upstream's
+owner-run rewrite launches ``-m hermes_cli.kanban_worker_client``; the guarantee must
+follow whichever module form ``_default_spawn`` builds.
 
 The child-process tests capture the exact argv / env / cwd ``_default_spawn``
 hands ``Popen`` and then really launch that interpreter, in that env and cwd,
@@ -25,6 +27,7 @@ from hermes_cli import kanban_db_dispatch as kbd
 from hermes_fork.kanban.worker_imports import isolate_worker_imports
 
 RUNTIME_ROOT = Path(kbd.__file__).resolve().parents[1]
+WORKER_MODULE = "hermes_cli.kanban_worker_client"
 CONFLICTED = (
     "def broken():\n"
     "<<<<<<< HEAD\n"
@@ -51,7 +54,8 @@ def poisoned_workspace(tmp_path: Path) -> Path:
     """A task workspace that is a conflicted Hermes checkout."""
     ws = tmp_path / "workspace"
     (ws / "hermes_cli").mkdir(parents=True)
-    for rel in ("hermes_cli/__init__.py", "hermes_cli/main.py", "hermes_bootstrap.py",
+    for rel in ("hermes_cli/__init__.py", "hermes_cli/main.py", f"{WORKER_MODULE.replace('.', '/')}.py",
+                "hermes_bootstrap.py",
                 "hermes_state_sessions.py", "hermes_constants.py", "cron/__init__.py",
                 "hermes_fork/__init__.py"):
         path = ws / rel
@@ -79,7 +83,7 @@ def spawn_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, poisoned_work
     # wrapper only prefixes the argv, so it is out of scope for the import test.
     monkeypatch.setattr(kbd, "_restart_safe_worker_argv", lambda task, cmd: cmd)
 
-    def run(*, resolve=None):
+    def run():
         captured = {}
 
         class FakeProc:
@@ -91,8 +95,6 @@ def spawn_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, poisoned_work
 
         with monkeypatch.context() as m:
             m.setattr(subprocess, "Popen", fake_popen)
-            if resolve is not None:
-                m.setattr(kbd, "_resolve_hermes_argv", resolve)
             assert kbd._default_spawn(_make_task(), str(poisoned_workspace)) == 4321
         return captured
 
@@ -100,7 +102,7 @@ def spawn_capture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, poisoned_work
 
 
 def _interpreter_prefix(cmd: list[str]) -> list[str]:
-    """The worker's interpreter + interpreter options, without ``-m hermes_cli.main ...``."""
+    """The worker's interpreter + interpreter options, without ``-m <module> ...``."""
     return cmd[: cmd.index("-m")]
 
 
@@ -139,23 +141,27 @@ def test_worker_imports_runtime_not_conflicted_workspace(spawn_capture, poisoned
     assert AGENTS_MARKER in out["context"]
 
 
-def test_real_worker_launch_boots_from_runtime(spawn_capture, poisoned_workspace):
-    """The exact module launch ``_default_spawn`` builds runs from a conflicted workspace."""
+def test_real_worker_launch_imports_from_runtime(spawn_capture, poisoned_workspace):
+    """The exact interpreter + module ``_default_spawn`` builds resolves from the runtime."""
     cap = spawn_capture()
-    head = cap["cmd"][: cap["cmd"].index("hermes_cli.main") + 1]
+    module = cap["cmd"][cap["cmd"].index("-m") + 1]
+    probe = f"import importlib, json; print(json.dumps(importlib.import_module({module!r}).__file__))"
     proc = subprocess.run(
-        [*head, "--version"], cwd=cap["cwd"], env=cap["env"],
+        [*_interpreter_prefix(cap["cmd"]), "-c", probe], cwd=cap["cwd"], env=cap["env"],
         capture_output=True, text=True, timeout=120,
     )
     assert "invalid decimal literal" not in proc.stderr
     assert "SyntaxError" not in proc.stderr
     assert proc.returncode == 0, proc.stderr[-2000:]
+    import json
+    origin = Path(json.loads(proc.stdout.strip().splitlines()[-1])).resolve()
+    assert origin.is_relative_to(RUNTIME_ROOT) and not origin.is_relative_to(poisoned_workspace.resolve())
 
 
 def test_spawn_identity_and_secrets_survive(spawn_capture, poisoned_workspace):
     cap = spawn_capture()
     env = cap["env"]
-    assert cap["cmd"][1:4] == ["-P", "-m", "hermes_cli.main"]
+    assert cap["cmd"][1:4] == ["-P", "-m", WORKER_MODULE]
     assert env["HERMES_KANBAN_TASK"] == "t_import_iso"
     assert env["HERMES_KANBAN_RUN_ID"] == "11"
     assert env["HERMES_KANBAN_CLAIM_LOCK"] == "lock-xyz"
@@ -172,11 +178,17 @@ def test_spawn_identity_and_secrets_survive(spawn_capture, poisoned_workspace):
     assert all(e and os.path.isabs(e) for e in entries)
 
 
-def test_resolved_shim_argv_is_left_alone(spawn_capture):
+def test_resolved_shim_argv_is_left_alone():
     """HERMES_BIN / PATH shim: a console script owns its imports (no cwd entry)."""
-    cap = spawn_capture(resolve=lambda: ["/opt/hermes/bin/hermes"])
-    assert cap["cmd"][:4] == ["/opt/hermes/bin/hermes", "-p", "elias", "--cli"]
-    assert "-P" not in cap["cmd"]
+    env: dict[str, str] = {}
+    cmd = ["/opt/hermes/bin/hermes", "-p", "elias", "--cli"]
+    assert isolate_worker_imports(list(cmd), env) == cmd
+    assert env == {}
+
+
+def test_both_module_forms_are_isolated():
+    for module in (WORKER_MODULE, "hermes_cli.main"):
+        assert isolate_worker_imports([sys.executable, "-m", module], {})[:4] == [sys.executable, "-P", "-m", module]
 
 
 def test_hermes_bin_path_and_bare_name(monkeypatch, tmp_path):
