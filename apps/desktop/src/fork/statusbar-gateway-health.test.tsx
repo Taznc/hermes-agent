@@ -53,6 +53,7 @@ vi.mock('@/app/shell/system-resources-statusbar', () => ({ useSystemResourcesSta
 
 const options = {
   agentsOpen: false,
+  changeSessionCwd: async () => {},
   chatOpen: true,
   commandCenterOpen: false,
   extraLeftItems: [],

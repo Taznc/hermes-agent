@@ -1,7 +1,8 @@
 """Kanban worker bootstrap imports come from the runtime, never the task workspace (tier T1, see FORK.md).
 
-Upstream launches every module-form worker as ``sys.executable -m hermes_cli.main`` with
-``cwd=<task workspace>``. ``python -m`` puts the current directory at ``sys.path[0]``,
+Upstream launches every Kanban worker in module form -- ``sys.executable -m
+hermes_cli.kanban_worker_client`` since the owner-run worker rewrite, ``-m hermes_cli.main``
+before it -- with ``cwd=<task workspace>``. ``python -m`` puts the current directory at ``sys.path[0]``,
 ahead of PYTHONPATH and site-packages, so a workspace that is itself a Hermes checkout
 supplies ``hermes_bootstrap``, ``hermes_cli`` and everything they import. When that
 checkout is mid-merge (conflict markers in ``hermes_state_sessions.py``) the worker dies
@@ -17,9 +18,9 @@ Fix, using only built-ins:
   user project) keep normal script-dir semantics. ``venv_sync.relaunch_command`` and
   ``_early_recovery`` both carry interpreter options across a relaunch.
 * ``cron.scheduler_worker_env.pin_hermes_tree_on_pythonpath``: the same pin cron's external
-  worker and upstream's ``_propagate_module_import_root`` (#122299/#122487, called just before
-  the anchor) use, so without the cwd entry the worker still imports exactly the
-  dispatcher's tree. Idempotent: re-applied here only so the root stays first after the
+  worker and upstream's own ``_default_spawn`` (called just before the anchor) use, so
+  without the cwd entry the worker still imports exactly the dispatcher's tree. That pin
+  alone does not close the hole: PYTHONPATH sits after ``sys.path[0]``. Idempotent: re-applied here only so the root stays first after the
   filter below, and so the guarantee does not depend on that upstream call staying put.
 * Empty / relative PYTHONPATH entries are dropped: Python resolves them against the cwd,
   which would reopen the same hole.
@@ -30,8 +31,8 @@ AGENTS.md / context loading stay rooted in the workspace. A resolved shim
 directory on ``sys.path``, not the cwd, so it already owns its imports.
 
 Called from exactly one site: the ``worker-import-isolation`` FORK ANCHOR in
-``hermes_cli.kanban_db_dispatch._default_spawn``, right after upstream's
-``_propagate_module_import_root`` and before the restart-safe systemd wrapper.
+``hermes_cli.kanban_db_dispatch._default_spawn``, right after upstream's PYTHONPATH pin and
+before the restart-safe systemd wrapper.
 """
 
 from __future__ import annotations
@@ -39,12 +40,13 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-_MODULE_FORM = ["-m", "hermes_cli.main"]
+# Every module-form worker launch: the owner-run client, and the legacy ``main`` fallback.
+_MODULE_FORMS = (["-m", "hermes_cli.kanban_worker_client"], ["-m", "hermes_cli.main"])
 
 
 def isolate_worker_imports(cmd: list[str], env: dict[str, str]) -> list[str]:
     """Return the worker argv with cwd-free imports; mutates ``env`` for module-form launches only."""
-    if cmd[1:3] != _MODULE_FORM:
+    if cmd[1:3] not in _MODULE_FORMS:
         return cmd
     from cron.scheduler_worker_env import pin_hermes_tree_on_pythonpath
 

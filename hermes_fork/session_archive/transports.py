@@ -20,45 +20,6 @@ def archive_mutation(db, session_id, mutate, aliases=()):
         return db._execute_write(update)
 
 
-async def rest_patch(session_id, body, scope):
-    from fastapi import HTTPException
-
-    def update(db):
-        sid = scope["_resolve_session_id"](db, session_id)
-        if not sid:
-            raise HTTPException(status_code=404, detail="Session not found")
-
-        def mutate(view):
-            if body.title is not None:
-                view.set_session_title(sid, body.title or "")
-            result = {"ok": True, "title": None}
-            for flag, setter in scope["_RENAME_FLAG_SETTERS"]:
-                value = getattr(body, flag)
-                if value is not None:
-                    setter(view, sid, value)
-                    result[flag] = bool(value)
-            result["title"] = view.get_session_title(sid) or ""
-            return result
-
-        try:
-            return archive_mutation(db, sid, mutate)
-        except SessionArchiveBlocked as exc:
-            raise HTTPException(
-                status_code=409,
-                detail={
-                    "code": "session_archive_blocked",
-                    "message": str(exc),
-                    "blockers": exc.blockers,
-                },
-            ) from exc
-        except ValueError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    return await asyncio.to_thread(
-        scope["_with_db"], body.profile, update, read_only=False
-    )
-
-
 async def messaging_patch(adapter, db, session_id, body):
     from aiohttp import web
 

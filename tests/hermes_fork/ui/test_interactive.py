@@ -15,7 +15,7 @@ from agent.tool_dispatch_helpers import _plan_tool_batch_segments
 from hermes_cli import plugins as plugins_mod
 from hermes_fork.ui import interactive
 
-_UPSTREAM = frozenset({"clarify", "manage_connections", "manage_catalog", "setup_choose"})
+_UPSTREAM = frozenset({"clarify", "manage_connections", "manage_catalog", "setup_beat", "set_theme"})
 
 
 def _tc(name, arguments="{}", call_id=None):

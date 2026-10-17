@@ -36,27 +36,36 @@ def assert_original(db):
     assert row["last_read_at"] is None
 
 
-def test_rest_compound_patch_rejected_without_any_mutation(db, monkeypatch):
-    from hermes_cli.web_routers import sessions
+def _authority_patch(db, payload, request_id="sidebar-1"):
+    """The canonical seam upstream routes REST, gateway-owner and offline edits through."""
+    import hermes_state_runtime as rt
 
-    monkeypatch.setattr(sessions, "_with_db", lambda profile, fn, **kwargs: fn(db))
-    app = FastAPI()
-    app.include_router(sessions.manage_router)
+    epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+    revision = db.get_session("parent")["runtime_revision"]
+    return rt.mutate_runtime_session(
+        db, epoch=epoch, principal_id="human", session_id="parent", request_id=request_id,
+        expected_revision=revision, operation="sidebar", payload=payload,
+    )
+
+
+def test_authority_compound_patch_rejected_without_any_mutation(db):
+    from hermes_state_runtime import RuntimeStoreError
+
     busy(db)
-    with TestClient(app) as client:
-        response = client.patch(
-            "/api/sessions/parent",
-            json={
-                "title": "changed",
-                "archived": True,
-                "hidden": True,
-                "pinned": True,
-                "unread": True,
-            },
-        )
-    assert response.status_code == 409
-    assert response.json()["detail"]["code"] == "session_archive_blocked"
+    with pytest.raises(RuntimeStoreError) as refused:
+        _authority_patch(db, {"title": "changed", "archived": True, "hidden": True,
+                              "pinned": True, "unread": True})
+    assert refused.value.reason == "session_archive_blocked"
     assert_original(db)
+
+
+def test_authority_archive_commits_when_idle_and_non_archive_edits_skip_the_guard(db):
+    busy(db)
+    # A busy session still takes a non-archive sidebar edit (only archiving is admission-gated).
+    assert _authority_patch(db, {"pinned": True}, request_id="pin")["pinned"] is True
+    db.release_session_turn_lease("parent", f"pid={os.getpid()}:turn=wire-test")
+    assert _authority_patch(db, {"archived": True}, request_id="arch")["archived"] is True
+    assert db.get_session("parent")["archived"]
 
 
 @pytest.mark.asyncio
