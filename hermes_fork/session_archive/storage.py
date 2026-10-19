@@ -15,6 +15,21 @@ def _guarded_archive(db, session_id, write):
         return db._execute_write(update)
 
 
+def admit_archive(db, session_id, archived, do):
+    """Run upstream ``set_session_archived``'s transaction *do(conn)*; an archive first passes
+    owned-work admission in that same transaction. Upstream keeps the lineage SQL, the provenance
+    clear and the post-commit ``on_session_delete`` event (``session-archive-storage-guard``)."""
+    if not archived:
+        return db._execute_write(do)
+    with owned_work_scope(db, session_id) as work:
+
+        def update(conn):
+            assert_archivable(db, conn, session_id, work)
+            return do(conn)
+
+        return db._execute_write(update)
+
+
 def set_archived(db, session_id, archived):
     # A deliberate archive or unarchive owns the provenance, so clear the idle
     # sweep's auto_archived stamp in the same UPDATE (upstream contract).

@@ -11,13 +11,24 @@ from .activity import owned_work_scope, record_home
 
 
 def archive_mutation(db, session_id, mutate, aliases=()):
+    events = []
     with owned_work_scope(db, session_id, aliases) as work:
 
         def update(conn):
+            events.clear()  # the write may retry; keep only the committed attempt's flips
             assert_archivable(db, conn, session_id, work)
-            return mutate(TransactionView(db, conn))
+            view = TransactionView(db, conn)
+            result = mutate(view)
+            events.extend(view.archive_events)
+            return result
 
-        return db._execute_write(update)
+        result = db._execute_write(update)
+    # Upstream's on_session_delete (#124511) for each deliberate archive, after commit.
+    from hermes_state_common import emit_session_deleted
+
+    for ids, primary in events:
+        emit_session_deleted(db, ids, reason="archive", primary=primary)
+    return result
 
 
 async def messaging_patch(adapter, db, session_id, body):
