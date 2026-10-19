@@ -43,6 +43,9 @@ class TransactionView:
     def __init__(self, db, conn):
         self.db = db
         self.conn = conn
+        # (lineage ids, primary) per real unarchived -> archived flip; the owner emits
+        # upstream's on_session_delete for each after commit (transports.archive_mutation).
+        self.archive_events = []
 
     def __getattr__(self, name):
         value = getattr(self.db, name)
@@ -50,11 +53,19 @@ class TransactionView:
             return MethodType(value.__func__, self)
         return value
 
-    def set_session_archived(self, session_id, archived):
-        # Admission was already performed for this transaction.
-        return self._set_lineage_column(
-            "archived", session_id, int(archived), extra_set_sql=DELIBERATE_ARCHIVE_SET_SQL
+    def set_session_archived(self, session_id, archived, *, notify=True):
+        # Admission was already performed for this transaction. Same flip predicate as
+        # upstream SessionDB.set_session_archived, whose post-commit event this view defers.
+        row = self.conn.execute(
+            "SELECT archived FROM sessions WHERE id = ?", (session_id,)
+        ).fetchone()
+        ids = self._set_lineage_column_in_transaction(
+            self.conn, "archived", session_id, int(archived),
+            extra_set_sql=DELIBERATE_ARCHIVE_SET_SQL,
         )
+        if notify and archived and ids and row is not None and not row[0]:
+            self.archive_events.append((ids, session_id))
+        return bool(ids)
 
     def _execute_write(self, fn, **kwargs):
         return fn(self.conn)
