@@ -24,15 +24,20 @@ Resolution when the flag is on (never raises; any failure -> ``workspace_default
   override means "bound to no cwd" and yields the default); else, only when no
   session override is installed at all (local CLI build), ``TERMINAL_CWD`` then
   ``os.getcwd()``.
-* identity cascade:
-  1. the declared Hermes project owning cwd (``$HERMES_HOME/projects.db``) -> its slug;
-  2. the git repository root's name: the session row's ``git_repo_root`` when present,
-     else a bounded ``.git`` walk-up (no subprocess). A ``.git`` FILE (linked worktree,
+* identity cascade (one repo -> exactly one bank, spelled exactly like the repo dir):
+  1. the git repository root's name, case preserved: a bounded ``.git`` walk-up (no
+     subprocess). A ``.git`` FILE (linked worktree,
      ``gitdir: <main>/.git/worktrees/<name>``) resolves to the MAIN repo's toplevel name,
      so Kanban worktrees (``<repo>/.worktrees/<task>`` or
      ``$HERMES_HOME/kanban/boards/<board>/workspaces/<task>``) share the project's bank.
      The ``.git`` check runs BEFORE the ``$HERMES_HOME`` exclusion for that reason;
-     a plain ``.git`` directory under ``$HERMES_HOME`` is still non-workspace;
+     a plain ``.git`` directory under ``$HERMES_HOME`` is still non-workspace.
+     This is deliberately ahead of the declared project: a project slug is LOWERCASED by
+     ``projects_db._slugify``, while the Claude Code / Codex Hindsight hooks name the bank
+     after the repo directory verbatim, so slug-first split ``Sweep`` into
+     ``project-sweep`` and ``project-Sweep`` (likewise ``DockerComposeSwarm``);
+  2. the declared Hermes project owning cwd (``$HERMES_HOME/projects.db``) -> its slug,
+     now only for folders that are not inside a git repository;
   3. the session row's ``git_repo_root`` hint (Desktop-stamped) when cwd itself is not
      inside a repo;
   4. everything else -> ``workspace_default``: never-a-workspace paths (``/``, ``$HOME``,
@@ -230,8 +235,8 @@ def _project_slug(path: str) -> str:
 
 
 def resolve_workspace_identity(cwd: str, *, repo_root: str = "") -> str:
-    """Workspace identity for *cwd*: project slug, else git repo name (cwd, then the
-    ``repo_root`` hint); ``""`` for everything else. Never raises."""
+    """Workspace identity for *cwd*: git repo name (case preserved), else the declared
+    project slug, else the ``repo_root`` hint's name; ``""`` for everything else. Never raises."""
     raw = str(cwd or "").strip()
     if not raw:
         return ""
@@ -239,12 +244,13 @@ def resolve_workspace_identity(cwd: str, *, repo_root: str = "") -> str:
         path = os.path.abspath(os.path.expanduser(raw))
     except Exception:
         return ""
-    if slug := _project_slug(path):
-        return slug
-    # Git first: a worktree .git file under $HERMES_HOME still names the main repo.
+    # Git first: a worktree .git file under $HERMES_HOME still names the main repo, and the
+    # repo name keeps its case (see the module docstring for why this beats the slug).
     with suppress(Exception):
         if (name := _git_root_name(path)) is not None:
             return name
+    if slug := _project_slug(path):
+        return slug
     if _is_non_workspace(path):
         return ""
     root = str(repo_root or "").strip()
