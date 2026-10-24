@@ -1185,15 +1185,15 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
                 continue
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
                 continue
+            # An ambiguous receipt holds the card while the attempt may still run; once nothing
+            # can be executing it (a dead bound interpreter, or a run that never bound one): crash.
+            if owner_reclaim_blocked(conn, row["id"], crash_sweep=True):
+                continue
             # >>> FORK ANCHOR: infra-interruptions <<<
             from hermes_fork.kanban.infra_interruptions import book_host_restart as _fork_host_restart
             if _fork_host_restart(conn, row, sweep, board=board):
                 continue
             # <<< FORK ANCHOR >>>
-            # An ambiguous receipt holds the card while the attempt may still run; once nothing
-            # can be executing it (a dead bound interpreter, or a run that never bound one): crash.
-            if owner_reclaim_blocked(conn, row["id"], crash_sweep=True):
-                continue
 
             pid = int(row["worker_pid"])
             # A managed run's authority-recorded exit (its bound interpreter's, under this claim).
