@@ -1,0 +1,40 @@
+/* Fork-owned (web desktop only): fit the shell to the VISIBLE viewport on
+   phones. Loaded by index-web.html via src/fork/web-viewport.ts and scoped to
+   html[data-hermes-desktop-host='browser'], which only index-web.html sets, so
+   Electron windows never see these rules.
+
+   Why: the shell sizes itself with Tailwind `h-screen` (100vh) in
+   app/contrib/controller.tsx. iOS Safari resolves 100vh to the LARGE viewport
+   (toolbars hidden), but html/body/#root are `overflow: hidden`, so the
+   toolbars never collapse and the bottom-anchored composer + statusbar render
+   under Safari's toolbar. Mirrors upstream PR #141864 (h-screen -> h-full,
+   16px touch inputs, VisualViewport fit); retire when that lands. */
+
+html[data-hermes-desktop-host='browser'] #root .h-screen {
+  height: 100%;
+}
+
+html[data-hermes-desktop-host='browser'] [data-slot='sidebar-wrapper'] {
+  min-height: 0;
+}
+
+/* Keyboard open on browsers without interactive-widget support: the tracker
+   in web-viewport.ts publishes the visible height/offset. */
+html[data-hermes-desktop-host='browser'] #root[data-browser-viewport] {
+  position: relative;
+  top: var(--browser-viewport-top);
+  height: var(--browser-viewport-height);
+}
+
+/* iOS Safari zooms into any focused field under 16px and stays zoomed after
+   the keyboard closes. Floor text entry on touch devices; a larger chat-text
+   scale still wins in the composer. */
+@media (hover: none), (pointer: coarse) {
+  html[data-hermes-desktop-host='browser'] :is(input, textarea, select) {
+    font-size: max(16px, 1em);
+  }
+
+  html[data-hermes-desktop-host='browser'] [data-slot='composer-rich-input'] {
+    font-size: max(16px, var(--conversation-text-font-size));
+  }
+}
