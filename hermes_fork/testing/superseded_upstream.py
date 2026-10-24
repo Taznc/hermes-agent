@@ -17,8 +17,14 @@ _LIFECYCLE = ("t_3c25b726 lifecycle consent (hermes_fork/lifecycle_consent.py): 
               "of hardline-deny, and lifecycle commands are never auto-approved by any mode. Replacement "
               "assertions: tests/hermes_fork/test_lifecycle_consent.py")
 
+_ANTHROPIC_PERCENT = ("anthropic-utilization-percent (hermes_fork/anthropic_usage_percent.py): Anthropic oauth/usage "
+                      "`utilization` is already a percent, so 1.0 is 1%, not 100%. Replacement assertions: "
+                      "tests/hermes_fork/test_anthropic_usage_percent.py")
+
 # node id (relative to the repo root) -> reason
 SUPERSEDED: dict[str, str] = {
+    "tests/agent/test_account_usage_pool_fetch.py::"
+    "test_anthropic_fetch_honors_explicit_api_key_and_marks_model_scoped_windows": _ANTHROPIC_PERCENT,
     "tests/hermes_cli/test_approvals_test.py::TestVerdicts::test_hardline_command_denies_with_rule_name": _LIFECYCLE,
     "tests/hermes_cli/test_approvals_test.py::TestVerdicts::test_mode_off_bypasses_dangerous_but_not_hardline":
         _LIFECYCLE,

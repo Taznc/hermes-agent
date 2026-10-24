@@ -628,6 +628,10 @@ def _usage_windows(
         ))
     return windows
 
+# >>> FORK ANCHOR: anthropic-utilization-percent <<<
+from hermes_fork.anthropic_usage_percent import percent_utilization
+_usage_windows = percent_utilization(_usage_windows)
+# <<< FORK ANCHOR >>>
 
 # Published Codex quota windows by ``limit_window_seconds``: 5h session and 7-day weekly.
 _CODEX_WINDOW_LABELS_BY_SECONDS = {18000: "Session", 604800: "Weekly"}
