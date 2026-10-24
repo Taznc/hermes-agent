@@ -266,10 +266,21 @@ def test_session_db_failure_is_swallowed(isolated, monkeypatch):
 # ── flag on: project slug (arm 1) ─────────────────────────────────────────────
 
 
-def test_declared_project_slug_wins_over_git(isolated, monkeypatch):
-    repo = _repo(isolated.work / "git-name")
+def test_git_repo_name_wins_over_declared_project_slug(isolated, monkeypatch):
+    """One repo -> one bank: the (lowercased) slug must not rename a repo the other
+    Hindsight writers name after its directory (``Sweep`` vs ``sweep``)."""
+    repo = _repo(isolated.work / "MixedCase")
+    monkeypatch.setattr(ws, "_project_slug", lambda path: "mixedcase")
+    assert ws.agent_workspace(_agent(cwd=str(repo)), ON) == "MixedCase"
+    cfg = {**ON, "workspace_prefix": "project-"}
+    assert ws.agent_workspace(_agent(cwd=str(repo)), cfg) == "project-MixedCase"
+
+
+def test_declared_project_slug_names_a_non_git_folder(isolated, monkeypatch):
+    folder = isolated.work / "plain-folder"
+    folder.mkdir(parents=True)
     monkeypatch.setattr(ws, "_project_slug", lambda path: "declared-slug")
-    assert ws.agent_workspace(_agent(cwd=str(repo)), ON) == "declared-slug"
+    assert ws.agent_workspace(_agent(cwd=str(folder)), ON) == "declared-slug"
 
 
 def test_declared_project_via_real_projects_db(tmp_path, monkeypatch, isolated):
