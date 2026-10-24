@@ -2,7 +2,7 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, interactive-widget=resizes-content" />
     <meta name="color-scheme" content="light dark" />
     <meta name="theme-color" content="#0a0a0a" />
     <link rel="icon" type="image/png" sizes="180x180" href="/apple-touch-icon.png" />
@@ -12,6 +12,9 @@
     <script>
       // Pre-paint the themed background before the app bundle loads (mirrors
       // index.html — avoids the white flash).
+      // Browser host marker (src/fork/web-viewport.css scopes phone viewport
+      // fixes to it). Set before paint so the first layout already fits.
+      document.documentElement.dataset.hermesDesktopHost = 'browser'
       try {
         let bg = localStorage.getItem('hermes-boot-background')
         let scheme = localStorage.getItem('hermes-boot-color-scheme')
@@ -35,6 +38,7 @@
          scripts execute in document order, so window.hermesDesktop exists by
          the time main.tsx's graph evaluates. -->
     <script type="module" src="/src/web-bridge-shim.ts"></script>
+    <script type="module" src="/src/fork/web-viewport.ts"></script>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
