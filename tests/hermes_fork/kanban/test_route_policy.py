@@ -383,3 +383,81 @@ def test_empty_endpoint_keys_are_not_overrides(home, spawned):
         tid = kb.create_task(conn, title="empty base_url", assignee="alpha")
         _dispatch(conn)
         assert spawned == [tid]
+
+
+# -- delegated children (delegation.*) ----------------------------------------------------
+#
+# Managed workers may call delegate_task, so a child's route is a route the
+# card can run on. Admission judges it with the same allowlist.
+
+
+@pytest.mark.parametrize("delegation_yaml", [
+    "",  # no delegation section at all
+    # what `hermes config get delegation` shows for every live profile
+    "delegation:\n  backend: default\n  backends: {}\n  model: ''\n  provider: ''\n"
+    "  fallback_providers: null\n  base_url: ''\n  api_key: ''\n  reasoning_effort: ''\n",
+    "delegation:\n  max_concurrent_children: 2\n",  # backend unset
+    "delegation:\n  fallback_providers: []\n",  # explicit no-fallback
+])
+def test_default_or_unset_delegation_spawns(home, spawned, delegation_yaml):
+    _profile(home, "alpha", APPROVED_PROFILE + delegation_yaml)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="deleg default", assignee="alpha")
+        _dispatch(conn)
+        assert spawned == [tid]
+
+
+@pytest.mark.parametrize("backend", ["model_map", "profile_routes", "Model_Map"])
+def test_non_default_delegation_backend_is_denied(home, spawned, backend):
+    """A plugin backend routes children on its own tables (model_map routes,
+    other profiles), none of which admission resolved."""
+    _profile(home, "alpha", APPROVED_PROFILE + f"delegation:\n  backend: {backend}\n")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="deleg backend", assignee="alpha")
+        res = _dispatch(conn)
+        _assert_denied(conn, res, spawned, tid, "delegation.backend", backend.casefold())
+
+
+@pytest.mark.parametrize("delegation_yaml, needle", [
+    # model pinned, provider inherited from the worker's primary
+    ("delegation:\n  model: gpt-6-sol\n", "delegation anthropic/gpt-6-sol/high"),
+    # provider + model pinned, effort inherited (high): Sol is approved only at medium
+    ("delegation:\n  provider: openai-codex\n  model: gpt-6-sol\n", "delegation openai-codex/gpt-6-sol/high"),
+    # provider pinned, model inherited
+    ("delegation:\n  provider: openrouter\n", "delegation openrouter/claude-opus-5-5/high"),
+    # effort pinned on the inherited route
+    ("delegation:\n  reasoning_effort: xhigh\n", "delegation anthropic/claude-opus-5-5/xhigh"),
+    # approved triple redirected to another endpoint
+    ("delegation:\n  model: claude-opus-5-5\n  base_url: https://proxy.example/v1\n", "delegation.base_url"),
+])
+def test_pinned_unapproved_delegation_route_is_denied(home, spawned, delegation_yaml, needle):
+    _profile(home, "alpha", APPROVED_PROFILE + delegation_yaml)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="deleg pinned bad", assignee="alpha")
+        res = _dispatch(conn)
+        _assert_denied(conn, res, spawned, tid, needle)
+
+
+@pytest.mark.parametrize("delegation_yaml", [
+    "delegation:\n  model: claude-sonnet-5-5\n",
+    "delegation:\n  provider: openai-codex\n  model: gpt-6-sol\n  reasoning_effort: medium\n",
+])
+def test_pinned_approved_delegation_route_spawns(home, spawned, delegation_yaml):
+    _profile(home, "alpha", APPROVED_PROFILE + delegation_yaml)
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="deleg pinned ok", assignee="alpha")
+        _dispatch(conn)
+        assert spawned == [tid]
+
+
+@pytest.mark.parametrize("entry, needle", [
+    # child fallback re-resolves the profile's effort (high); Sol is medium-only
+    ("provider: openai-codex\n    model: gpt-6-sol", "delegation.fallback[0] openai-codex/gpt-6-sol/high"),
+    ("provider: nous\n    model: claude-opus-5-5", "Nous Portal"),
+])
+def test_unapproved_delegation_fallback_is_denied(home, spawned, entry, needle):
+    _profile(home, "alpha", APPROVED_PROFILE + f"delegation:\n  fallback_providers:\n  - {entry}\n")
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="deleg fb bad", assignee="alpha")
+        res = _dispatch(conn)
+        _assert_denied(conn, res, spawned, tid, needle)
