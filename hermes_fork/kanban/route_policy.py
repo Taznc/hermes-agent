@@ -18,7 +18,14 @@ What is checked, per card:
 * EVERY fallback route the worker could switch to (``fallback_providers`` /
   ``fallback_model``, root and ``model.``-nested), each at the effort the
   fallback activation re-resolves from config (the task's ``--reasoning`` does
-  not survive a fallback swap).
+  not survive a fallback swap);
+* every route a ``delegate_task`` CHILD of the worker could run on (managed
+  workers may delegate): ``delegation.backend`` must be ``default`` (or
+  unset), since a plugin backend (``model_map``, ``profile_routes``) picks
+  child routes admission cannot resolve; a pinned ``delegation.model`` /
+  ``provider`` / ``reasoning_effort`` (unset = inherit the worker's own) and
+  every explicit ``delegation.fallback_providers`` entry are judged like the
+  worker's own routes, and ``delegation.base_url`` / ``api_key`` fail closed.
 
 Each ``(provider, model, effort)`` triple must be an exact member of
 :data:`APPROVED_UNATTENDED_ROUTES`. Anything unresolved (no model, provider
@@ -33,8 +40,8 @@ reason (sticky: ``recompute_ready`` never auto-resumes it; an unblock that
 hits the same denial again escalates to triage via the block-loop breaker).
 
 This is NOT the create-time ``kanban.model_routing`` classifier from ``dev``
-(it picks a route when a card is created); that stays unported — it is
-disabled in the live config.
+(it picks a route when a card is created); that is dropped, superseded by the
+per-task model override (checked here) — see the feature ledger.
 """
 
 from __future__ import annotations
@@ -181,6 +188,66 @@ def resolve_routes(task: "Task", config: dict) -> list[Route]:
     return routes
 
 
+def delegation_backend_denial(config: dict) -> Optional[str]:
+    """Why the assignee's ``delegation.backend`` may not run unattended, or ``None``.
+
+    Only the ``default`` backend routes children from the ``delegation.*`` keys
+    judged by :func:`delegation_routes`; a plugin backend (``model_map``,
+    ``profile_routes``, ...) picks child routes from its own tables, which
+    admission does not resolve, so any other backend fails closed.
+    """
+    from agent.delegation_registry import DEFAULT_BACKEND, configured_backend
+
+    deleg = config.get("delegation") if isinstance(config, dict) else None
+    backend = configured_backend(deleg) if isinstance(deleg, dict) else DEFAULT_BACKEND
+    if backend == DEFAULT_BACKEND:
+        return None
+    return (f"delegation.backend {backend!r} is denied: only the {DEFAULT_BACKEND!r} backend routes "
+            "delegated children on routes admission can check")
+
+
+def delegation_routes(config: dict, primary: Route) -> list[Route]:
+    """Routes a ``delegate_task`` child of this worker could run on beyond *primary* and its fallbacks.
+
+    Mirrors ``tools.delegate_tool_config``: an unset ``delegation.model`` /
+    ``provider`` / ``reasoning_effort`` inherits the worker's own (already
+    judged) value, so a child with nothing pinned adds no route. Anything pinned
+    yields one ``delegation`` route; endpoint keys (``base_url``, ``api_key``,
+    ...) fail closed like ``model.base_url``. An explicit
+    ``delegation.fallback_providers`` list is the child's own chain, each entry
+    judged at the effort the fallback activation re-resolves from config;
+    ``null`` (inherit the worker's judged chain) and ``[]`` add nothing.
+    """
+    from hermes_cli.fallback_config import get_fallback_chain
+
+    deleg = config.get("delegation") if isinstance(config, dict) else None
+    if not isinstance(deleg, dict):
+        return []
+    model = str(deleg.get("model") or "").strip()
+    provider = str(deleg.get("provider") or "").strip()
+    endpoint = tuple(f"delegation.{k}" for k in _endpoint_overrides(deleg))
+    raw_effort = deleg.get("reasoning_effort")
+    effort = primary.effort
+    if raw_effort or raw_effort is False:
+        from hermes_constants import parse_reasoning_effort
+
+        # An unknown level is logged and ignored by the delegate tool: the child inherits.
+        effort = _effort_label(parse_reasoning_effort(raw_effort)) or primary.effort
+    routes: list[Route] = []
+    if model or provider or endpoint or effort != primary.effort:
+        routes.append(Route("delegation", _clean(provider) or primary.provider,
+                            _clean(model) or primary.model, effort, endpoint))
+    declared = deleg.get("fallback_providers")
+    if declared is not None and declared != []:
+        for i, entry in enumerate(get_fallback_chain({"fallback_providers": declared})):
+            fb_model = str(entry.get("model") or "").strip()
+            routes.append(Route(
+                f"delegation.fallback[{i}]", _clean(entry.get("provider")), _clean(fb_model),
+                _config_effort(config, fb_model), _endpoint_overrides(entry),
+            ))
+    return routes
+
+
 def route_denial(route: Route) -> Optional[str]:
     """Why *route* may not run unattended, or ``None`` when it is approved."""
     if not route.model or not route.provider or route.provider == "auto" or not route.effort:
@@ -214,7 +281,15 @@ def unattended_route_denial(task: "Task", config: Optional[dict] = None) -> Opti
         if not task.assignee:
             return "card has no assignee profile to resolve a route from"
         config = load_assignee_config(task.assignee)
-    for route in resolve_routes(task, config):
+    routes = resolve_routes(task, config)
+    for route in routes:
+        reason = route_denial(route)
+        if reason:
+            return reason
+    reason = delegation_backend_denial(config)
+    if reason:
+        return reason
+    for route in delegation_routes(config, routes[0]):
         reason = route_denial(route)
         if reason:
             return reason
