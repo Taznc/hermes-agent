@@ -447,9 +447,9 @@ def _require_own_dependencies(project_root: Path) -> None:
     if sys.prefix != sys.base_prefix:
         return  # a venv interpreter (developer .venv, test env) carries its own packages
     # >>> FORK ANCHOR: borrowed-home-deps <<<
-    from hermes_fork.borrowed_home_deps import activate_borrowed_dependencies
-    if activate_borrowed_dependencies(project_root):
-        return  # a borrowed HERMES_HOME boots on the owning root's committed environment
+    with __import__("contextlib").suppress(ModuleNotFoundError):  # a cold PM bootstrap closure has no hermes_fork
+        from hermes_fork.borrowed_home_deps import activate_borrowed_dependencies
+        if activate_borrowed_dependencies(project_root): return  # a borrowed HERMES_HOME boots on the owner's env
     # <<< FORK ANCHOR >>>
     if Path(sys.base_prefix).resolve().is_relative_to(store_root(project_root).resolve()):
         raise NoCommittedEnvironment("no dependency environment is committed for this install")
