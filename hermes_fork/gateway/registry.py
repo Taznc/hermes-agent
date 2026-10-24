@@ -134,6 +134,13 @@ def _install_gateway_seams(server) -> None:
         logger.exception("config cache adapter failed to install; retaining upstream raw config handling")
 
     try:
+        # Terminal commands of a systemd-service backend get their own scope; stale ones are swept.
+        from hermes_fork.terminal_scope import install as install_terminal_scope
+        install_terminal_scope()
+    except Exception:
+        logger.exception("terminal scope seam failed to install; commands share the host cgroup")
+
+    try:
         from hermes_fork.gateway.session_surface import install as install_session_surface
         install_session_surface(server)
     except Exception:

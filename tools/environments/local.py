@@ -1105,6 +1105,10 @@ class LocalEnvironment(BaseEnvironment):
         if login:
             cmd_string = _prepend_shell_init(cmd_string, _resolve_shell_init_files())
         args = [bash, *(["-l"] if login else []), "-c", cmd_string]
+        # >>> FORK ANCHOR: terminal-scope <<<
+        from hermes_fork.terminal_scope import scope_foreground
+        args = scope_foreground(args)  # own cgroup when a systemd service backend runs it
+        # <<< FORK ANCHOR >>>
         self._recover_cwd()
         proc = subprocess.Popen(
             args, text=True, env=_make_run_env(self.env), encoding="utf-8", errors="replace",
