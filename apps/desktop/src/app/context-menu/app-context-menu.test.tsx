@@ -551,7 +551,7 @@ describe('AppContextMenu', () => {
   })
 
   it('offers Copy message on a chat message right-click and copies the whole message', async () => {
-    const writeClipboard = vi.fn().mockResolvedValue(undefined)
+    const writeClipboard = vi.fn().mockResolvedValue(true)
 
     installBridge({ writeClipboard })
     mountMenu()

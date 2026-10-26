@@ -632,7 +632,7 @@ def _sanitize_chat_upload_filename(filename: str | None) -> str:
     return candidate or "upload"
 
 
-@router.post("/api/chat/file-upload")
+@router.post("/api/chat/file-upload-data-url")
 async def upload_chat_file(payload: ChatFileUpload, profile: Optional[str] = None):
     """Persist a browser-provided non-image chat attachment for staging.
 

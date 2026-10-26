@@ -1,8 +1,12 @@
-"""Tests for POST /api/chat/file-upload (browser +Files picker / OS file drop).
+"""Tests for POST /api/chat/file-upload-data-url (browser +Files picker / OS file drop).
 
 Fork web-desktop bridge: the web-served renderer's '+' Files picker and OS
 drops stage raw browser bytes through this route (web-bridge-shim.ts
 uploadFileBuffer) because a browser never exposes a filesystem path.
+
+The route has its own path: ``/api/chat/file-upload`` is upstream's multipart
+route (``web_routers/uploads.py``, webapp surface only), which a JSON route on
+the same path, mounted earlier, would shadow.
 """
 
 from __future__ import annotations
@@ -31,7 +35,7 @@ def test_post_chat_file_upload_requires_auth(client):
     from hermes_cli.web_server import _SESSION_HEADER_NAME
 
     resp = client.post(
-        "/api/chat/file-upload",
+        "/api/chat/file-upload-data-url",
         json={"data_url": "data:text/plain;base64,aGVsbG8=", "filename": "notes.txt"},
         headers={_SESSION_HEADER_NAME: "wrong-token"},
     )
@@ -42,7 +46,7 @@ def test_post_chat_file_upload_stages_bytes_under_uploads_dir(client):
     from hermes_constants import get_hermes_home
 
     resp = client.post(
-        "/api/chat/file-upload",
+        "/api/chat/file-upload-data-url",
         json={"data_url": "data:text/plain;base64,aGVsbG8gd29ybGQ=", "filename": "notes.txt"},
     )
 
@@ -62,7 +66,7 @@ def test_post_chat_file_upload_stages_bytes_under_uploads_dir(client):
 
 def test_post_chat_file_upload_sanitizes_path_traversal_in_filename(client):
     resp = client.post(
-        "/api/chat/file-upload",
+        "/api/chat/file-upload-data-url",
         json={"data_url": "data:text/plain;base64,eA==", "filename": "../../etc/passwd"},
     )
 
@@ -80,7 +84,7 @@ def test_post_chat_file_upload_rejects_oversized_payload(client):
     oversized = b"x" * (ws._FS_DATA_URL_MAX_BYTES + 1)
 
     resp = client.post(
-        "/api/chat/file-upload",
+        "/api/chat/file-upload-data-url",
         json={
             "data_url": f"data:application/octet-stream;base64,{base64.b64encode(oversized).decode()}",
             "filename": "big.bin",
@@ -92,7 +96,7 @@ def test_post_chat_file_upload_rejects_oversized_payload(client):
 
 def test_post_chat_file_upload_rejects_non_data_url_payload(client):
     resp = client.post(
-        "/api/chat/file-upload",
+        "/api/chat/file-upload-data-url",
         json={"data_url": "not-a-data-url", "filename": "notes.txt"},
     )
 

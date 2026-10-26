@@ -192,7 +192,7 @@ const stagedFileDisplayNames = new Map<string, string>()
 
 async function uploadFileBuffer(bytes: Uint8Array, filename: string, mimeType?: string): Promise<string> {
   const result = await api<{ path?: string }>({
-    path: '/api/chat/file-upload',
+    path: '/api/chat/file-upload-data-url',
     method: 'POST',
     body: {
       data_url: `data:${mimeType || 'application/octet-stream'};base64,${bytesToBase64(bytes)}`,
