@@ -196,6 +196,10 @@ def scope_foreground(args: list[str]) -> list[str]:
     """Wrap a foreground ``bash -c`` argv in a transient scope when this backend qualifies."""
     try:
         install()
+    except Exception:
+        # The registry wrap serves background spawns only; foreground scoping does not need it.
+        _degraded("install", "terminal scope: install failed; background spawns run unscoped")
+    try:
         unit = host_unit()
         if not unit:
             return args

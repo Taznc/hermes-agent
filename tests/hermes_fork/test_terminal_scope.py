@@ -362,6 +362,22 @@ class TestDegradedIsVisible:
             assert ts.scope_foreground(["bash"]) == ["bash"]
         assert len(self._warnings(caplog, "foreground wrap failed")) == 1
 
+    def test_failed_install_keeps_foreground_scoped(self, placed, monkeypatch, caplog):
+        """A renamed ``ProcessRegistry._scope_argv`` breaks only the background wrap. Foreground
+        commands still get their scope on every call, install() is retried, and it warns once."""
+        monkeypatch.setattr(ts, "_installed_pid", None)
+        monkeypatch.delattr(pr.ProcessRegistry, "_scope_argv")
+        with caplog.at_level(logging.DEBUG, logger=ts.__name__):
+            first = ts.scope_foreground(["bash", "-c", "true"])
+            second = ts.scope_foreground(["bash", "-c", "true"])
+        for argv in (first, second):
+            assert argv[0] == "/usr/bin/systemd-run" and argv[-3:] == ["bash", "-c", "true"]
+            unit = argv[argv.index("--unit") + 1]
+            assert unit.startswith("hermes-term-hermes-webdesktop-backend-5be2739fa0fb-fg-")
+        assert ts._installed_pid is None  # still unwrapped, so the next call retries
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1 and "install failed" in warnings[0].getMessage()
+
     def test_background_failure_warns_once(self, placed, monkeypatch, caplog):
         monkeypatch.delattr(pr, "_systemd_scope_argv")
         session = types.SimpleNamespace(systemd_unit="", persist_on_release=False)
