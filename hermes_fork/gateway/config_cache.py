@@ -25,18 +25,22 @@ def install(server) -> None:
     @wraps(server._load_cfg_raw)
     def load_raw() -> dict:
         from hermes_cli.config import read_user_config_raw
+        from hermes_cli.config_backend import config_exists, config_version
         from hermes_cli.config_read_errors import FailedConfigRead
 
         try:
             path = server._active_config_path()
-            sig = server.file_signature(path.stat()) if path.exists() else None
+            try:
+                sig = config_version(path)
+            except FileNotFoundError:  # absent; any other stat error is a failed read
+                sig = None
             with server._cfg_lock:
                 cached = server._cfg_cache
                 snapshot = (cached if cached is not None
                             and server._cfg_sig == sig and server._cfg_path == path else None)
             if snapshot is not None:
                 return copy.deepcopy(snapshot)
-            data = read_user_config_raw(path) if path.exists() else {}
+            data = read_user_config_raw(path) if config_exists(path) else {}
         except Exception as exc:
             return FailedConfigRead(error=exc)
         snapshot = copy.deepcopy(data)
@@ -50,6 +54,7 @@ def install(server) -> None:
     @wraps(server._save_cfg)
     def save(cfg: dict):
         from hermes_cli.config import atomic_config_replace
+        from hermes_cli.config_backend import config_version
         from hermes_cli.config_read_errors import _refuse_failed_read
 
         path = server._active_config_path()
@@ -58,7 +63,7 @@ def install(server) -> None:
         with save_lock:
             atomic_config_replace(path, snapshot)
             try:
-                sig = server.file_signature(path.stat())
+                sig = config_version(path)
             except Exception:
                 sig = None
             with server._cfg_lock:

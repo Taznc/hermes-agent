@@ -56,7 +56,7 @@ const desktopWindow = window as unknown as { hermesDesktop?: Window['hermesDeskt
 let writeClipboard: ReturnType<typeof vi.fn>
 
 beforeEach(() => {
-  writeClipboard = vi.fn().mockResolvedValue(undefined)
+  writeClipboard = vi.fn().mockResolvedValue(true)
   desktopWindow.hermesDesktop = { writeClipboard } as unknown as Window['hermesDesktop']
 })
 

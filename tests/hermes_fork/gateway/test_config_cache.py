@@ -252,7 +252,8 @@ def test_replaced_inode_invalidates_equal_mtime_and_size(server):
     assert replacement.stat().st_ino != old.st_ino
     replacement.replace(path)
     assert server._load_cfg_raw() == {"model": "bbbb"}
-    assert server._cfg_sig == server.file_signature(path.stat())
+    from hermes_cli.config_backend import config_version
+    assert server._cfg_sig == config_version(path)
 
 
 def test_install_is_idempotent_and_preserves_call_signatures(server):
@@ -302,13 +303,16 @@ def test_real_writeback_caller_uses_installed_raw_reader_and_saver(server):
 
 
 def test_saver_stat_failure_keeps_legacy_signature_fallback(server, monkeypatch):
-    signature = server.file_signature
+    from hermes_cli import config_backend
+
+    signature = config_backend.config_version
     with monkeypatch.context() as patch:
-        patch.setattr(server, "file_signature", lambda stat: (_ for _ in ()).throw(OSError("synthetic stat failure")))
+        patch.setattr(config_backend, "config_version",
+                      lambda path: (_ for _ in ()).throw(OSError("synthetic stat failure")))
         server._save_cfg({"probe": "saved"})
         assert server._cfg_sig is None
     assert server._load_cfg_raw() == {"probe": "saved"}
-    assert server._cfg_sig == signature(server._active_config_path().stat())
+    assert server._cfg_sig == signature(server._active_config_path())
 
 
 def test_failed_read_refusal_happens_before_copying_its_fallback(server):

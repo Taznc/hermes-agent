@@ -1,4 +1,5 @@
 import { ActionBarPrimitive, BranchPickerPrimitive, MessagePrimitive, useAui, useAuiState } from '@assistant-ui/react'
+import { useStore } from '@nanostores/react'
 import { type FC, type ReactNode, useCallback, useEffect, useRef, useState } from 'react'
 
 import { DirectiveContent } from '@/components/assistant-ui/directive-text'
@@ -16,14 +17,16 @@ import { MessageTimelineTimestamp } from '@/components/assistant-ui/thread/timel
 import { type RestoreMessageTarget } from '@/components/assistant-ui/thread/types'
 import { useMessageReactions } from '@/components/assistant-ui/thread/use-message-reactions'
 import { UserMessageText } from '@/components/assistant-ui/thread/user-message-text'
+import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
-import { writeClipboardText } from '@/components/ui/copy-button'
 import { Tip } from '@/components/ui/tooltip'
 import { useResizeObserver } from '@/hooks/use-resize-observer'
 import { useI18n } from '@/i18n'
+import { writeClipboardText } from '@/lib/clipboard'
 import { triggerHaptic } from '@/lib/haptics'
 import { StopFilled } from '@/lib/icons'
 import { LruCache } from '@/lib/lru-cache'
+import { $touchPointer, isTouchInteraction } from '@/lib/touch-interaction'
 import { cn } from '@/lib/utils'
 import { $gateway } from '@/store/gateway'
 import { notifyThreadEditOpen } from '@/store/thread-scroll'
@@ -350,8 +353,12 @@ interface UserBubbleActionsProps {
   runtimeUserOrdinal: RestoreMessageTarget['userOrdinal']
   showRestore: boolean
   showStop: boolean
+  touch: boolean
 }
 
+/** Bottom-right cluster: when it was sent, then Stop or Restore. Its fill
+ *  masks the last line's tail while shown. Touch has no hover, so Stop/Restore
+ *  stay visible there and a cluster with neither is not rendered. */
 const UserBubbleActions: FC<UserBubbleActionsProps> = ({
   fullText,
   messageId,
@@ -359,17 +366,29 @@ const UserBubbleActions: FC<UserBubbleActionsProps> = ({
   onRequestRestoreConfirm,
   runtimeUserOrdinal,
   showRestore,
-  showStop
+  showStop,
+  touch
 }) => {
   const copy = useI18n().t.assistant.thread
 
+  if (touch && !showStop && !showRestore) {
+    return null
+  }
+
   return (
-    <>
-      <MessageHoverTime className={cn(!showStop && !showRestore && 'pr-0.5')} />
+    <div
+      className={cn(
+        'pointer-events-none absolute right-2 bottom-2 z-10 flex items-center gap-1 rounded-md bg-(--dt-user-bubble) pl-1 transition-opacity',
+        touch
+          ? 'opacity-100'
+          : 'opacity-0 group-hover/user-message:opacity-100 group-hover/user-message:transition-none group-focus-within/user-message:opacity-100'
+      )}
+    >
+      {!touch && <MessageHoverTime className={cn(!showStop && !showRestore && 'pr-0.5')} />}
       {showStop ? (
         <button
           aria-label={copy.stop}
-          className={cn('pointer-events-auto size-5', USER_ACTION_ICON_BUTTON_CLASS)}
+          className={cn('pointer-events-auto', touch ? 'size-11' : 'size-5', USER_ACTION_ICON_BUTTON_CLASS)}
           onClick={event => {
             event.preventDefault()
             event.stopPropagation()
@@ -383,7 +402,7 @@ const UserBubbleActions: FC<UserBubbleActionsProps> = ({
         <Tip label={copy.restoreFromHere}>
           <button
             aria-label={copy.restoreCheckpoint}
-            className={cn('pointer-events-auto size-6', USER_ACTION_ICON_BUTTON_CLASS)}
+            className={cn('pointer-events-auto', touch ? 'size-11' : 'size-6', USER_ACTION_ICON_BUTTON_CLASS)}
             onClick={event => {
               event.preventDefault()
               event.stopPropagation()
@@ -403,8 +422,98 @@ const UserBubbleActions: FC<UserBubbleActionsProps> = ({
           </button>
         </Tip>
       ) : null}
+    </div>
+  )
+}
+
+interface TouchUserBubbleProps {
+  children: ReactNode
+  className: string
+  editable: boolean
+  showRestore: boolean
+  showStop: boolean
+}
+
+/** Touch bubble: the prose stays plain selectable text, so a long press keeps
+ *  the platform's selection handles and Copy, and editing is an explicit button
+ *  below it instead of a tap on the bubble. The Edit row leaves room for the
+ *  Stop/Restore cluster pinned over its end. */
+function TouchUserBubble({ children, className, editable, showRestore, showStop }: TouchUserBubbleProps) {
+  const copy = useI18n().t.assistant.thread
+
+  return (
+    <>
+      <div className={cn(className, 'cursor-text')} data-selectable-text="true">
+        {children}
+      </div>
+      <div className={cn('flex justify-end', (showStop || showRestore) && 'pr-11')}>
+        {editable && (
+          <ActionBarPrimitive.Edit asChild>
+            <Button
+              aria-label={copy.editMessage}
+              data-slot="aui_user-touch-edit"
+              onClick={notifyThreadEditOpen}
+              size="icon"
+              variant="ghost"
+            >
+              <Codicon name="edit" />
+            </Button>
+          </ActionBarPrimitive.Edit>
+        )}
+      </div>
     </>
   )
+}
+
+/** Sticky human bubbles clamp to ~2 lines with a soft fade so a long prompt
+ *  doesn't dominate the viewport while the response streams underneath; the
+ *  clamp lifts on hover / focus (see styles.css). We measure the *unclamped*
+ *  inner wrapper so the ResizeObserver only fires on real content / width
+ *  changes, not on every frame while the outer max-height animates open.
+ *  Touch has no hover to lift it, so a touch bubble is never clamped. */
+function useUserBubbleClamp(readOnly: boolean, touch: boolean) {
+  const clampInnerRef = useRef<HTMLDivElement | null>(null)
+  const [bodyClamped, setBodyClamped] = useState(false)
+  const lastClampHeightRef = useRef(-1)
+  const lineHeightRef = useRef(0)
+  const [expanded, setExpanded] = useState(false)
+  const clampActive = !touch && !(readOnly && expanded)
+
+  const measureClamp = useCallback((entries: readonly ResizeObserverEntry[]) => {
+    const inner = clampInnerRef.current
+    const outer = inner?.parentElement
+
+    if (!inner || !outer) {
+      return
+    }
+
+    // Prefer the size the ResizeObserver already computed — reading
+    // `scrollHeight` outside RO timing forces a synchronous layout, and with
+    // many user bubbles observed at once those reads interleave with the
+    // style write below into a read-write-read reflow cascade.
+    const entryHeight = entries.find(entry => entry.target === inner)?.borderBoxSize?.[0]?.blockSize
+    const fullHeight = Math.ceil(entryHeight ?? inner.scrollHeight)
+
+    if (fullHeight === lastClampHeightRef.current) {
+      return
+    }
+
+    lastClampHeightRef.current = fullHeight
+
+    // Line-height is stable for the life of the bubble (font settings don't
+    // change under it) — resolve the computed style once.
+    if (!lineHeightRef.current) {
+      const styles = getComputedStyle(inner)
+      lineHeightRef.current = parseFloat(styles.lineHeight) || 1.5 * parseFloat(styles.fontSize) || 20
+    }
+
+    outer.style.setProperty('--human-msg-full', `${fullHeight}px`)
+    setBodyClamped(fullHeight > lineHeightRef.current * 2 + 1)
+  }, [])
+
+  useResizeObserver(measureClamp, clampInnerRef)
+
+  return { bodyClamped, clampActive, clampInnerRef, expanded, setExpanded }
 }
 
 export const UserMessage: FC<{
@@ -413,6 +522,7 @@ export const UserMessage: FC<{
 }> = ({ onCancel, onRequestRestoreConfirm }) => {
   const { t } = useI18n()
   const copy = t.assistant.thread
+  const touch = useStore($touchPointer)
   const messageId = useAuiState(s => s.message.id)
   const content = useAuiState(s => s.message.content)
   const messageText = messageContentText(content)
@@ -460,57 +570,12 @@ export const UserMessage: FC<{
     void writeClipboardText(copyText).catch(() => {})
   }, [copyText])
 
-  // Sticky human bubbles clamp to ~2 lines with a soft fade so a long prompt
-  // doesn't dominate the viewport while the response streams underneath; the
-  // clamp lifts on hover / focus (see styles.css). We measure the *unclamped*
-  // inner wrapper so the ResizeObserver only fires on real content / width
-  // changes, not on every frame while the outer max-height animates open.
-  const clampInnerRef = useRef<HTMLDivElement | null>(null)
-  const [bodyClamped, setBodyClamped] = useState(false)
-  const lastClampHeightRef = useRef(-1)
-  const lineHeightRef = useRef(0)
-
   // Watch windows spectate a subagent run driven elsewhere — prompts can't be
   // edited, restored, or stopped from here. The bubble stays a button that
   // toggles the 2-line clamp so long prompts are still fully readable.
   const readOnly = isWatchWindow()
-  const [expanded, setExpanded] = useState(false)
-  const clampActive = !(readOnly && expanded)
+  const { bodyClamped, clampActive, clampInnerRef, expanded, setExpanded } = useUserBubbleClamp(readOnly, touch)
   const openEdit = useDeferredSingleClickEdit()
-
-  const measureClamp = useCallback((entries: readonly ResizeObserverEntry[]) => {
-    const inner = clampInnerRef.current
-    const outer = inner?.parentElement
-
-    if (!inner || !outer) {
-      return
-    }
-
-    // Prefer the size the ResizeObserver already computed — reading
-    // `scrollHeight` outside RO timing forces a synchronous layout, and with
-    // many user bubbles observed at once those reads interleave with the
-    // style write below into a read-write-read reflow cascade.
-    const entryHeight = entries.find(entry => entry.target === inner)?.borderBoxSize?.[0]?.blockSize
-    const fullHeight = Math.ceil(entryHeight ?? inner.scrollHeight)
-
-    if (fullHeight === lastClampHeightRef.current) {
-      return
-    }
-
-    lastClampHeightRef.current = fullHeight
-
-    // Line-height is stable for the life of the bubble (font settings don't
-    // change under it) — resolve the computed style once.
-    if (!lineHeightRef.current) {
-      const styles = getComputedStyle(inner)
-      lineHeightRef.current = parseFloat(styles.lineHeight) || 1.5 * parseFloat(styles.fontSize) || 20
-    }
-
-    outer.style.setProperty('--human-msg-full', `${fullHeight}px`)
-    setBodyClamped(fullHeight > lineHeightRef.current * 2 + 1)
-  }, [])
-
-  useResizeObserver(measureClamp, clampInnerRef)
 
   // Injected background-process notification, not a human prompt — render the
   // compact system-style notice (after all hooks above have run).
@@ -624,13 +689,14 @@ export const UserMessage: FC<{
                 // Copy message rides the picker (copyAction above).
                 data-context-menu-skip={readOnly || !reactionsEnabled ? undefined : ''}
                 onContextMenu={
-                  // Right-click is the desktop stand-in for iOS touch-and-hold —
-                  // but only when there's nothing selected. A live highlight
-                  // keeps the native Copy menu (and ⌘C) instead of the picker.
+                  // Right-click is the desktop reaction gesture. A touch long-press
+                  // in the browser-hosted Desktop stays the platform's, so selection
+                  // handles and Copy are never replaced by the picker; a mouse
+                  // right-click on the same device still opens it.
                   readOnly || !reactionsEnabled
                     ? undefined
                     : event => {
-                        if (hasTextSelection()) {
+                        if (hasTextSelection() || isTouchInteraction(event.nativeEvent)) {
                           return
                         }
 
@@ -639,7 +705,16 @@ export const UserMessage: FC<{
                       }
                 }
               >
-                {readOnly ? (
+                {touch ? (
+                  <TouchUserBubble
+                    className={bubbleClassName}
+                    editable={!readOnly}
+                    showRestore={showRestore}
+                    showStop={showStop}
+                  >
+                    {bubbleContent}
+                  </TouchUserBubble>
+                ) : readOnly ? (
                   // Spectator transcript: clicking only toggles the clamp so the
                   // full prompt is readable — never opens an edit composer.
                   <button
@@ -676,19 +751,16 @@ export const UserMessage: FC<{
                     {bubbleContent}
                   </button>
                 )}
-                {/* Hover cluster, bottom-right: when it was sent, then Stop or
-                    Restore. Its fill masks the last line's tail while shown. */}
-                <div className="pointer-events-none absolute right-2 bottom-2 z-10 flex items-center gap-1 rounded-md bg-(--dt-user-bubble) pl-1 opacity-0 transition-opacity group-hover/user-message:opacity-100 group-hover/user-message:transition-none group-focus-within/user-message:opacity-100">
-                  <UserBubbleActions
-                    fullText={messageText}
-                    messageId={messageId}
-                    onCancel={onCancel}
-                    onRequestRestoreConfirm={onRequestRestoreConfirm}
-                    runtimeUserOrdinal={runtimeUserOrdinal}
-                    showRestore={showRestore}
-                    showStop={showStop}
-                  />
-                </div>
+                <UserBubbleActions
+                  fullText={messageText}
+                  messageId={messageId}
+                  onCancel={onCancel}
+                  onRequestRestoreConfirm={onRequestRestoreConfirm}
+                  runtimeUserOrdinal={runtimeUserOrdinal}
+                  showRestore={showRestore}
+                  showStop={showStop}
+                  touch={touch}
+                />
               </div>
             </ReactionPicker>
             {/* Below the bubble, same register as the assistant action row:
