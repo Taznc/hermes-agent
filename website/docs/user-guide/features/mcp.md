@@ -912,6 +912,13 @@ speaks SSE only (set `transport: sse`) or a proxy in front of it rejects the req
 means the token or OAuth grant is wrong; an HTML body means the URL points at a web page, not an MCP
 endpoint. `hermes logs --level debug` additionally shows the exact endpoint each connect attempt used.
 
+### A server's response is too large
+
+Hermes accepts up to 10 MiB in one HTTP response, or in one SSE event of a streamed response, so a
+large `tools/list` catalog or tool result (an editor screenshot, say) fits. On the legacy SSE
+transport (`transport: sse`) the MCP SDK caps each event at 1 MiB and offers no way to raise it; if
+the server also serves Streamable HTTP, remove `transport: sse` from its entry.
+
 ### Tools not appearing
 
 Possible causes:
