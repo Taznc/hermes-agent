@@ -8,11 +8,14 @@ event-loop thread with it. Health probes then timed out until the unit was resta
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
 import subprocess
 import sys
+import threading
+import time
 import types
 from pathlib import Path
 
@@ -41,8 +44,13 @@ def placed(tmp_path, monkeypatch):
     monkeypatch.setattr(pr, "_systemd_run_user_scope_available", lambda: True)
     monkeypatch.setattr(ts.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setenv("XDG_RUNTIME_DIR", "/run/user/1000")
+    monkeypatch.setattr(ts, "_installed_pid", os.getpid())  # install() is a no-op unless a test resets it
+    monkeypatch.setattr(ts, "_warned", set(), raising=False)
     _place()
     return _place
+
+
+GATEWAY_CG = "0::/system.slice/hermes-gateway.service\n"
 
 
 class TestPlacement:
@@ -68,6 +76,36 @@ class TestPlacement:
 
     def test_supervised_gateway_keeps_upstream_policy(self, placed, monkeypatch):
         monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: True)
+        assert ts.host_unit() is None
+
+    @pytest.mark.parametrize("supervised, exec_pid_is_me", [(True, True), (False, True), (False, False)],
+                             ids=["gateway-main-pid", "gateway-main-pid-unrecognised", "gateway-worker"])
+    def test_gateway_unit_is_left_alone_main_pid_or_worker(self, placed, monkeypatch, supervised, exec_pid_is_me):
+        """t_059acb3a: a kanban worker shell sits directly in hermes-gateway.service without being
+        its supervised main pid. It must keep the unit's cgroup (no 4 GiB scope cap), and a gateway
+        restart must not sweep in-flight scopes, even when the main pid's supervision markers are
+        missing."""
+        placed(GATEWAY_CG)
+        monkeypatch.setattr(pr, "_is_supervised_gateway_process", lambda: supervised)
+        monkeypatch.setenv("SYSTEMD_EXEC_PID", str(os.getpid() if exec_pid_is_me else 1))
+        monkeypatch.setattr(pr, "systemd_user_bus_env", lambda base=None: {})
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            out = "hermes-term-hermes-gateway-aaaaaaaaaaaa-fg-1.scope loaded active running x\n"
+            return subprocess.CompletedProcess(argv, 0, stdout=out, stderr="")
+        monkeypatch.setattr(ts.subprocess, "run", run)
+        assert ts.host_unit() is None
+        assert ts.scope_foreground(["bash", "-c", "npx vitest"]) == ["bash", "-c", "npx vitest"]
+        assert ts.scope_background(types.SimpleNamespace(systemd_unit="", persist_on_release=False),
+                                   ["bash"], "proc_abc") is None
+        assert ts.reap_stale_scopes() == [] and calls == []
+
+    @pytest.mark.parametrize("unit", ["hermes-dashboard.service", "hermes-webdesktop.service",
+                                      "hermes-webdesktop-dev.service", "postgresql.service"])
+    def test_other_services_are_left_alone(self, placed, unit):
+        placed(f"0::/system.slice/{unit}\n")
         assert ts.host_unit() is None
 
     @pytest.mark.parametrize("value", ["0", "off", "FALSE", "no"])
@@ -204,13 +242,147 @@ class TestStaleSweep:
         assert ts.reap_stale_scopes() == ["hermes-term-hermes-webdesktop-backend-aaaaaaaaaaaa-bg-proc_1.scope"]
         assert calls[-1][-2:] == ["--no-block", "hermes-term-hermes-webdesktop-backend-aaaaaaaaaaaa-bg-proc_1.scope"]
 
+    def test_sweep_runs_off_the_callers_thread(self, monkeypatch):
+        done = threading.Event()
+        seen = []
+
+        def reap():
+            seen.append(threading.current_thread().name)
+            done.set()
+        monkeypatch.setattr(ts, "reap_stale_scopes", reap)
+        ts._reap_in_background()
+        assert done.wait(5)
+        assert seen == ["fork-terminal-scope-sweep"]
+
+    def test_sweep_failure_is_logged(self, monkeypatch, caplog):
+        done = threading.Event()
+
+        def reap():
+            try:
+                raise RuntimeError("systemctl exploded")
+            finally:
+                done.set()
+        monkeypatch.setattr(ts, "reap_stale_scopes", reap)
+        with caplog.at_level(logging.WARNING, logger=ts.__name__):
+            ts._reap_in_background()
+            assert done.wait(5)
+            for _ in range(50):  # the warning is logged just after the event fires
+                if "stale terminal scope sweep failed" in caplog.text:
+                    break
+                time.sleep(0.05)
+        assert "stale terminal scope sweep failed" in caplog.text
+
+
+class TestInstall:
+    """``install()``: the wrap and the boot sweep, from the call and from the gateway seam."""
+
+    @pytest.fixture
+    def fresh(self, placed, monkeypatch):
+        monkeypatch.setattr(ts, "_installed_pid", None)
+        monkeypatch.setattr(pr.ProcessRegistry, "_scope_argv", pr.ProcessRegistry._scope_argv)
+        if getattr(pr.ProcessRegistry._scope_argv, "_fork_terminal_scope", False):  # wrapped by an earlier boot
+            monkeypatch.setattr(pr.ProcessRegistry, "_scope_argv", pr.ProcessRegistry._scope_argv.__wrapped__)  # type: ignore[attr-defined]
+        sweeps = []
+        monkeypatch.setattr(ts, "_reap_in_background", lambda: sweeps.append(os.getpid()))
+        return sweeps
+
+    def test_sweeps_once_per_process_on_a_backend(self, fresh):
+        ts.install()
+        ts.install()
+        assert fresh == [os.getpid()]
+        assert getattr(pr.ProcessRegistry._scope_argv, "_fork_terminal_scope", False)
+
+    def test_gateway_wraps_but_never_sweeps(self, fresh, placed):
+        placed(GATEWAY_CG)
+        ts.install()
+        assert fresh == []
+
+    def test_failed_install_is_retried(self, fresh, monkeypatch):
+        """t_059acb3a: the pid used to be recorded before the wrap, so one failure (here: the
+        import of a renamed upstream class) left this process unwrapped for good."""
+        registry_cls = pr.ProcessRegistry
+        monkeypatch.delattr(pr, "ProcessRegistry")
+        with pytest.raises(ImportError):
+            ts.install()
+        assert ts._installed_pid is None and fresh == []
+        monkeypatch.setattr(pr, "ProcessRegistry", registry_cls, raising=False)
+        ts.install()
+        assert getattr(registry_cls._scope_argv, "_fork_terminal_scope", False)
+        assert ts._installed_pid == os.getpid() and fresh == [os.getpid()]
+
+    def test_concurrent_first_caller_waits_for_the_wrap(self, fresh, monkeypatch):
+        """A second thread must not return from install() (and spawn unwrapped) while the first is
+        still installing."""
+        entered, release = threading.Event(), threading.Event()
+        real_wrap = ts._wrap_registry
+
+        def slow_wrap():
+            entered.set()
+            assert release.wait(5)
+            real_wrap()
+        monkeypatch.setattr(ts, "_wrap_registry", slow_wrap)
+        first = threading.Thread(target=ts.install)
+        first.start()
+        assert entered.wait(5)
+        returned = []
+        second = threading.Thread(target=lambda: (ts.install(), returned.append(
+            getattr(pr.ProcessRegistry._scope_argv, "_fork_terminal_scope", False))))
+        second.start()
+        second.join(0.3)
+        assert second.is_alive() and returned == []  # blocked on the lock, not returned unwrapped
+        release.set()
+        first.join(5)
+        second.join(5)
+        assert returned == [True] and fresh == [os.getpid()]
+
+    def test_gateway_seam_starts_the_sweep(self, fresh, monkeypatch):
+        """The fork gateway seam (``hermes_fork.gateway.registry``) is what runs the boot sweep for a
+        backend that never spawns a command."""
+        from hermes_fork.gateway import config_cache, registry, session_surface
+        from hermes_fork.ui import gateway as plugin_ui
+
+        monkeypatch.setattr(registry._contracts, "STRICT", True)
+        for module in (plugin_ui, config_cache, session_surface):
+            monkeypatch.setattr(module, "install", lambda server: None)
+        registry._install_gateway_seams(types.SimpleNamespace())
+        assert fresh == [os.getpid()]
+        assert getattr(pr.ProcessRegistry._scope_argv, "_fork_terminal_scope", False)
+
+
+class TestDegradedIsVisible:
+    """A fall-back to the unscoped path logs one WARNING per site (t_059acb3a), then DEBUG."""
+
+    def _warnings(self, caplog, text):
+        return [r for r in caplog.records if r.levelno == logging.WARNING and text in r.getMessage()]
+
+    def test_renamed_upstream_builder_warns_once(self, placed, monkeypatch, caplog):
+        monkeypatch.delattr(pr, "_systemd_scope_argv")
+        with caplog.at_level(logging.DEBUG, logger=ts.__name__):
+            assert ts.scope_foreground(["bash"]) == ["bash"]
+            assert ts.scope_foreground(["bash"]) == ["bash"]
+        assert len(self._warnings(caplog, "foreground wrap failed")) == 1
+
+    def test_background_failure_warns_once(self, placed, monkeypatch, caplog):
+        monkeypatch.delattr(pr, "_systemd_scope_argv")
+        session = types.SimpleNamespace(systemd_unit="", persist_on_release=False)
+        with caplog.at_level(logging.DEBUG, logger=ts.__name__):
+            assert ts.scope_background(session, ["bash"], "proc_abc") is None
+            assert ts.scope_background(session, ["bash"], "proc_abc") is None
+        assert len(self._warnings(caplog, "background wrap failed")) == 1
+
+    def test_gateway_probe_failure_warns(self, placed, monkeypatch, caplog):
+        monkeypatch.delattr(pr, "_is_supervised_gateway_process")
+        with caplog.at_level(logging.DEBUG, logger=ts.__name__):
+            assert ts.host_unit() is None
+        assert len(self._warnings(caplog, "gateway identity probe failed")) == 1
+
 
 def _user_scope_usable() -> bool:
     if not sys.platform.startswith("linux") or not shutil.which("systemd-run"):
         return False
     try:
         return subprocess.run(["systemd-run", "--user", "--scope", "--quiet", "--collect", "--", "true"],
-                              capture_output=True, timeout=20, env=pr.systemd_user_bus_env()).returncode == 0
+                              capture_output=True, timeout=20, env=pr.systemd_user_bus_env(), check=False).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 

@@ -28,11 +28,18 @@ restart could not be listed, polled or killed. This module covers that case too.
   no longer leaves orphans behind (upstream's intent: serve's processes die with it). Background
   commands started with ``persist_on_release`` get a ``keep`` scope, which is never reaped.
 
-Active only where it applies: Linux, the process sits directly in a ``*.service`` cgroup (a
-placement test, not an inherited env marker), it is not the supervised gateway (upstream owns
-that), and ``HERMES_FORK_TERMINAL_SCOPE`` is not ``0``/``off``/``false``/``no``. It also needs a
-usable user scope (upstream's cached probe). When any of these is missing, the argv comes back
-unchanged and behaviour is upstream's.
+Active only where it applies: Linux, the process sits directly in the cgroup of a web-desktop
+backend unit (:data:`HOST_UNITS`; a placement test, not an inherited env marker), it is not the
+supervised gateway (upstream owns that), and ``HERMES_FORK_TERMINAL_SCOPE`` is not
+``0``/``off``/``false``/``no``. It also needs a usable user scope (upstream's cached probe). When
+any of these is missing, the argv comes back unchanged and behaviour is upstream's.
+
+Why an allowlist and not any ``*.service`` (t_059acb3a): the managed workers of
+``hermes-gateway.service`` (kanban worker shells) sit directly in that unit's cgroup without
+being its supervised main pid. Under an "any service" rule their foreground commands got a
+4 GiB ``MemoryMax`` (an OOM kill for a big tsc/vitest run), and a gateway restart would sweep
+their in-flight scopes. Neither the gateway nor the dashboard runs the tightly swapped
+``MemoryHigh`` unit this module exists for, so both keep upstream's behaviour.
 """
 
 from __future__ import annotations
@@ -45,6 +52,7 @@ import subprocess
 import sys
 import threading
 import uuid
+from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import Any, Optional
 
@@ -59,6 +67,23 @@ _OFF_VALUES = frozenset({"0", "off", "false", "no"})
 _NAME_RE = re.compile(
     r"^hermes-term-(?P<slug>.+)-(?P<inv>[0-9a-f]{12}|noinvocation)-(?P<kind>fg|bg|keep)-(?P<rest>.+)\.scope$")
 _CGROUP_FILE = Path("/proc/self/cgroup")
+# Units whose terminal commands are scoped and whose stale scopes are swept: the `hermes serve`
+# web-desktop backends (hermes-webdesktop-backend, hermes-webdesktop-next-backend).
+HOST_UNITS = ("hermes-webdesktop*backend.service",)
+
+_warned: set[str] = set()
+
+
+def _degraded(site: str, message: str) -> None:
+    """Log a fall-back to the unscoped path: WARNING once per site and process, DEBUG after.
+
+    These paths rely on private ``tools.process_registry`` names. An upstream rename has to show
+    in the log, not just quietly put commands back into the backend's cgroup."""
+    key = f"{os.getpid()}:{site}"
+    first = key not in _warned
+    _warned.add(key)
+    logger.log(logging.WARNING if first else logging.DEBUG, message, exc_info=True)
+
 
 _placement_lock = threading.Lock()
 _placement: Optional[tuple[int, Optional[str]]] = None  # (pid, service unit or None)
@@ -104,7 +129,7 @@ def host_unit() -> Optional[str]:
     if not _enabled():
         return None
     unit = _service_unit()
-    if not unit:
+    if not unit or not any(fnmatchcase(unit, pattern) for pattern in HOST_UNITS):
         return None
     try:
         from tools.process_registry import _is_supervised_gateway_process
@@ -112,7 +137,7 @@ def host_unit() -> Optional[str]:
         if _is_supervised_gateway_process():
             return None  # upstream's own policy covers the gateway
     except Exception:
-        logger.debug("gateway identity probe failed; not scoping", exc_info=True)
+        _degraded("gateway-probe", "terminal scope: gateway identity probe failed; commands run unscoped")
         return None
     return unit
 
@@ -179,7 +204,7 @@ def scope_foreground(args: list[str]) -> list[str]:
             return args
         return _runtime_dir_prefix() + scoped[1]
     except Exception:
-        logger.debug("terminal scope wrap failed; running unscoped", exc_info=True)
+        _degraded("foreground", "terminal scope: foreground wrap failed; commands run unscoped")
         return args
 
 
@@ -199,7 +224,7 @@ def scope_background(session: Any, argv: list[str], unit_suffix: str) -> Optiona
         session.systemd_unit = f"{scoped[0]}.scope"
         return scoped[1]
     except Exception:
-        logger.debug("background terminal scope wrap failed; using upstream's path", exc_info=True)
+        _degraded("background", "terminal scope: background wrap failed; using upstream's path")
         return None
 
 
@@ -270,26 +295,38 @@ def install() -> None:
     when no command ever does. Also called from the ``terminal-scope`` anchor, which covers hosts
     that never import the TUI gateway. A local background spawn always comes after its
     ``LocalEnvironment`` exists, and that environment's ``init_session`` runs through the anchor.
-    So the wrapper is in place before the first background spawn either way."""
+    So the wrapper is in place before the first background spawn either way.
+
+    The pid is recorded only after the wrap is in place. A concurrent first caller waits on the
+    lock instead of spawning unwrapped, and a failed attempt (an import error) is retried."""
     global _installed_pid
-    if _installed_pid == os.getpid():
+    pid = os.getpid()
+    if _installed_pid == pid:
         return
     with _install_lock:
-        if _installed_pid == os.getpid():
+        if _installed_pid == pid:
             return
-        _installed_pid = os.getpid()
-        from tools.process_registry import ProcessRegistry
+        _wrap_registry()
+        sweep = host_unit() is not None
+        _installed_pid = pid
+    if sweep:
+        _reap_in_background()
 
-        upstream = ProcessRegistry._scope_argv
-        if not getattr(upstream, "_fork_terminal_scope", False):
-            def _scope_argv(self, session, safe_command, unit_suffix, label):
-                argv = upstream(self, session, safe_command, unit_suffix, label)
-                if getattr(session, "systemd_unit", ""):
-                    return argv  # upstream already scoped it (supervised gateway)
-                return scope_background(session, argv, unit_suffix) or argv
 
-            _scope_argv._fork_terminal_scope = True  # type: ignore[attr-defined]
-            _scope_argv.__wrapped__ = upstream  # type: ignore[attr-defined]
-            ProcessRegistry._scope_argv = _scope_argv
-        if host_unit():
-            _reap_in_background()
+def _wrap_registry() -> None:
+    """Wrap ``ProcessRegistry._scope_argv`` once (the class attribute survives fork)."""
+    from tools.process_registry import ProcessRegistry
+
+    upstream = ProcessRegistry._scope_argv
+    if getattr(upstream, "_fork_terminal_scope", False):
+        return
+
+    def _scope_argv(self, session, safe_command, unit_suffix, label):
+        argv = upstream(self, session, safe_command, unit_suffix, label)
+        if getattr(session, "systemd_unit", ""):
+            return argv  # upstream already scoped it (supervised gateway)
+        return scope_background(session, argv, unit_suffix) or argv
+
+    _scope_argv._fork_terminal_scope = True  # type: ignore[attr-defined]
+    _scope_argv.__wrapped__ = upstream  # type: ignore[attr-defined]
+    ProcessRegistry._scope_argv = _scope_argv
