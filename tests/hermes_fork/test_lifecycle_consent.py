@@ -68,7 +68,7 @@ def operator(monkeypatch):
     def notify(data):
         prompts.append(data)
 
-    def poll(event, session_key, *, interrupt_log):
+    def poll(event, session_key, *, interrupt_log, timeout_s=None):
         choice = answers.pop(0)
         if choice == "timeout":
             return "timeout"
