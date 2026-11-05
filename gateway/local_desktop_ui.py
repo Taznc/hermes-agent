@@ -276,6 +276,10 @@ def wire(turn, agent):
     agent.setup_beat_callback = lambda payload: _setup_beat(turn, agent, dict(payload or {}))
     # Fire-and-forget: the tool thread waits on its own operation; the card answers by op_id.
     agent.connection_callback = lambda payload: publish("connection.request", dict(payload)) and None
+    # >>> FORK ANCHOR: plugin-ui-authority <<<
+    from hermes_fork.ui.authority import bind as bind_plugin_ui  # plugin ui.request / ui.emit
+    bind_plugin_ui(turn, agent)
+    # <<< FORK ANCHOR >>>
     return key, publish
 
 

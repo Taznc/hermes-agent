@@ -70,38 +70,52 @@ class PluginUI:
             raise ValueError(f"plugin UI payload for {kind!r} is not JSON-serialisable: {exc}") from None
         return kind, payload
 
+    def _bound_agent(self):
+        agent = self._agent
+        if agent is _UNBOUND:
+            from agent.subagent_lifecycle import get_active_subagent_parent
+            agent = get_active_subagent_parent()
+        return agent
+
     def _channel(self):
         """``(gateway module, session id)`` for this turn's live UI, else ``(None, None)``."""
         gateway = _gateway()
         if gateway is None:
             return None, None
-        agent = self._agent
-        if agent is _UNBOUND:
-            from agent.subagent_lifecycle import get_active_subagent_parent
-            agent = get_active_subagent_parent()
-        sid = gateway.session_for_agent(agent)
+        sid = gateway.session_for_agent(self._bound_agent())
         return (gateway, sid) if sid else (None, None)
+
+    def _route(self):
+        """``(request, emit)`` for this turn's attached viewers: the TUI sidecar's session, else the
+        gateway session authority's local-viewer turn (``hermes_fork.ui.authority``); None when neither."""
+        gateway, sid = self._channel()
+        if gateway is not None:
+            return (lambda kind, payload, timeout: gateway.request(sid, kind, payload, timeout),
+                    lambda kind, payload: gateway.emit(sid, kind, payload))
+        authority = sys.modules.get("hermes_fork.ui.authority")
+        route = authority.route_for(self._bound_agent()) if authority is not None else None
+        return (route.request, route.emit) if route is not None else None
 
     # -- public API ----------------------------------------------------------------------------
 
     @property
     def available(self) -> bool:
         """Whether an interactive UI is attached to this turn (a request may still be ``unsupported``)."""
-        return self._channel()[1] is not None
+        return self._route() is not None
 
     def request(self, kind: str, payload: Any = None, timeout: float | None = None) -> dict | None:
         """Ask the UI and block for the answer. ``timeout`` None → ``agent.clarify_timeout``; ``<= 0`` →
         wait until answered or cancelled."""
         kind, payload = self._check(kind, payload)
-        gateway, sid = self._channel()
-        if gateway is None:
+        route = self._route()
+        if route is None:
             return None
-        return gateway.request(sid, kind, payload, _resolve_timeout(timeout))
+        return route[0](kind, payload, _resolve_timeout(timeout))
 
     def emit(self, kind: str, payload: Any = None) -> bool:
         """Fire-and-forget ``plugin.event``; True when a frame was written to the UI."""
         kind, payload = self._check(kind, payload)
-        gateway, sid = self._channel()
-        if gateway is None:
+        route = self._route()
+        if route is None:
             return False
-        return gateway.emit(sid, kind, payload)
+        return route[1](kind, payload)

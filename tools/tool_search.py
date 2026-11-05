@@ -153,6 +153,11 @@ def is_deferrable_tool_name(name: str, defer_tools: Optional[frozenset] = None) 
     plugin tool). Bridge names never defer."""
     if name in BRIDGE_TOOL_NAMES:
         return False
+    # >>> FORK ANCHOR: tool-search-eager <<<
+    from hermes_fork.tool_search_eager import is_eager  # tools.tool_search.eager pins it visible
+    if is_eager(name):
+        return False
+    # <<< FORK ANCHOR >>>
     if defer_tools is not None and name in defer_tools:
         return True
     if name in _core_tool_names():
