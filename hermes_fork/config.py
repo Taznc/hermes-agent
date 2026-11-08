@@ -1,13 +1,28 @@
 """Fork-owned opt-in settings; never migrate upstream config versions."""
 from pathlib import Path
+from collections.abc import Mapping
 import math
 
 
 def human_input_bridge(config, *, home):
-    raw = config.get("human_input_bridge") or {}
+    config = {} if config is None else config
+    if not isinstance(config, Mapping):
+        raise ValueError("configuration must be a mapping")
+    fork = config.get("fork", {})
+    if not isinstance(fork, Mapping):
+        raise ValueError("fork configuration must be a mapping")
+    # Canonical presence wins even for null/disabled values. Legacy reads are
+    # compatibility only; never write new top-level feature configuration.
+    raw = fork["human_input_bridge"] if "human_input_bridge" in fork else config.get("human_input_bridge")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ValueError("fork.human_input_bridge must be a mapping or null")
     if raw.get("enabled") is not True:
         return None
-    recipient = dict(raw.get("telegram") or {})
+    if not isinstance(raw.get("telegram"), Mapping):
+        raise ValueError("human_input_bridge.telegram must be a mapping")
+    recipient = dict(raw["telegram"])
     recipient.setdefault("thread_id", None)
     for key in ("user_id", "chat_id", "bot_id"):
         if type(recipient.get(key)) is not int:

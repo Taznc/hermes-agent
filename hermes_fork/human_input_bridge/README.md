@@ -95,18 +95,21 @@ policy. No automatic expired-row reaper or crash/orphan adoption is claimed.
 ## Opt-in config and host API
 
 ```yaml
-human_input_bridge:
-  enabled: false
-  delay_seconds: 120
-  telegram:
-    user_id: 123
-    chat_id: 123
-    thread_id: null
-    bot_id: 456
-  # mailbox_path: human-input-bridge/mailbox.sqlite3
-  mini_app_url: https://example.invalid/telegram-ask/
-  http: {host: 127.0.0.1, port: 8789}
+fork:
+  human_input_bridge:
+    enabled: false
+    delay_seconds: 120
+    telegram:
+      user_id: 123
+      chat_id: 123
+      thread_id: null
+      bot_id: 456
+    # mailbox_path: human-input-bridge/mailbox.sqlite3
+    mini_app_url: https://example.invalid/telegram-ask/
+    http: {host: 127.0.0.1, port: 8789}
 ```
+
+Write settings only under `fork.human_input_bridge`. Legacy root settings are read only when the canonical key is absent; canonical disabled/null values never fall through.
 
 Core reads `load_config_readonly()` once per turn inside the routed profile scope;
 `hermes_fork.config.human_input_bridge(config, home=get_hermes_home())` validates it.
