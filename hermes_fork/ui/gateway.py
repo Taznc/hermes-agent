@@ -107,3 +107,6 @@ def install(server: Any) -> None:
     declare_contracts()
     setattr(server, _LIFECYCLE_FN, _wrap_lifecycle(original))
     _server = server
+    if hasattr(server, "_start_usage_ticker"):
+        from hermes_fork.human_input_bridge.installers import install_sidecar
+        install_sidecar(server)

@@ -1454,3 +1454,8 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             # didn't — see codex_runtime.py); default True keeps skip-db for the standard runtime.
             "agent_persisted": result.get("agent_persisted", True),
         }
+
+# >>> FORK ANCHOR: human-input-runtime <<<
+from hermes_fork.human_input_bridge.installers import install_turn_runner as _install_human_input
+_install_human_input(TurnRunner)
+# <<< FORK ANCHOR: human-input-runtime >>>

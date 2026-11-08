@@ -1,8 +1,9 @@
 # Human-input bridge (removable T1 fork module)
 
-This is IPC infrastructure plus **opt-in** source adapters, not an enabled Telegram
-feature. Nothing starts on import. No mailbox path, recipient, credentials, config
-key, service, network listener or bot connection is inferred.
+This is an **opt-in runtime integration**, disabled by default. Nothing starts on import.
+Gateway TurnRunner and the TUI plugin-UI installer bind one source owner per turn,
+pump IPC intents, then close and invalidate that owner at teardown. Telegram network
+I/O and the authenticated web host remain in the separate fork-ask plugin lane.
 
 ## Integration
 
@@ -57,10 +58,14 @@ writers, including draft revisions and simultaneous proposals. No in-memory queu
 is used for IPC. The owner-only correlation state intentionally stays in the source
 process; a fresh owner instance cannot adopt prior-generation intents.
 
-- `ready(now=None)` is a non-mutating view of due, pending, unexpired, unsent rows.
-  Default due time is publication +120 seconds; draft changes never extend expiry.
-- `mark_delivered` checks bound chat/topic, records one message and never settles.
-  There is no exactly-once network-send guarantee; callers must run one presenter.
+- `ready(now=None)` is a non-mutating view of due, pending, unexpired, unsent,
+  unattempted rows. Default due time is publication +120 seconds; draft changes
+  never extend expiry. Messaging Ask is due immediately, other surfaces use the delay.
+- `claim_delivery(handle)` atomically persists the single network attempt before
+  sending. `mark_delivered` still accepts after a claim, checks bound chat/topic,
+  records one message and never settles. A crash after claim may lose delivery;
+  it must never cause a retry. `delivered(bot_id=None, limit=1000)` returns private
+  recovery rows newest-first (limit bounded to 10000); presenters retire stale buttons.
 - `propose` requires an already authenticated responder matching all four recipient
   fields. Untrusted JSON is **not** authentication. Telegram signature/bot identity
   and freshness verification belongs in the transport backend before this call.
@@ -87,26 +92,78 @@ This is not a sandbox against another process already running as that same accou
 SQLite data is unencrypted and retained; deployment needs a profile retention
 policy. No automatic expired-row reaper or crash/orphan adoption is claimed.
 
-## Deliberately unwired anchors / remaining work
+## Opt-in config and host API
 
-1. Runtime must construct the owner with an explicit profile-local path and verified
-   recipient, bind the actual turn agent, and close it on teardown. There is no
-   automatic enablement/config discovery in this change.
-2. Native messaging turns without an existing `PluginUI` request still need an
-   owner-side Ask rich-transport lifecycle anchor. The separate bot/backend process
-   cannot fabricate an owner or settle gateway memory. Existing UI source primitives
-   decline immediately with no attached viewer; this module does not override that.
-3. Native approval lifecycle needs a minimal parent-reviewed anchor where the
-   original request id is available: `gateway/run_turn_runner.py::_approval_notify_sync`
-   (or the appropriate sidecar approval notifier in `tui_gateway/server.py`). Call
-   `watch_approval` there and arrange owner-side pumping/lifecycle. **Not installed**.
-4. Native clarify publication needs a corresponding parent-reviewed hook at
-   `gateway/run_turn_runner.py::_clarify_callback_sync` and/or the source request
-   publication/wait lifecycle. Exact-id watch adapters exist, but no automatic
-   clarify hooking, batch-progress translation, or partial-answer merge is claimed.
-5. Side-question owner execution, bot registration, authenticated Mini App server,
-   actual native renderer and deployment belong to the other lanes/parent. This
-   module does not invent side-question answers or perform any live Telegram send.
+```yaml
+human_input_bridge:
+  enabled: false
+  delay_seconds: 120
+  telegram:
+    user_id: 123
+    chat_id: 123
+    thread_id: null
+    bot_id: 456
+  # mailbox_path: human-input-bridge/mailbox.sqlite3
+  mini_app_url: https://example.invalid/telegram-ask/
+  http: {host: 127.0.0.1, port: 8789}
+```
+
+Core reads `load_config_readonly()` once per turn inside the routed profile scope;
+`hermes_fork.config.human_input_bridge(config, home=get_hermes_home())` validates it.
+The default path is `<profile>/human-input-bridge/mailbox.sqlite3`; relative paths
+are profile-relative and paths escaping the profile are rejected. No bot token is
+accepted here. The plugin host reads the same config once, registers a dormant
+`ctx.register_telegram_handler(factory)` factory, and gets the token only from the
+connected native application after exact configured bot-id validation. No second
+poller. The plugin owns `mini_app_url`, HTTP startup/teardown, TLS/auth and native UI.
+
+`runtime.bind_agent(agent, config=None, messaging=False)` returns an owner or None;
+`release_agent(agent)` invalidates the owner and joins its pump. Runtime installers:
+
+- One four-line T2 `human-input-runtime` anchor at the end of
+  `gateway/run_turn_runner.py` installs wrappers for real turn bind/teardown,
+  `_approval_notify_sync`, `_send_shared_clarify`, and canonical clarify publication.
+- Existing `hermes_fork.ui.gateway.install(server)` installs sidecar turn ownership
+  at its real usage-ticker lifecycle and exact-id source registration hooks.
+- Messaging Ask attaches a mailbox-backed transport to a source-process
+  `SessionEvents` and uses the **real** `ask_viewer_result` waiter. Registration
+  publishes the projection immediately; only the original source resolver returns
+  the tool result. This is not a fake pending record in the bot process.
+- Native approval projections force-redact command/description before persistence,
+  expose only once/deny and always resolve the exact queue id, never FIFO.
+- Ordinary clarify batches validate the complete exact question-id set and commit
+  under the original source registry lock, preserving already locked answers.
+  These private registry seams are pinned by production integration tests.
+
+## Side-question owner RPC
+
+`propose_side(handle, question_id, question, responder)` returns an opaque id or
+False. It requires pending/unexpired state, exact authenticated recipient scope,
+a question belonging to the request (id or qid), text up to 2000 chars, no other
+inflight side request, and at most eight side requests per main request. No main
+revision/draft change. Approval side requests are rejected.
+
+`side_requests(owner_id)` is private source-owner work: entries contain handle and
+side_id. `acknowledge_side(handle, side_id, owner_id=..., answer=...)` accepts only
+the exact pending owner and bounded (16000 chars) answer. `get_sides(handle)` is
+browser safe: **only** `{id, question_id, question, status, answer}` per item.
+
+The source pump executes existing `agent.side_question.answer_side_question` on a
+snapshot of `_session_messages` with `parent_agent` and live `main_runtime` settings,
+preserving prompt-cache parity and read-only tools. It never starts an ordinary
+user turn, edits parent history, or resolves the main waiter. Answers are force
+redacted before persistence. Closing/settling interrupts active side forks; late
+answers cannot be acknowledged. Plugin submit validation must build side metadata
+from acknowledged mailbox answers rather than accepting browser-authored answers.
+
+## Remaining operational boundary
+
+No live Telegram/model/HTTP call is made by the core tests. The plugin lane owns
+network delivery and stale-owner retirement after source-process crashes (a fresh
+owner never adopts the prior owner epoch). SQLite rows are retained and unencrypted;
+retention/reaping remains deployment work. No live deployment, unit restart, push
+or merge is included. Native approval hook routing is installed; its real SDK send
+is not exercised here. Config changes take effect on a new turn, not every pump tick.
 
 ## Verification
 

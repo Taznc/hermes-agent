@@ -73,23 +73,108 @@ class OwnerBridge:
         if not valid:
             raise ValueError("source request kind/payload mismatch; secrets are never projected")
 
+    @staticmethod
+    def _stable(frame, kind):
+        if frame is not None and kind == "clarify":
+            frame = {**frame, "params": {k: v for k, v in frame["params"].items() if k != "answers"}}
+        return frame
+
+    @staticmethod
+    def _batch_result(req, response):
+        from tools.clarify_batch import settle_batch
+        if response.get("outcome") == "cancelled":
+            return settle_batch(req.locked, ended="cancelled")
+        answers = response.get("answers")
+        if (not isinstance(answers, dict) or set(answers) != set(req.qids or [])
+                or any(v is not None and (not isinstance(v, str) or len(v) > 16000) for v in answers.values())):
+            return None
+        # The original registry owns locks. Remote frames cannot replace an already locked answer.
+        return settle_batch({**answers, **req.locked}, ended="submitted")
+
     def watch_tui(self, session_id, request_id, *, kind, payload, **options):
         from tui_gateway import server_requests as source
-        current = lambda: self._find(source.open_requests(session_id), request_id)
+        current = lambda: self._stable(self._find(source.open_requests(session_id), request_id), kind)
         self._check_request(current(), kind, payload)
         resolve = lambda response: source.resolve_response({"jsonrpc": "2.0", "id": request_id, "result": response})
+        if kind == "clarify":
+            def resolve(response):
+                with source._lock:
+                    req = source._open.get(request_id)
+                    if req is None or req.sid != session_id or req.method != "clarify":
+                        return False
+                    result = self._batch_result(req, response)
+                    if result is None:
+                        return False
+                    source._open.pop(request_id)
+                    req.result, req.answered = result, True
+                req.event.set()
+                return True
         return self._watch(request_id, kind=kind, payload=payload, current=current, resolve=resolve, **options)
 
     def watch_authority(self, events, session_id, request_id, *, kind, payload, **options):
         from gateway import session_server_requests as source
-        current = lambda: self._find(source.open_requests(events, session_id), request_id)
+        current = lambda: self._stable(self._find(source.open_requests(events, session_id), request_id), kind)
         self._check_request(current(), kind, payload)
         # This runs inside the original owner, not on a remote actor's connection. Identity of
         # both the stream AND session must still match the source registration at resolution.
         resolve = lambda response: source.resolve(
             {"jsonrpc": "2.0", "id": request_id, "result": response},
             session_ok=lambda sid, stream: sid == session_id and stream is events)
+        if kind == "clarify":
+            def resolve(response):
+                with source._lock:
+                    pending = source._open.get(request_id)
+                    if pending is None or pending.events is not events or pending.session_id != session_id:
+                        return False
+                    result = self._batch_result(pending, response)
+                    if result is None:
+                        return False
+                    source._open.pop(request_id)
+                    pending.result = result
+                pending.event.set()
+                return True
         return self._watch(request_id, kind=kind, payload=payload, current=current, resolve=resolve, **options)
+
+    def watch_native_approval(self, session_key, request_id, **options):
+        from tools import approval as source
+        from agent.redact import redact_sensitive_text
+        if not request_id:
+            raise ValueError("exact approval queue id required")
+        data = next((r for r in source.list_gateway_approvals(session_key) if r.get("request_id") == request_id), None)
+        if data is None:
+            return None
+        payload = {"title": "Command approval", "command": redact_sensitive_text(str(data.get("command", "")), force=True),
+                   "description": redact_sensitive_text(str(data.get("description", "")), force=True)}
+        return self.watch_approval(session_key, request_id, payload=payload, allowed_choices=["once", "deny"], **options)
+
+    def watch_native_clarify(self, request_id, **options):
+        from tools import clarify_gateway as source
+        entry = source.get_pending(request_id)
+        if entry is None:
+            return None
+        payload = {"questions": [{"id": request_id, "question": entry.question,
+                                  "choices": entry.choices, "multi_select": entry.multi_select}]}
+        def current():
+            live = source.get_pending(request_id)
+            return payload if live is entry else None
+        def commit(value):
+            with source._lock:
+                if source.get_pending(request_id) is not entry:
+                    return False
+                return source.resolve_gateway_clarify(request_id, value)
+        def resolve(response):
+            if response.get("outcome") == "cancelled":
+                return commit(source.CANCELLED)
+            answers = response.get("answers")
+            if not isinstance(answers, dict) or set(answers) != {request_id}:
+                return False
+            value = answers[request_id]
+            if value is None:
+                value = source.SKIPPED
+            elif not isinstance(value, str) or len(value) > 16000:
+                return False
+            return commit(value)
+        return self._watch(request_id, kind="clarify", payload=payload, current=current, resolve=resolve, **options)
 
     def watch_approval(self, session_key, request_id, *, payload, allowed_choices, **options):
         from tools import approval as source
@@ -149,6 +234,29 @@ class OwnerBridge:
                 cancelled = row["kind"] != "approval" and response.get("action") == "cancel"
                 if cancelled:
                     response = {"outcome": "cancelled", "surface": "telegram"}
+                elif row["kind"] == "clarify" and response.get("action") == "submit":
+                    # The rich renderer uses Ask-style answer objects; original clarify
+                    # waiters require raw strings / JSON arrays / None, not that envelope.
+                    import json
+                    answers = response.get("payload", {}).get("answers", {})
+                    converted = {}
+                    valid = isinstance(answers, dict)
+                    if valid:
+                        for qid, answer in answers.items():
+                            if not isinstance(answer, dict):
+                                valid = False
+                                break
+                            value = None if answer.get("deferred") else answer.get("response")
+                            if isinstance(value, list) and all(isinstance(v, str) for v in value):
+                                value = json.dumps(value, ensure_ascii=False)
+                            if value is not None and not isinstance(value, str):
+                                valid = False
+                                break
+                            converted[qid] = value
+                    if not valid:
+                        self.settle(handle, "cancelled")
+                        continue
+                    response = {"answers": converted, "outcome": "submitted", "surface": "telegram"}
                 elif row["kind"] == "ask" and response.get("action") == "submit":
                     response = {"payload": response["payload"], "surface": "telegram"}
                 if binding.resolve(response):

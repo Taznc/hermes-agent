@@ -94,6 +94,9 @@ class PluginUI:
                     lambda kind, payload: gateway.emit(sid, kind, payload))
         authority = sys.modules.get("hermes_fork.ui.authority")
         route = authority.route_for(self._bound_agent()) if authority is not None else None
+        owner = getattr(self._bound_agent(), "_fork_human_input_owner", None)
+        if owner is not None and getattr(owner, "messaging", False):
+            return owner.request, lambda *_: False
         return (route.request, route.emit) if route is not None else None
 
     # -- public API ----------------------------------------------------------------------------

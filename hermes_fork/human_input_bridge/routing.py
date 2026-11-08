@@ -33,11 +33,13 @@ def route_ask(ui, kind, payload, timeout, send):
     owner = getattr(agent, _ATTR, None)
     if owner is None or kind != "fork-ask/questions":
         return send(kind, payload, timeout)
+    if getattr(owner, "messaging", False):
+        return send(kind, payload, timeout)
     gateway, sid = ui._channel()
     if gateway is not None:
         from tui_gateway import server_requests as source
         snapshots = lambda: source.open_requests(sid)
-        watch = lambda rid, expiry: owner.watch_tui(sid, rid, kind="ask", payload=payload, expires_at=expiry)
+        watch = lambda rid, expiry: owner.watch_tui(sid, rid, kind="ask", payload=payload, expires_at=expiry, delay_seconds=getattr(owner, "delay_seconds", 120))
     else:
         authority_module = sys.modules.get("hermes_fork.ui.authority")
         route = authority_module.route_for(agent) if authority_module is not None else None
@@ -50,7 +52,7 @@ def route_ask(ui, kind, payload, timeout, send):
         from gateway import session_server_requests as source
         events = live.event_stream
         snapshots = lambda: source.open_requests(events, sid)
-        watch = lambda rid, expiry: owner.watch_authority(events, sid, rid, kind="ask", payload=payload, expires_at=expiry)
+        watch = lambda rid, expiry: owner.watch_authority(events, sid, rid, kind="ask", payload=payload, expires_at=expiry, delay_seconds=getattr(owner, "delay_seconds", 120))
     nonce = secrets.token_urlsafe(24)
     token = _source_nonce.set(nonce)
     try:

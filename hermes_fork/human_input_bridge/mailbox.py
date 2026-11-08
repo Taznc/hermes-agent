@@ -130,7 +130,85 @@ class Mailbox:
         now = time.time() if now is None else now
         with self._transaction() as db:
             return [r for r in self._rows(db) if r["status"] == "pending" and r["delivery"] is None
-                    and r["due_at"] <= now and not self._expired(r, now)]
+                    and not r.get("delivery_attempted_at") and r["due_at"] <= now and not self._expired(r, now)]
+
+    def claim_delivery(self, handle):
+        """Persist the at-most-once network attempt BEFORE sending (crash may lose delivery)."""
+        with self._transaction() as db:
+            row = self._read(db, handle)
+            now = time.time()
+            if (not row or row["status"] != "pending" or row["delivery"] is not None
+                    or row.get("delivery_attempted_at") or row["due_at"] > now or self._expired(row, now)):
+                return False
+            row["delivery_attempted_at"] = now
+            self._save(db, row)
+            return True
+
+    def delivered(self, *, bot_id=None, limit=1000):
+        """Private bounded presenter recovery rows, newest first (optional bot scope)."""
+        if type(limit) is not int or not 1 <= limit <= 10000:
+            raise ValueError("delivery recovery limit must be 1..10000")
+        with self._transaction() as db:
+            result = []
+            for (body,) in db.execute("SELECT body FROM requests ORDER BY rowid DESC"):
+                row = json.loads(body)
+                if row["delivery"] is not None and (bot_id is None or row["recipient"]["bot_id"] == bot_id):
+                    result.append(row)
+                    if len(result) == limit:
+                        break
+            return result
+
+    def propose_side(self, handle, question_id, question, responder):
+        if not isinstance(question, str) or not question.strip() or len(question) > 2000:
+            return False
+        try:
+            responder = _scope(responder)
+        except ValueError:
+            return False
+        with self._transaction() as db:
+            row = self._read(db, handle)
+            if (not row or row["status"] != "pending" or self._expired(row)
+                    or responder != row["recipient"] or row["kind"] == "approval"):
+                return False
+            questions = row["payload"].get("questions", [])
+            if not any(str(q.get("id", q.get("qid", ""))) == str(question_id) for q in questions):
+                return False
+            sides = row.setdefault("sides", [])
+            if len(sides) >= 8 or any(s["status"] == "pending" for s in sides):
+                return False
+            side_id = secrets.token_urlsafe(24)
+            sides.append(dict(side_id=side_id, question_id=question_id, question=question.strip(),
+                              status="pending", answer=None))
+            self._save(db, row)
+            return side_id
+
+    def side_requests(self, owner_id):
+        with self._transaction() as db:
+            return [dict(s, handle=r["handle"]) for r in self._rows(db)
+                    if r["owner_id"] == owner_id and r["status"] == "pending" and not self._expired(r)
+                    for s in r.get("sides", []) if s["status"] == "pending"]
+
+    def acknowledge_side(self, handle, side_id, owner_id, answer):
+        if not isinstance(answer, str) or len(answer) > 16000:
+            return False
+        with self._transaction() as db:
+            row = self._read(db, handle)
+            if (not row or row["owner_id"] != owner_id or row["status"] != "pending" or self._expired(row)):
+                return False
+            side = next((s for s in row.get("sides", []) if s["side_id"] == side_id), None)
+            if not side or side["status"] != "pending":
+                return False
+            side.update(status="answered", answer=answer)
+            self._save(db, row)
+            return True
+
+    def get_sides(self, handle):
+        with self._transaction() as db:
+            row = self._read(db, handle)
+            if not row:
+                return []
+            return [dict(id=s["side_id"], **{k: s[k] for k in ("question_id", "question", "status", "answer")})
+                    for s in row.get("sides", [])]
 
     def mark_delivered(self, handle, *, chat_id, message_id, thread_id=None):
         with self._transaction() as db:
