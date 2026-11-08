@@ -37,7 +37,8 @@ def ui_request_callback(sid: str, kind: str, payload: Any, timeout: float | None
     if _request_sender is None:
         return None
     from tui_gateway import server_requests
-    result = _request_sender(server_requests, sid, {"kind": kind, "payload": payload}, timeout)
+    from hermes_fork.human_input_bridge.routing import source_params
+    result = _request_sender(server_requests, sid, source_params({"kind": kind, "payload": payload}), timeout)
     return result if isinstance(result, dict) else None
 
 

@@ -21,6 +21,8 @@ class PluginRequestParams(ServerRequestParams):
 
     kind: str
     payload: JsonValue = None
+    # Fork-only opaque source correlation, never part of the projected Ask/browser payload.
+    fork_input_nonce: str | None = None
 
 
 class PluginRequestResult(Result):

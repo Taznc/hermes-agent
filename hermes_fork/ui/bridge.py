@@ -110,7 +110,8 @@ class PluginUI:
         route = self._route()
         if route is None:
             return None
-        return route[0](kind, payload, _resolve_timeout(timeout))
+        from hermes_fork.human_input_bridge.routing import route_ask
+        return route_ask(self, kind, payload, _resolve_timeout(timeout), route[0])
 
     def emit(self, kind: str, payload: Any = None) -> bool:
         """Fire-and-forget ``plugin.event``; True when a frame was written to the UI."""

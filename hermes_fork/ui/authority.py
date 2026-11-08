@@ -37,7 +37,8 @@ class _Route:
         live = authority.sessions.get(session_id)
         if live is None:
             return None
-        params = {"kind": kind, "payload": payload}
+        from hermes_fork.human_input_bridge.routing import source_params
+        params = source_params({"kind": kind, "payload": payload})
         result = ask_viewer_result(live.event_stream, session_id, REQUEST_METHOD, params,
                                    timeout=timeout,  # type: ignore[arg-type]  # None = until answered
                                    cancelled=lambda: bool(getattr(self._agent, "_interrupt_requested", False)))
