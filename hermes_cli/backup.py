@@ -425,6 +425,10 @@ def verify_sqlite_integrity(
     size = st.st_size
     if size < 100:  # SQLite minimum viable size (header + 1 page)
         return _done(f"too small ({size} bytes) to be a valid SQLite database", size=size)
+    # >>> FORK ANCHOR: live-db-header-check <<<
+    from hermes_fork.live_db_verify import resolve_checks as _fork_resolve_checks
+    check_header, run_pragma = _fork_resolve_checks(path, check_header, run_pragma)
+    # <<< FORK ANCHOR >>>
     if check_header:
         # Refused when a live connection exists (close() would cancel this process's POSIX locks
         # — see sqlite_safe_read); verification targets offline snapshots/backup artifacts anyway.
