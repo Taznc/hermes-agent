@@ -237,6 +237,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             if not heartbeat_owner_is_current(self, event, session_key):
                 return
             _run_start_session_id = session_entry.session_id
+            # >>> FORK ANCHOR: short-topic-title-observer <<< (T2; hermes_fork.telegram_titles)
+            from hermes_fork.telegram_titles import observe_topic_title
+            await observe_topic_title(self, source, session_key, _run_start_session_id, _quick_key, run_generation)
             _turn_started_monotonic = time.monotonic()
             # Admission/typing is not execution. All routing, authorization and
             # turn preparation gates have passed when the agent runner is entered.
