@@ -505,6 +505,9 @@ def generate_title(
     prompt = _TITLE_PROMPT_TEMPLATE.replace(
         "__LANGUAGE_RULE__", _LANGUAGE_RULE_PINNED.format(language=language) if language else _LANGUAGE_RULE_MATCH_USER,
     )
+    # >>> FORK ANCHOR: short-topic-title-prompt <<< (T2; hermes_fork.telegram_titles)
+    from hermes_fork.telegram_titles import title_prompt
+    prompt = title_prompt(prompt)
     try:
         # Use the provider's default temperature instead of forcing 0.3.
         # Some models (e.g. GPT-5.6) only accept their server-side default

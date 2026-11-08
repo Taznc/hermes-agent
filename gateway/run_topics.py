@@ -542,6 +542,10 @@ class GatewayTopicThreadsMixin:
 
     async def _rename_telegram_topic_for_session_title(self, source: SessionSource, session_id: str, title: str) -> None:
         """Best-effort rename of a Telegram DM topic when Hermes auto-titles a session."""
+        # >>> FORK ANCHOR: short-topic-title-guard <<< (T2; hermes_fork.telegram_titles)
+        from hermes_fork.telegram_titles import rename_topic_title
+        if await rename_topic_title(self, source, session_id, title):
+            return
         if not await asyncio.to_thread(self._is_telegram_topic_lane, source) or not source.chat_id or not source.thread_id:
             return
         # Operator kill-switch, e.g. user-managed topics (ad-hoc Threaded Mode) that auto-rename
