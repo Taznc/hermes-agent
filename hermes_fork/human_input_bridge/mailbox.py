@@ -66,6 +66,8 @@ class Mailbox:
             os.close(fd)
         with self._transaction() as db:
             db.execute("CREATE TABLE IF NOT EXISTS requests (handle TEXT PRIMARY KEY, body TEXT NOT NULL)")
+            db.execute("CREATE INDEX IF NOT EXISTS requests_owner_status ON requests "
+                       "(json_extract(body, '$.owner_id'), json_extract(body, '$.status'))")
 
     @contextmanager
     def _transaction(self):
@@ -79,6 +81,14 @@ class Mailbox:
         except BaseException:
             db.rollback()
             raise
+        finally:
+            db.close()
+
+    @contextmanager
+    def _reader(self):
+        db = sqlite3.connect(self.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
+        try:
+            yield db
         finally:
             db.close()
 
@@ -120,7 +130,7 @@ class Mailbox:
         return handle
 
     def get(self, handle):
-        with self._transaction() as db:
+        with self._reader() as db:
             return self._read(db, handle)
 
     def _rows(self, db):
@@ -183,10 +193,11 @@ class Mailbox:
             return side_id
 
     def side_requests(self, owner_id):
-        with self._transaction() as db:
-            return [dict(s, handle=r["handle"]) for r in self._rows(db)
-                    if r["owner_id"] == owner_id and r["status"] == "pending" and not self._expired(r)
-                    for s in r.get("sides", []) if s["status"] == "pending"]
+        with self._reader() as db:
+            rows = db.execute("SELECT body FROM requests WHERE json_extract(body, '$.owner_id')=? "
+                              "AND json_extract(body, '$.status')='pending' ORDER BY rowid", (owner_id,))
+            return [dict(s, handle=r["handle"]) for (body,) in rows for r in [json.loads(body)]
+                    if not self._expired(r) for s in r.get("sides", []) if s["status"] == "pending"]
 
     def acknowledge_side(self, handle, side_id, owner_id, answer):
         if not isinstance(answer, str) or len(answer) > 16000:
@@ -247,7 +258,7 @@ class Mailbox:
     def acknowledge(self, handle, *, owner_id, status, result=None):
         return self._acknowledge(handle, owner_id=owner_id, status=status, result=result)
 
-    def _acknowledge(self, handle, *, owner_id, status, result=None, accepted_at=None):
+    def _acknowledge(self, handle, *, owner_id, status, result=None, accepted_at=None, source_settled=False):
         # accepted_at is an owner-only receipt timestamp, never a transport field.
         if status not in TERMINAL:
             raise ValueError("owner acknowledgement must be terminal")
@@ -255,7 +266,7 @@ class Mailbox:
             row = self._read(db, handle)
             if not row or row["owner_id"] != owner_id or row["status"] in TERMINAL:
                 return False
-            if status == "submitted" and self._expired(row, accepted_at):
+            if not source_settled and status == "submitted" and self._expired(row, accepted_at):
                 return False
             row.update(status=status, result=result, revision=row["revision"] + 1)
             self._save(db, row)

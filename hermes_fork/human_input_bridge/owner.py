@@ -22,6 +22,7 @@ class _Binding:
     deferred_ack: bool = False
     awaiting_ack: bool = False
     accepted_at: float | None = None
+    receipt: object = None
 
 
 class OwnerBridge:
@@ -38,23 +39,26 @@ class OwnerBridge:
         with self._lock:
             self._closed = True
             for handle, binding in list(self._bindings.items()):
-                if not binding.awaiting_ack:
+                receipt = binding.receipt() if binding.receipt is not None else None
+                if receipt is not None:
+                    self.settle(handle, *receipt, authoritative=True)
+                elif not binding.awaiting_ack:
                     self.settle(handle, "cancelled")
 
     def _watch(self, request_id, *, kind, payload, current, resolve, expires_at=None,
-               delay_seconds=120, allowed_choices=None, deferred_ack=False):
+               delay_seconds=120, allowed_choices=None, deferred_ack=False, receipt=None):
         with self._lock:
             if self._closed:
-                raise ValueError("owner epoch is closed")
+                return None
             snapshot = current()
             if snapshot is None:
-                raise ValueError("source request is not pending in this owner")
+                return None
             handle = self.mailbox.publish(kind=kind, payload=payload, owner_id=self.owner_id,
                                           request_id=request_id, recipient=self.recipient,
                                           expires_at=expires_at, delay_seconds=delay_seconds,
                                           allowed_choices=allowed_choices)
             self._bindings[handle] = _Binding(binding_digest(self.mailbox.get(handle)), snapshot,
-                                              current, resolve, deferred_ack)
+                                              current, resolve, deferred_ack, receipt=receipt)
             return handle
 
     @staticmethod
@@ -93,8 +97,18 @@ class OwnerBridge:
 
     def watch_tui(self, session_id, request_id, *, kind, payload, **options):
         from tui_gateway import server_requests as source
-        current = lambda: self._stable(self._find(source.open_requests(session_id), request_id), kind)
-        self._check_request(current(), kind, payload)
+        from .receipts import structured_receipt, tui_cancellations
+        tui_cancellations(source)
+        with source._lock:
+            pending = source._open.get(request_id)
+            if pending is None or pending.sid != session_id:
+                return None
+        def current():
+            with source._lock:
+                return self._stable(pending.snapshot(), kind) if source._open.get(request_id) is pending else None
+        self._check_request(current() or self._stable(pending.snapshot(), kind), kind, payload)
+        if kind == "clarify":
+            options["receipt"] = lambda: structured_receipt(pending)
         resolve = lambda response: source.resolve_response({"jsonrpc": "2.0", "id": request_id, "result": response})
         if kind == "clarify":
             def resolve(response):
@@ -113,8 +127,19 @@ class OwnerBridge:
 
     def watch_authority(self, events, session_id, request_id, *, kind, payload, **options):
         from gateway import session_server_requests as source
-        current = lambda: self._stable(self._find(source.open_requests(events, session_id), request_id), kind)
-        self._check_request(current(), kind, payload)
+        from .receipts import structured_receipt
+        with source._lock:
+            pending_source = source._open.get(request_id)
+            if pending_source is None or pending_source.events is not events or pending_source.session_id != session_id:
+                return None
+        def frame():
+            return {"id": request_id, "method": pending_source.method, "params": pending_source.params}
+        def current():
+            with source._lock:
+                return self._stable(frame(), kind) if source._open.get(request_id) is pending_source else None
+        self._check_request(self._stable(frame(), kind), kind, payload)
+        if kind == "clarify":
+            options["receipt"] = lambda: structured_receipt(pending_source)
         # This runs inside the original owner, not on a remote actor's connection. Identity of
         # both the stream AND session must still match the source registration at resolution.
         resolve = lambda response: source.resolve(
@@ -174,7 +199,9 @@ class OwnerBridge:
             elif not isinstance(value, str) or len(value) > 16000:
                 return False
             return commit(value)
-        return self._watch(request_id, kind="clarify", payload=payload, current=current, resolve=resolve, **options)
+        from .receipts import native_receipt
+        return self._watch(request_id, kind="clarify", payload=payload, current=current, resolve=resolve,
+                           receipt=lambda: native_receipt(entry, source), **options)
 
     def watch_approval(self, session_key, request_id, *, payload, allowed_choices, **options):
         from tools import approval as source
@@ -188,7 +215,7 @@ class OwnerBridge:
             self.settle(handle, "cancelled")
         return handle
 
-    def settle(self, handle, reason, result=None):
+    def settle(self, handle, reason, result=None, *, authoritative=False):
         """Called only by the source owner after local answer, expiry, cancel or withdrawal."""
         status = {"resolved": "submitted", "timeout": "timed_out", "interrupted": "cancelled"}.get(reason, reason)
         if status not in TERMINAL:
@@ -198,10 +225,10 @@ class OwnerBridge:
         if row is None or binding is None:
             return False
         accepted_at = binding.accepted_at
-        if status == "submitted" and self.mailbox._expired(row, accepted_at):
+        if not authoritative and status == "submitted" and self.mailbox._expired(row, accepted_at):
             status = "timed_out"
         accepted = self.mailbox._acknowledge(handle, owner_id=self.owner_id, status=status,
-                                              result=result, accepted_at=accepted_at)
+                                              result=result, accepted_at=accepted_at, source_settled=authoritative)
         if accepted:
             self._bindings.pop(handle, None)
         return accepted
@@ -215,12 +242,25 @@ class OwnerBridge:
                 if row["status"] in TERMINAL:
                     self._bindings.pop(handle, None)
                     continue
+                if binding.digest != binding_digest(row):
+                    self.settle(handle, "cancelled")
+                    continue
+                receipt = binding.receipt() if binding.receipt is not None else None
+                if receipt is not None:
+                    self.settle(handle, *receipt, authoritative=True)
+                    continue
                 if binding.awaiting_ack:
                     continue
                 if self.mailbox._expired(row):
                     self.settle(handle, "timed_out")
                     continue
-                if binding.digest != binding_digest(row) or binding.current() != binding.snapshot:
+                current = binding.current()
+                if current is None:
+                    # Removal can precede the source's event/result commit. Await its receipt.
+                    if binding.receipt is None:
+                        self.settle(handle, "cancelled")
+                    continue
+                if current != binding.snapshot:
                     self.settle(handle, "cancelled")
                     continue
                 if row["status"] != "submitting":

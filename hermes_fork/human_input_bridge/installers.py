@@ -1,4 +1,5 @@
 """Named T2 installers; all behavior remains fork-owned."""
+import asyncio
 import contextvars
 import functools
 import threading
@@ -60,8 +61,9 @@ def install_turn_runner(cls):
         if owner:
             from tools.clarify_gateway import get_clarify_timeout
             timeout = get_clarify_timeout()
-            owner.watch_native_clarify(entry.clarify_id, expires_at=time.time() + timeout if timeout > 0 else None,
-                                       delay_seconds=owner.delay_seconds)
+            await asyncio.to_thread(owner.watch_native_clarify, entry.clarify_id,
+                                    expires_at=time.time() + timeout if timeout > 0 else None,
+                                    delay_seconds=owner.delay_seconds)
         return result
     cls._send_shared_clarify = send_clarify
 
@@ -77,6 +79,7 @@ def install_sidecar(server):
         owner = bind_agent(agent)
         if owner:
             server._sessions[sid]["_fork_human_input_owner"] = owner
+        session = server._sessions[sid]
         stop, thread = ticker(sid, agent, *args, **kwargs)
         def close():
             stop.wait()
@@ -84,7 +87,8 @@ def install_sidecar(server):
                 owner.close()
                 if getattr(agent, "_fork_human_input_owner", None) is owner:
                     release_agent(agent)
-            server._sessions.get(sid, {}).pop("_fork_human_input_owner", None)
+            if server._sessions.get(sid) is session and session.get("_fork_human_input_owner") is owner:
+                session.pop("_fork_human_input_owner", None)
         context = contextvars.copy_context()
         threading.Thread(target=context.run, args=(close,), daemon=True, name="human-input-teardown").start()
         return stop, thread

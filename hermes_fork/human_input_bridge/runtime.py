@@ -86,6 +86,7 @@ class RuntimeOwner(OwnerBridge):
         if kind != "fork-ask/questions" or self.events is None:
             return None
         from gateway.session_server_requests import ask_viewer_result
+        timeout = timeout if timeout is not None and timeout > 0 else None
         expiry = time.time() + timeout if timeout is not None else None
         try:
             return ask_viewer_result(self.events, self.source_id, "plugin.request",
